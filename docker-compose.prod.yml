@@ -1,0 +1,99 @@
+# =============================================================================
+# docker-compose.prod.yml  —  운영 서버 배포용
+#
+# 실행:
+#   cp .env.prod.example .env.prod   # 환경변수 설정
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# 로컬 개발은 Mac 네이티브 환경(brew PostgreSQL + node 직접 실행)을 사용합니다.
+# 이 파일은 운영 서버 전용입니다.
+# =============================================================================
+
+services:
+
+  # ── PostgreSQL 15 ─────────────────────────────────────────────────────────────
+  db:
+    image: postgres:15-alpine
+    container_name: skbs-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       ${DB_NAME}
+      POSTGRES_USER:     ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      # 데이터 영속성 — 컨테이너 재시작/재빌드 시에도 데이터 유지
+      - pgdata:/var/lib/postgresql/data
+      # 최초 실행 시 스키마 자동 초기화 (DB 가 비어 있을 때만 실행)
+      - ./apps/backend/src/config/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    # 보안: DB 포트는 외부에 노출하지 않음 (backend 컨테이너와 내부 네트워크로 통신)
+    # 운영 서버에서 직접 접근이 필요한 경우에만 아래 주석을 해제하세요.
+    # ports:
+    #   - "127.0.0.1:5432:5432"
+    networks:
+      - internal
+
+  # ── Node.js 백엔드 ────────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: .                              # 프로젝트 루트 (monorepo)
+      dockerfile: apps/backend/Dockerfile.prod
+    container_name: skbs-backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env.prod
+    environment:
+      NODE_ENV:   production
+      PORT:       4000
+      UPLOAD_DIR: /app/uploads
+      OUTPUT_DIR: /app/outputs
+      # DATABASE_URL 은 .env.prod 에서 주입됩니다.
+      # CORS_ORIGIN 은 .env.prod 에서 주입됩니다.
+    volumes:
+      # 업로드 파일 / PDF 출력물 영속성
+      - uploads:/app/uploads
+      - outputs:/app/outputs
+    ports:
+      # 외부 포트 3000 → 컨테이너 내부 4000
+      # Nginx 가 프록시하므로 직접 노출은 선택적
+      - "3000:4000"
+    networks:
+      - internal
+      - external
+
+  # ── React + Nginx 프론트엔드 ──────────────────────────────────────────────────
+  frontend:
+    build:
+      context: .                               # 프로젝트 루트 (monorepo)
+      dockerfile: apps/frontend/Dockerfile.prod
+    container_name: skbs-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "80:80"
+    networks:
+      - external
+
+# ── 볼륨 ──────────────────────────────────────────────────────────────────────
+volumes:
+  pgdata:
+    name: skbs_pgdata
+  uploads:
+    name: skbs_uploads
+  outputs:
+    name: skbs_outputs
+
+# ── 네트워크 ──────────────────────────────────────────────────────────────────
+networks:
+  internal:   # DB ↔ Backend (외부 노출 없음)
+    internal: true
+  external:   # Backend ↔ Frontend ↔ 외부

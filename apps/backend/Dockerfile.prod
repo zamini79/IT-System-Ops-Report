@@ -1,0 +1,62 @@
+# =============================================================================
+# apps/backend/Dockerfile.prod
+#
+# Build context: 프로젝트 루트 (docker-compose.prod.yml 기준)
+#   docker build -f apps/backend/Dockerfile.prod .
+#
+# 멀티스테이지 빌드:
+#   builder  — TypeScript 컴파일 (shared → backend)
+#   runtime  — 프로덕션 런타임 (최소 이미지)
+# =============================================================================
+
+# ── Stage 1: Build ─────────────────────────────────────────────────────────────
+FROM node:20-alpine AS builder
+WORKDIR /workspace
+
+# package.json 레이어 캐시 (소스 변경 시 npm ci 재실행 방지)
+COPY package.json package-lock.json ./
+COPY packages/shared/package.json  ./packages/shared/
+COPY apps/backend/package.json     ./apps/backend/
+
+# 전체 워크스페이스 의존성 설치 (devDeps 포함 — tsc 빌드에 필요)
+RUN npm ci
+
+# 소스 복사
+COPY packages/shared/ ./packages/shared/
+COPY apps/backend/    ./apps/backend/
+
+# shared 타입 패키지 먼저 빌드, 이후 백엔드 빌드
+RUN npm run build --workspace=packages/shared && \
+    npm run build --workspace=apps/backend
+
+
+# ── Stage 2: Runtime ───────────────────────────────────────────────────────────
+FROM node:20-alpine AS runtime
+WORKDIR /app
+
+ENV NODE_ENV=production
+
+# package.json 레이어 캐시
+COPY package.json package-lock.json ./
+COPY packages/shared/package.json  ./packages/shared/
+COPY apps/backend/package.json     ./apps/backend/
+
+# 프로덕션 의존성만 설치 (workspace 심링크 포함)
+RUN npm ci --omit=dev
+
+# 빌드 결과물 복사
+COPY --from=builder /workspace/packages/shared/dist ./packages/shared/dist
+COPY --from=builder /workspace/apps/backend/dist    ./apps/backend/dist
+
+# Playwright Chromium 브라우저 + 시스템 의존성 설치
+# (크롤러 엔진에서 사용 — 미사용 시 이 줄을 제거하면 이미지 크기 약 500 MB 절감)
+RUN npx --yes playwright install --with-deps chromium
+
+# 업로드 / 출력 디렉터리 생성 (볼륨 마운트 전 존재해야 함)
+RUN mkdir -p /app/uploads /app/outputs
+
+WORKDIR /app/apps/backend
+EXPOSE 4000
+
+# Graceful shutdown 을 위해 직접 node 실행 (npm start 래퍼 미사용)
+CMD ["node", "dist/index.js"]

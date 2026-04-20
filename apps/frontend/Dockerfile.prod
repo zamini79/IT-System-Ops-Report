@@ -1,0 +1,43 @@
+# =============================================================================
+# apps/frontend/Dockerfile.prod
+#
+# Build context: 프로젝트 루트 (docker-compose.prod.yml 기준)
+#   docker build -f apps/frontend/Dockerfile.prod .
+#
+# 멀티스테이지 빌드:
+#   builder  — Vite 빌드 (TypeScript + React)
+#   nginx    — 정적 파일 서빙 (최소 nginx:alpine 이미지)
+# =============================================================================
+
+# ── Stage 1: Build ─────────────────────────────────────────────────────────────
+FROM node:20-alpine AS builder
+WORKDIR /workspace
+
+# package.json 레이어 캐시 (소스 변경 시 npm ci 재실행 방지)
+COPY package.json package-lock.json ./
+COPY packages/shared/package.json  ./packages/shared/
+COPY apps/frontend/package.json    ./apps/frontend/
+
+# 전체 워크스페이스 의존성 설치
+RUN npm ci
+
+# 소스 복사 (vite.config.ts 의 alias 가 ../../packages/shared/src 를 직접 참조)
+COPY packages/shared/ ./packages/shared/
+COPY apps/frontend/   ./apps/frontend/
+
+# Vite 빌드 (tsc --noEmit + vite build)
+WORKDIR /workspace/apps/frontend
+RUN npm run build
+
+
+# ── Stage 2: Nginx ─────────────────────────────────────────────────────────────
+FROM nginx:1.27-alpine AS nginx
+
+# 빌드된 정적 파일 복사
+COPY --from=builder /workspace/apps/frontend/dist /usr/share/nginx/html
+
+# 프로덕션 Nginx 설정 적용
+COPY apps/frontend/nginx.prod.conf /etc/nginx/conf.d/default.conf
+
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]

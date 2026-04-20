@@ -1,0 +1,17 @@
+import { DivisionReportPage } from "../components/division/DivisionReportPage";
+
+const SYSTEMS = [
+  { code: "GCP_QUALITY", label: "GCP Quality System" },
+  { code: "MEDCOMMS",    label: "Medcomms" },
+];
+
+export function DevDivisionPage() {
+  return (
+    <DivisionReportPage
+      divisionCode="DEV"
+      divisionName="개발본부"
+      systems={SYSTEMS}
+      sideLayout
+    />
+  );
+}
