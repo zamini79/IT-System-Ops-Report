@@ -439,6 +439,12 @@ function buildBioReportHtml(
       text-align:center; color:#9ca3af; font-size:12px;
       background:#f8fafc; margin-bottom:16px;
     }
+    .headline {
+      font-size:11px; line-height:1.8; color:#1f2937;
+      background:#f0f4f8; border-left:4px solid #0f2d55;
+      padding:10px 14px; margin-bottom:14px; border-radius:0 4px 4px 0;
+    }
+    .headline strong { color:#0f2d55; font-weight:700; }
 
     /* MS Timesheet CSS */
     .ms-section { margin-bottom: 22px; }
@@ -472,11 +478,15 @@ function buildBioReportHtml(
     <div class="cover-date">작성일: ${today}</div>
   </div>
 
-  <!-- ── Page 1: 시스템 사용 현황 (플레이스홀더) ── -->
+  <!-- ── Page 1: Veeva 시스템 사용현황 (플레이스홀더) ── -->
   <div class="page">
     <div class="page-header">
-      <h2>1. 시스템 사용 현황</h2>
+      <h2>1. Veeva 시스템 사용현황</h2>
       <span class="pg">${titleDate}</span>
+    </div>
+    <div class="headline">
+      ${titleDate} Bio연구본부 Veeva Quality System에 대한 운영 현황입니다.
+      <strong>(헤드메시지 내용은 추후 업데이트 예정입니다.)</strong>
     </div>
     <div class="placeholder-box">
       차트 및 데이터 준비 중입니다. 추후 업데이트 예정입니다.

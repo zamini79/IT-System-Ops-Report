@@ -736,55 +736,48 @@ function LhouseNamedUploadPanel({
   );
 }
 
-// ── DEV 슬롯 정의 ─────────────────────────────────────────────────────────────
+// ── DEV 슬롯 그룹 정의 ────────────────────────────────────────────────────────
 
-const DEV_SLOTS: Array<{
-  slot:      string;
-  label:     string;
-  savedAs:   string;
-  accept:    Record<string, string[]>;
-  hint:      string;
-  icon:      string;
-  iconColor: string;
-}> = [
+const IMG_ACCEPT = { "image/jpeg": [".jpg", ".jpeg"], "image/png": [".png"] };
+const IMG_HINT   = "JPG / PNG 파일 1개 (.jpg / .jpeg / .png) — 서버에서 자동 분할";
+
+interface DevSlotGroup {
+  groupLabel: string;
+  subLabel:   string;
+  color:      string;
+  slot:       string;
+  savedAs:    string;
+  chartCount: number;
+  chartLayout: string;
+}
+
+const DEV_SLOT_GROUPS: DevSlotGroup[] = [
   {
-    slot:    "activity_gcp",
-    label:   "Activity (Task) Count - GCP Quality System",
-    savedAs: "Activity_GCP.xlsx",
-    accept:  {
-      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": [".xlsx"],
-      "application/vnd.ms-excel": [".xls"],
-    },
-    hint:      "Excel 파일 1개 (.xlsx / .xls)",
-    icon:      "X",
-    iconColor: "text-green-600",
+    groupLabel:  "GCP Quality System (eDMS / eQMS / eLMS)",
+    subLabel:    "차트 6개 (3열 × 2행) 자동 분할",
+    color:       "border-blue-400 text-blue-700 bg-blue-50",
+    slot:        "systemusage_gcp",
+    savedAs:     "Systemusage_GCP.jpg",
+    chartCount:  6,
+    chartLayout: "3×2",
   },
   {
-    slot:    "systemusage_gcp",
-    label:   "System Usage (DX) - GCP Quality System",
-    savedAs: "Systemusage_GCP.jpg",
-    accept:  { "image/jpeg": [".jpg", ".jpeg"], "image/png": [".png"] },
-    hint:      "JPG / PNG 파일 1개 (.jpg / .jpeg / .png)",
-    icon:      "I",
-    iconColor: "text-purple-500",
+    groupLabel:  "Medical Contents Management System (Medcomms)",
+    subLabel:    "차트 6개 (3열 × 2행) 자동 분할",
+    color:       "border-orange-400 text-orange-700 bg-orange-50",
+    slot:        "systemusage_medcomms",
+    savedAs:     "Systemusage_Medcomms.jpg",
+    chartCount:  6,
+    chartLayout: "3×2",
   },
   {
-    slot:    "personwithuser_clinical",
-    label:   "Study person with user - Clinical",
-    savedAs: "Personwithuser_Clinical.jpg",
-    accept:  { "image/jpeg": [".jpg", ".jpeg"], "image/png": [".png"] },
-    hint:      "JPG / PNG 파일 1개 (.jpg / .jpeg / .png)",
-    icon:      "I",
-    iconColor: "text-blue-500",
-  },
-  {
-    slot:    "monthly_medcomms",
-    label:   "Monthly Report - Medcomms",
-    savedAs: "Monthly_Medcomms.jpg",
-    accept:  { "image/jpeg": [".jpg", ".jpeg"], "image/png": [".png"] },
-    hint:      "JPG / PNG 파일 1개 (.jpg / .jpeg / .png)",
-    icon:      "I",
-    iconColor: "text-orange-500",
+    groupLabel:  "Clinical Trial Management System (CTMS / eTMF)",
+    subLabel:    "차트 3개 (상단 좌우 + 하단 전폭) 자동 분할",
+    color:       "border-purple-400 text-purple-700 bg-purple-50",
+    slot:        "systemusage_ctms",
+    savedAs:     "Systemusage_CTMS.jpg",
+    chartCount:  3,
+    chartLayout: "2+1",
   },
 ];
 
@@ -798,6 +791,11 @@ function findDevServerFile(fileList: UploadedFileRow[], savedAs: string): Upload
     ) ?? null
   );
 }
+
+const EXCEL_ACCEPT = {
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": [".xlsx"],
+  "application/vnd.ms-excel": [".xls"],
+};
 
 function DevNamedUploadPanel({
   jobId,
@@ -814,16 +812,52 @@ function DevNamedUploadPanel({
 }) {
   return (
     <section className="space-y-4">
-      {DEV_SLOTS.map((s) => (
-        <SingleNamedDropzone
-          key={s.slot}
-          {...s}
-          jobId={jobId}
-          divisionCode={divisionCode}
-          onUploadDone={onUploadDone}
-          serverFile={findDevServerFile(fileList, s.savedAs)}
-          onLog={onLog}
-        />
+      {/* Activity (Task) Count — Excel */}
+      <SingleNamedDropzone
+        slot="activity_gcp"
+        label="Activity (Task) Count - GCP Quality System"
+        savedAs="Activity_GCP.xlsx"
+        accept={EXCEL_ACCEPT}
+        hint="Excel 파일 1개 (.xlsx / .xls)"
+        icon="X"
+        iconColor="text-green-600"
+        jobId={jobId}
+        divisionCode={divisionCode}
+        onUploadDone={onUploadDone}
+        serverFile={fileList.find((f) => f.original_name === "Activity_GCP.xlsx") ?? null}
+        onLog={onLog}
+      />
+
+      {/* 시스템별 대시보드 이미지 (3개) */}
+      {DEV_SLOT_GROUPS.map((group) => (
+        <div key={group.slot}>
+          {/* 그룹 헤더 */}
+          <div className={`flex items-center gap-2 mb-2 px-3 py-1.5 rounded-lg border ${group.color}`}>
+            <svg className="w-3.5 h-3.5 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14M14 8h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+            </svg>
+            <div className="flex-1 min-w-0">
+              <span className="text-xs font-semibold block">{group.groupLabel}</span>
+              <span className="text-[10px] opacity-60">{group.subLabel}</span>
+            </div>
+          </div>
+          {/* 단일 이미지 슬롯 */}
+          <SingleNamedDropzone
+            slot={group.slot}
+            label={group.groupLabel}
+            savedAs={group.savedAs}
+            accept={IMG_ACCEPT}
+            hint={IMG_HINT}
+            icon="I"
+            iconColor="text-indigo-500"
+            jobId={jobId}
+            divisionCode={divisionCode}
+            onUploadDone={onUploadDone}
+            serverFile={findDevServerFile(fileList, group.savedAs)}
+            onLog={onLog}
+          />
+        </div>
       ))}
     </section>
   );
@@ -921,11 +955,12 @@ function fmtTime(iso: string): string {
 }
 
 function CrawlLogPanel({ logs, isConnected }: { logs: LogEntry[]; isConnected: boolean }) {
-  const bottomRef = useRef<HTMLDivElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
 
-  // 새 로그 추가 시 자동 스크롤
+  // 새 로그 추가 시 패널 내부만 스크롤 (페이지 스크롤 방지)
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    const el = containerRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
   }, [logs]);
 
   return (
@@ -940,7 +975,7 @@ function CrawlLogPanel({ logs, isConnected }: { logs: LogEntry[]; isConnected: b
       </div>
 
       {/* 로그 목록 */}
-      <div className="flex-1 overflow-y-auto min-h-0 p-3 space-y-1.5" style={{ maxHeight: "calc(100vh - 280px)" }}>
+      <div ref={containerRef} className="flex-1 overflow-y-auto min-h-0 p-3 space-y-1.5" style={{ maxHeight: "calc(100vh - 280px)" }}>
         {logs.length === 0 ? (
           <p className="text-[11px] text-gray-300 text-center pt-8">
             파일 업로드 또는 보고서 생성 시<br />진행 상황이 표시됩니다.
@@ -969,7 +1004,6 @@ function CrawlLogPanel({ logs, isConnected }: { logs: LogEntry[]; isConnected: b
             );
           })
         )}
-        <div ref={bottomRef} />
       </div>
     </aside>
   );

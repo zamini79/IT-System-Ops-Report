@@ -215,31 +215,32 @@ const NAMED_SLOTS = {
   },
   // ── DEV ───────────────────────────────────────────────────────────────────
   activity_gcp: {
-    filename:   "Activity_GCP.xlsx",
-    mimeTypes:  new Set([
+    filename:  "Activity_GCP.xlsx",
+    mimeTypes: new Set([
       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
       "application/vnd.ms-excel",
     ]),
     extensions: new Set([".xlsx", ".xls"]),
     label: "Activity (Task) Count - GCP Quality System",
   },
+  // ── DEV: 시스템별 대시보드 이미지 (1장 업로드 → 서버에서 분할) ─────────────
   systemusage_gcp: {
-    filename:   "Systemusage_GCP.jpg",      // 이미지 슬롯 — 확장자 동적 처리
+    filename:   "Systemusage_GCP.jpg",
     mimeTypes:  new Set(["image/jpeg", "image/png"]),
     extensions: new Set([".jpg", ".jpeg", ".png"]),
-    label: "System Usage (DX) - GCP Quality System",
+    label: "System Usage — GCP Quality System (eDMS / eQMS / eLMS)",
   },
-  personwithuser_clinical: {
-    filename:   "Personwithuser_Clinical.jpg",  // 이미지 슬롯 — 확장자 동적 처리
+  systemusage_medcomms: {
+    filename:   "Systemusage_Medcomms.jpg",
     mimeTypes:  new Set(["image/jpeg", "image/png"]),
     extensions: new Set([".jpg", ".jpeg", ".png"]),
-    label: "Study person with user - Clinical",
+    label: "System Usage — Medical Contents Management System (Medcomms)",
   },
-  monthly_medcomms: {
-    filename:   "Monthly_Medcomms.jpg",     // 이미지 슬롯 — 확장자 동적 처리
+  systemusage_ctms: {
+    filename:   "Systemusage_CTMS.jpg",
     mimeTypes:  new Set(["image/jpeg", "image/png"]),
     extensions: new Set([".jpg", ".jpeg", ".png"]),
-    label: "Monthly Report - Medcomms",
+    label: "System Usage — Clinical Trial Management System (CTMS / eTMF)",
   },
   // ── 공유 ──────────────────────────────────────────────────────────────────
   timesheet: {
@@ -259,8 +260,8 @@ type NamedSlot = keyof typeof NAMED_SLOTS;
 const IMAGE_SLOTS = new Set<NamedSlot>([
   "systemusage",
   "systemusage_gcp",
-  "personwithuser_clinical",
-  "monthly_medcomms",
+  "systemusage_medcomms",
+  "systemusage_ctms",
 ]);
 
 // ── Multer: 고정명 저장 ───────────────────────────────────────────────────────
@@ -306,7 +307,7 @@ function namedFileFilter(
   const cfg  = slot ? NAMED_SLOTS[slot] : undefined;
 
   if (!cfg) {
-    return cb(new AppError(400, `알 수 없는 slot 값입니다. activity / systemusage / activity_gcp / systemusage_gcp / personwithuser_clinical / monthly_medcomms / timesheet 를 사용하세요.`));
+    return cb(new AppError(400, `알 수 없는 slot 값입니다. activity / systemusage / activity_gcp / systemusage_gcp / systemusage_medcomms / systemusage_ctms / timesheet 를 사용하세요.`));
   }
 
   const ext  = path.extname(file.originalname).toLowerCase();
