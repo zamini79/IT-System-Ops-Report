@@ -1,9 +1,7 @@
 import { DivisionReportPage } from "../components/division/DivisionReportPage";
 
 const SYSTEMS = [
-  { code: "EDMS",      label: "eDMS" },
-  { code: "ELN",       label: "ELN" },
-  { code: "GCLP_LIMS", label: "GCLP LIMS" },
+  { code: "EDMS", label: "Veeva (eDMS)" },
 ];
 
 export function BioResearchPage() {

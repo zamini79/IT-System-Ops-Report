@@ -55,9 +55,9 @@ const MEDCOMMS_CHART_TITLES = [
 ] as const;
 
 const CTMS_CHART_TITLES = [
-  "CTMS 임상시험 현황",
-  "eTMF 문서 현황",
-  "월별 종합 현황",
+  "CTMS, eTMF 사용자 현황",
+  "CTMS, eTMF 일일 사용자 현황",
+  "CTMS, eTMF - Study별 사용자 현황",
 ] as const;
 
 // ── MS Timesheet 데이터 구조 ─────────────────────────────────────────────────
@@ -71,6 +71,16 @@ interface GcpStats {
   trainings:    number;  // chart 4 OCR — 교육 실행 건수
   activeUsers:  number;  // chart 5 OCR — 사용자 등록 현황 (오른쪽 막대)
   uniqueLogin:  number;  // chart 6 OCR — 일일 사용 현황 (오른쪽 막대)
+}
+
+interface MedcommsStats {
+  activeUsers:  number;  // chart 1 OCR — 사용자 현황 (오른쪽 막대)
+  uniqueLogin:  number;  // chart 2 OCR — 일일 사용 현황 (오른쪽 막대)
+  topDocType:   { name: string; count: number };  // chart 3 OCR — 가장 많은 문서 구분
+  newDocuments: number;  // chart 4 OCR — 신규 문서 (오른쪽 - 가운데)
+  taskTotal:    number;  // chart 5 OCR — Task 합계
+  recordCount:  number;  // chart 6 OCR — Record Count (해당 월)
+  timeInReview: number;  // chart 6 OCR — Time in Review (해당 월)
 }
 
 interface MsChartRow {
@@ -553,7 +563,7 @@ async function ocrCrop(
     await worker.terminate();
     return (data.text ?? "").replace(/\s+/g, " ").trim();
   } finally {
-    if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+    try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch { /* 임시 파일 삭제 실패는 무시 */ }
   }
 }
 
@@ -684,6 +694,306 @@ async function extractGcpTrainingCount(imagePath: string): Promise<number> {
   } catch (e) {
     logger.error(`[DEV OCR] chart4(train) 실패: ${(e as Error).message}`);
     return 0;
+  }
+}
+
+// ── Medcomms 차트 OCR 함수 ───────────────────────────────────────────────────
+
+/**
+ * Chart 1 — 사용자 현황: 세로 막대 3개 중 가장 오른쪽 막대 상단 숫자
+ *
+ * 전략: 우측 30% × 상단 72% 크롭 → PSM 11 + normalize
+ */
+async function extractMedcommsRightmostBar(imagePath: string, label: string): Promise<number> {
+  if (!fs.existsSync(imagePath)) { logger.warn(`[MC OCR] 파일 없음: ${imagePath}`); return 0; }
+  const { width: W = 548, height: H = 477 } = await sharp(imagePath).metadata();
+  const left = Math.floor(W * 0.70), top = 0;
+  const width = W - left, height = Math.floor(H * 0.72);
+  try {
+    const text = await ocrCrop(imagePath, { left, top, width, height }, 6, "11", "norm", `mc_${label}`);
+    logger.info(`[MC OCR] ${label} 텍스트: "${text}"`);
+    const numbers = (text.match(/\d[\d,]*/g) ?? [])
+      .map(parseCommaInt)
+      .filter(n => !isNaN(n) && n >= 1 && n <= 999_999 && !(n >= 2000 && n <= 2030));
+    logger.info(`[MC OCR] ${label} 추출: ${JSON.stringify(numbers)}`);
+    return numbers[0] ?? 0;
+  } catch (e) {
+    logger.error(`[MC OCR] ${label} 실패: ${(e as Error).message}`);
+    return 0;
+  }
+}
+
+/**
+ * Chart 2 — 일일 사용 현황: 세로 막대 3개 중 가장 오른쪽 막대 상단 숫자 추출
+ *
+ * ※ nested async function(bboxStrategy) 제거 → 반환값이 외부 함수로 전달되지 않는
+ *   구조적 문제를 방지하기 위해 flat 구조로 재작성.
+ *
+ * 전략 순서 (모두 전체 높이 크롭 — 막대 값이 작아도 놓치지 않음):
+ *   1: 우측 50% × 전체 높이, PSM 11, norm  → 마지막 유효 숫자 (오른쪽 막대)
+ *   2: 우측 50% × 전체 높이, PSM 11, thresh
+ *   3: 우측 30% × 전체 높이, PSM 11, norm  → 더 좁은 영역
+ *   4: 전체 이미지,           PSM 11, norm  → 마지막 숫자 폴백
+ */
+async function extractMedcommsUniqueLogin(imagePath: string): Promise<number> {
+  if (!fs.existsSync(imagePath)) { logger.warn(`[MC OCR] 파일 없음: ${imagePath}`); return 0; }
+  const { width: W = 548, height: H = 477 } = await sharp(imagePath).metadata();
+  logger.info(`[MC OCR] chart2 이미지 크기: ${W}×${H}`);
+
+  /** 텍스트에서 유효 정수 배열 추출 (연도 제외) */
+  const parseNums = (text: string): number[] =>
+    (text.match(/\d[\d,]*/g) ?? [])
+      .map(parseCommaInt)
+      .filter(n => !isNaN(n) && n >= 1 && n <= 999_999 && !(n >= 2000 && n <= 2030));
+
+  // ── 전략 1: 우측 50% × 전체 높이, norm ──────────────────────────────────────
+  try {
+    const left = Math.floor(W * 0.50);
+    const text = await ocrCrop(imagePath, { left, top: 0, width: W - left, height: H }, 7, "11", "norm", "mc2_s1");
+    const nums = parseNums(text);
+    logger.info(`[MC OCR] chart2 [S1] 텍스트: "${text}" / 숫자: ${JSON.stringify(nums)}`);
+    if (nums.length > 0) {
+      const v = nums[nums.length - 1];          // 오른쪽 막대 레이블 = 마지막
+      logger.info(`[MC OCR] chart2 ✓ S1 → ${v}`);
+      return v;
+    }
+  } catch (e) { logger.error(`[MC OCR] chart2 S1 실패: ${(e as Error).message}`); }
+
+  // ── 전략 2: 우측 50% × 전체 높이, thresh ─────────────────────────────────────
+  try {
+    const left = Math.floor(W * 0.50);
+    const text = await ocrCrop(imagePath, { left, top: 0, width: W - left, height: H }, 7, "11", "thresh", "mc2_s2");
+    const nums = parseNums(text);
+    logger.info(`[MC OCR] chart2 [S2] 텍스트: "${text}" / 숫자: ${JSON.stringify(nums)}`);
+    if (nums.length > 0) {
+      const v = nums[nums.length - 1];
+      logger.info(`[MC OCR] chart2 ✓ S2 → ${v}`);
+      return v;
+    }
+  } catch (e) { logger.error(`[MC OCR] chart2 S2 실패: ${(e as Error).message}`); }
+
+  // ── 전략 3: 우측 30% × 전체 높이, norm ──────────────────────────────────────
+  try {
+    const left = Math.floor(W * 0.70);
+    const text = await ocrCrop(imagePath, { left, top: 0, width: W - left, height: H }, 8, "11", "norm", "mc2_s3");
+    const nums = parseNums(text);
+    logger.info(`[MC OCR] chart2 [S3] 텍스트: "${text}" / 숫자: ${JSON.stringify(nums)}`);
+    if (nums.length > 0) {
+      const v = nums[nums.length - 1];
+      logger.info(`[MC OCR] chart2 ✓ S3 → ${v}`);
+      return v;
+    }
+  } catch (e) { logger.error(`[MC OCR] chart2 S3 실패: ${(e as Error).message}`); }
+
+  // ── 전략 4: 전체 이미지, norm (최후 폴백) ────────────────────────────────────
+  try {
+    const text = await ocrCrop(imagePath, { left: 0, top: 0, width: W, height: H }, 5, "11", "norm", "mc2_s4");
+    const nums = parseNums(text);
+    logger.info(`[MC OCR] chart2 [S4] 텍스트: "${text}" / 숫자: ${JSON.stringify(nums)}`);
+    if (nums.length > 0) {
+      const v = nums[nums.length - 1];
+      logger.info(`[MC OCR] chart2 ✓ S4 → ${v}`);
+      return v;
+    }
+  } catch (e) { logger.error(`[MC OCR] chart2 S4 실패: ${(e as Error).message}`); }
+
+  logger.warn("[MC OCR] chart2 ✗ 모든 전략 실패 → 0");
+  return 0;
+}
+
+/**
+ * Chart 3 — 가로 막대 차트 (4개): 가장 값이 높은 index와 값 추출
+ *
+ * 레이아웃: [왼쪽 = index명] [██ 막대 body ██] [오른쪽 끝 = 수치]
+ *
+ * 전략: Tesseract 단어 바운딩박스(bbox) 기반 공간 분석
+ *   - 텍스트만으로는 레이블·수치의 위치를 알 수 없어 bbox를 사용
+ *   ① 차트 전체 영역을 scale 5 업스케일 + greyscale normalize
+ *   ② PSM 6 인식 → data.words (text, bbox, confidence) 수집
+ *   ③ xCentre < midX(45%) → 레이블 단어 / xCentre ≥ midX → 수치 단어
+ *   ④ yCentre 가 ROW_THRESHOLD(막대간격/2) 이내인 단어들을 같은 행으로 묶음
+ *   ⑤ 행별 최댓값 비교 → 가장 큰 수치의 {name, count} 반환
+ */
+async function extractMedcommsTopDocType(imagePath: string): Promise<{ name: string; count: number }> {
+  if (!fs.existsSync(imagePath)) { logger.warn(`[MC OCR] 파일 없음: ${imagePath}`); return { name: "-", count: 0 }; }
+  const { width: W = 548, height: H = 477 } = await sharp(imagePath).metadata();
+
+  const chartTopY = Math.floor(H * 0.07);
+  const chartBotY = Math.floor(H * 0.93);
+  const region    = { left: 0, top: chartTopY, width: W, height: chartBotY - chartTopY };
+  const SCALE     = 5;
+  const scaledW   = region.width  * SCALE;
+  const scaledH   = region.height * SCALE;
+
+  // 막대 4개 기준: 행 간격의 절반을 임계값으로 사용 (인접 행 미합산)
+  const ROW_THRESHOLD = Math.floor(scaledH / 4 / 2);
+  // x < midX → 레이블 영역 / x ≥ midX → 수치 영역
+  const midX = Math.floor(scaledW * 0.45);
+
+  const tmp = imagePath.replace(/\.png$/, "_ocr_mc3_bbox.png");
+
+  try {
+    await (sharp(imagePath)
+      .extract(region)
+      .resize(scaledW, scaledH, { kernel: "lanczos3" })
+      .greyscale()
+      .normalize()
+      .sharpen() as ReturnType<typeof sharp>)
+      .png()
+      .toFile(tmp);
+
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-explicit-any
+    const Tesseract = require("tesseract.js") as any;
+    const worker    = await Tesseract.createWorker("eng");
+    await worker.setParameters({ tessedit_pageseg_mode: "6" });
+    const { data } = await worker.recognize(tmp);
+    await worker.terminate();
+
+    type TWord = { text: string; bbox: { x0: number; y0: number; x1: number; y1: number }; confidence: number };
+    const words: TWord[] = data.words ?? [];
+    logger.info(`[MC OCR] chart3 bbox: 단어 ${words.length}개 인식`);
+
+    interface Row { yCentre: number; labels: string[]; values: number[] }
+    const rows: Row[] = [];
+
+    for (const word of words) {
+      const text = (word.text ?? "").trim();
+      if (!text || word.confidence < 20) continue;
+
+      const yCentre = (word.bbox.y0 + word.bbox.y1) / 2;
+      const xCentre = (word.bbox.x0 + word.bbox.x1) / 2;
+
+      let row = rows.find(r => Math.abs(r.yCentre - yCentre) < ROW_THRESHOLD);
+      if (!row) {
+        row = { yCentre, labels: [], values: [] };
+        rows.push(row);
+      }
+      row.yCentre = (row.yCentre + yCentre) / 2;
+
+      if (xCentre < midX) {
+        // 레이블 영역: 숫자 전용 문자열 제외
+        if (!/^\d[\d,.]*$/.test(text)) row.labels.push(text);
+      } else {
+        // 수치 영역: "5 67" → "567" 자릿수 병합 후 파싱
+        const merged = text.replace(/(\d)\s+(\d)/g, "$1$2");
+        const num = parseCommaInt(merged);
+        if (!isNaN(num) && num >= 1 && num <= 9_999_999 && !(num >= 2000 && num <= 2030)) {
+          row.values.push(num);
+        }
+      }
+    }
+
+    rows.sort((a, b) => a.yCentre - b.yCentre);
+    logger.info(`[MC OCR] chart3 행 분석: ${JSON.stringify(
+      rows.map(r => ({ label: r.labels.join(" "), value: r.values[0] ?? 0 }))
+    )}`);
+
+    const best = rows.reduce<{ name: string; count: number }>(
+      (b, row) => {
+        const val = row.values[0] ?? 0;
+        return val > b.count ? { name: row.labels.join(" ").trim() || "-", count: val } : b;
+      },
+      { name: "-", count: 0 }
+    );
+
+    logger.info(`[MC OCR] chart3 최댓값: ${JSON.stringify(best)}`);
+    return best;
+
+  } catch (e) {
+    logger.error(`[MC OCR] chart3 bbox 실패: ${(e as Error).message}`);
+    return { name: "-", count: 0 };
+  } finally {
+    if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+  }
+}
+
+/**
+ * Chart 4 — 꺾은선 그래프: 신규 문서 수 = (오른쪽 달 값 - 가운데 달 값)
+ *
+ * GCP extractGcpNewDocuments 와 동일한 전략 (3등분, 가운데/오른쪽 비교).
+ */
+async function extractMedcommsNewDocuments(imagePath: string): Promise<number> {
+  if (!fs.existsSync(imagePath)) { logger.warn(`[MC OCR] 파일 없음: ${imagePath}`); return 0; }
+  const { width: W = 548, height: H = 477 } = await sharp(imagePath).metadata();
+  const chartLeft = Math.floor(W * 0.13);
+  const secW      = Math.floor((W - chartLeft) / 3);
+  const cropTop   = Math.floor(H * 0.073);
+  const cropH     = Math.floor(H * 0.78) - cropTop;
+
+  async function scanSection(label: string, left: number, width: number): Promise<number> {
+    const safeW = Math.min(width, W - left);
+    try {
+      const text = await ocrCrop(imagePath, { left, top: cropTop, width: safeW, height: cropH }, 6, "11", "norm", `mc4_${label}`);
+      logger.info(`[MC OCR] chart4(doc) ${label}: "${text}"`);
+      const numbers = (text.match(/\d[\d,]*/g) ?? [])
+        .map(parseCommaInt)
+        .filter(n => !isNaN(n) && n >= 50 && n <= 999_999 && !(n >= 2000 && n <= 2030));
+      return numbers[0] ?? 0;
+    } catch (e) {
+      logger.error(`[MC OCR] chart4(doc) ${label} 실패: ${(e as Error).message}`);
+      return 0;
+    }
+  }
+
+  const midVal   = await scanSection("mid",   chartLeft + secW,     secW);
+  const rightVal = await scanSection("right", chartLeft + secW * 2, W - chartLeft - secW * 2);
+  const newDocs  = Math.max(0, rightVal - midVal);
+  logger.info(`[MC OCR] chart4(doc) 오른쪽=${rightVal}, 가운데=${midVal} → 신규=${newDocs}`);
+  return newDocs;
+}
+
+/**
+ * Chart 5 — 세로 막대 차트: 막대 상단 숫자 전체 합산
+ *
+ * 전략: y축 제외 (좌 8%), 상단 72% 크롭 → PSM 11 norm → 모든 숫자 합산
+ */
+async function extractMedcommsTaskTotal(imagePath: string): Promise<number> {
+  if (!fs.existsSync(imagePath)) { logger.warn(`[MC OCR] 파일 없음: ${imagePath}`); return 0; }
+  const { width: W = 548, height: H = 477 } = await sharp(imagePath).metadata();
+  const left   = Math.floor(W * 0.08);
+  const top    = 0;
+  const width  = W - left;
+  const height = Math.floor(H * 0.72);
+  try {
+    const text = await ocrCrop(imagePath, { left, top, width, height }, 6, "11", "norm", "mc5_task");
+    logger.info(`[MC OCR] chart5 텍스트: "${text}"`);
+    const numbers = (text.match(/\d[\d,]*/g) ?? [])
+      .map(parseCommaInt)
+      .filter(n => !isNaN(n) && n >= 1 && n <= 999_999 && !(n >= 2000 && n <= 2030));
+    logger.info(`[MC OCR] chart5 숫자: ${JSON.stringify(numbers)}`);
+    return numbers.reduce((s, n) => s + n, 0);
+  } catch (e) {
+    logger.error(`[MC OCR] chart5 실패: ${(e as Error).message}`);
+    return 0;
+  }
+}
+
+/**
+ * Chart 6 — 월 별 문서 리뷰 시간 (이중 막대): 해당 월 Record Count / Time in Review 추출
+ *
+ * 전략: 우측 30% × 상단 80% 크롭 → PSM 11 norm → 첫째 = Record Count, 둘째 = Time in Review
+ */
+async function extractMedcommsReviewStats(imagePath: string): Promise<{ recordCount: number; timeInReview: number }> {
+  if (!fs.existsSync(imagePath)) { logger.warn(`[MC OCR] 파일 없음: ${imagePath}`); return { recordCount: 0, timeInReview: 0 }; }
+  const { width: W = 548, height: H = 477 } = await sharp(imagePath).metadata();
+  const left   = Math.floor(W * 0.65);
+  const top    = 0;
+  const width  = W - left;
+  const height = Math.floor(H * 0.80);
+  try {
+    const text = await ocrCrop(imagePath, { left, top, width, height }, 7, "11", "norm", "mc6_review");
+    logger.info(`[MC OCR] chart6 텍스트: "${text}"`);
+    const numbers = (text.match(/\d[\d,.]+/g) ?? [])
+      .map(s => parseFloat(s.replace(/,/g, "")))
+      .filter(n => !isNaN(n) && n >= 1 && !(n >= 2000 && n <= 2030));
+    logger.info(`[MC OCR] chart6 숫자: ${JSON.stringify(numbers)}`);
+    return {
+      recordCount:  Math.round(numbers[0] ?? 0),
+      timeInReview: Math.round(numbers[1] ?? 0),
+    };
+  } catch (e) {
+    logger.error(`[MC OCR] chart6 실패: ${(e as Error).message}`);
+    return { recordCount: 0, timeInReview: 0 };
   }
 }
 
@@ -896,8 +1206,9 @@ function buildDevReportHtml(
   medcommsCharts: Array<{ base64: string; mime: string } | null>,
   ctmsCharts:     Array<{ base64: string; mime: string } | null>,
   msData?:        DevMsTimesheetData | null,
-  msBarCharts?:   Map<string, string | null>,
-  gcpStats?:      GcpStats | null,
+  msBarCharts?:      Map<string, string | null>,
+  gcpStats?:         GcpStats | null,
+  medcommsStats?:    MedcommsStats | null,
 ): string {
   const today      = new Date().toLocaleDateString("ko-KR", {
     year: "numeric", month: "long", day: "numeric",
@@ -944,10 +1255,6 @@ function buildDevReportHtml(
   const qualityUsers  = gcpStats?.activeUsers ?? 0;
 
   const devHeadlineHtml = `<div class="headline">
-    ${titleDate} 개발본부 Veeva System 사용자 수는
-    Quality <strong>${qualityUsers.toLocaleString()}</strong>명,
-    Clinical <strong>-</strong>명,
-    Medical <strong>-</strong>명이 등록되어 사용중 입니다.<br>
     ${monthLabel} 진행된 Managed Service는
     Quality System <strong>${qualityMs.count}</strong>건 (<strong>${qualityMs.hours.toLocaleString()}</strong>시간),
     Clinical System <strong>${clinicalMs.count}</strong>건 (<strong>${clinicalMs.hours.toLocaleString()}</strong>시간),
@@ -991,20 +1298,14 @@ function buildDevReportHtml(
   </div>`;
 
   // ── Page 2: Medcomms 6개 그리드 ─────────────────────────────────────────────
-  const medcommsCellMsgs: Record<number, string> = {
-    1: "",
-    2: "",
-    3: "",
-    4: "",
-    5: "",
-    6: "",
-  };
-
+  logger.info(`[HTML] buildDevReportHtml 진입 — medcommsStats.uniqueLogin=${medcommsStats?.uniqueLogin ?? "null"}`);
   const medcommsGrid = `<div class="usage-grid grid-3row-lg">
-    ${medcommsCharts.slice(0, 6).map((img, i) => makeCell(i + 1, MEDCOMMS_CHART_TITLES[i] ?? `차트 ${i + 1}`, img, medcommsCellMsgs[i + 1])).join("\n")}
+    ${medcommsCharts.slice(0, 6).map((img, i) => makeCell(i + 1, MEDCOMMS_CHART_TITLES[i] ?? `차트 ${i + 1}`, img)).join("\n")}
   </div>`;
 
   // ── Page 3: CTMS 2+1 레이아웃 ───────────────────────────────────────────────
+  // charts[0] = Clinical1 좌측 절반, charts[1] = Clinical1 우측 절반
+  // charts[2] = Clinical2 전체 (하단 전폭)
   const ctmsGrid = (() => {
     const c1 = ctmsCharts[0] ?? null;
     const c2 = ctmsCharts[1] ?? null;
@@ -1016,7 +1317,7 @@ function buildDevReportHtml(
         : `<div style="display:flex;align-items:center;justify-content:center;color:#9ca3af;font-size:11px;height:100%;">차트 미업로드</div>`;
 
     return `<div class="ctms-grid">
-      <!-- 좌우 2개 -->
+      <!-- 좌우 2개 (Clinical1 분할) -->
       <div class="usage-cell">
         <div class="cell-title"><span class="cell-no">1</span>${escHtml(CTMS_CHART_TITLES[0])}</div>
         <div class="img-wrap">${imgHtml(c1, CTMS_CHART_TITLES[0])}</div>
@@ -1025,7 +1326,7 @@ function buildDevReportHtml(
         <div class="cell-title"><span class="cell-no">2</span>${escHtml(CTMS_CHART_TITLES[1])}</div>
         <div class="img-wrap">${imgHtml(c2, CTMS_CHART_TITLES[1])}</div>
       </div>
-      <!-- 가로 전체 1개 -->
+      <!-- 하단 전폭 (Clinical2) -->
       <div class="usage-cell ctms-wide">
         <div class="cell-title"><span class="cell-no">3</span>${escHtml(CTMS_CHART_TITLES[2])}</div>
         <div class="img-wrap" style="padding:4px;">${imgHtml(c3, CTMS_CHART_TITLES[2])}</div>
@@ -1288,10 +1589,6 @@ function buildDevReportHtml(
       <h2>3. Clinical trial management System (CTMS / eTMF)</h2>
       <span class="pg">${titleDate}</span>
     </div>
-    <div class="headline">
-      ${titleDate} 개발본부 Clinical Trial Management System (CTMS / eTMF) 운영 현황입니다.
-      <strong>(헤드메시지 내용은 추후 업데이트 예정입니다.)</strong>
-    </div>
     ${ctmsGrid}
     <div class="footer">
       <span>SK Bioscience 개발본부 — 시스템 운영 현황</span>
@@ -1322,22 +1619,22 @@ export async function generateDevReport(jobId: string): Promise<DevReportResult>
   fs.mkdirSync(uploadPath, { recursive: true });
 
   // 1) 시스템별 대시보드 이미지 → sharp 로 분할
-  const gcpPng      = path.join(uploadPath, "Systemusage_GCP.png");
-  const gcpSrc      = fs.existsSync(gcpPng) ? gcpPng : resolveImagePath(uploadPath, "Systemusage_GCP");
-  const medcommsSrc = resolveImagePath(uploadPath, "Systemusage_Medcomms");
-  const ctmsSrc     = resolveImagePath(uploadPath, "Systemusage_CTMS");
+  const gcpPng       = path.join(uploadPath, "Systemusage_GCP.png");
+  const gcpSrc       = fs.existsSync(gcpPng) ? gcpPng : resolveImagePath(uploadPath, "Systemusage_GCP");
+  const medcommsSrc  = resolveImagePath(uploadPath, "Systemusage_Medcomms");
+  const ctmsSrc1     = resolveImagePath(uploadPath, "Systemusage_Clinical1");
+  const ctmsSrc2     = resolveImagePath(uploadPath, "Systemusage_Clinical2");
 
-  logger.info(`[DEV Report] Systemusage_GCP     : ${gcpSrc      ?? "없음"}`);
-  logger.info(`[DEV Report] Systemusage_Medcomms: ${medcommsSrc ?? "없음"}`);
-  logger.info(`[DEV Report] Systemusage_CTMS    : ${ctmsSrc     ?? "없음"}`);
+  logger.info(`[DEV Report] Systemusage_GCP       : ${gcpSrc     ?? "없음"}`);
+  logger.info(`[DEV Report] Systemusage_Medcomms  : ${medcommsSrc ?? "없음"}`);
+  logger.info(`[DEV Report] Systemusage_Clinical1 : ${ctmsSrc1    ?? "없음"}`);
+  logger.info(`[DEV Report] Systemusage_Clinical2 : ${ctmsSrc2    ?? "없음"}`);
 
-  // 분할 결과 (없는 파일은 null 6/6/3개로 채움)
+  // 분할 결과 (없는 파일은 null 로 채움)
   const NULL6 = Array<ChartImg | null>(6).fill(null);
-  const NULL3 = Array<ChartImg | null>(3).fill(null);
 
   let gcpCharts:      Array<ChartImg | null> = NULL6;
   let medcommsCharts: Array<ChartImg | null> = NULL6;
-  let ctmsCharts:     Array<ChartImg | null> = NULL3;
 
   if (gcpSrc) {
     try {
@@ -1353,11 +1650,33 @@ export async function generateDevReport(jobId: string): Promise<DevReportResult>
       logger.error(`[DEV Report] Medcomms 분할 실패: ${(e as Error).message}`);
     }
   }
-  if (ctmsSrc) {
+
+  // CTMS: Clinical1 → 좌(차트1) / 우(차트2) 분할, Clinical2 → 하단 전폭(차트3) 직접 사용
+  const ctmsCharts: Array<ChartImg | null> = [null, null, null];
+  if (ctmsSrc1) {
     try {
-      ctmsCharts = await split3Charts(ctmsSrc, uploadPath);
+      const meta  = await sharp(ctmsSrc1).metadata();
+      const W     = (meta.width  as number) ?? 1000;
+      const H     = (meta.height as number) ?? 800;
+      const halfW = Math.floor(W / 2);
+      const [leftBuf, rightBuf] = await Promise.all([
+        sharp(ctmsSrc1).extract({ left: 0,     top: 0, width: halfW,    height: H }).png().toBuffer(),
+        sharp(ctmsSrc1).extract({ left: halfW, top: 0, width: W - halfW, height: H }).png().toBuffer(),
+      ]);
+      ctmsCharts[0] = { base64: leftBuf.toString("base64"),  mime: "image/png" };
+      ctmsCharts[1] = { base64: rightBuf.toString("base64"), mime: "image/png" };
+      logger.info(`[DEV Report] Clinical1 분할 완료 — ${W}×${H} → 좌 ${halfW}px / 우 ${W - halfW}px`);
     } catch (e) {
-      logger.error(`[DEV Report] CTMS 분할 실패: ${(e as Error).message}`);
+      logger.error(`[DEV Report] Clinical1 분할 실패: ${(e as Error).message}`);
+    }
+  }
+  if (ctmsSrc2) {
+    try {
+      const buf = await sharp(ctmsSrc2).png().toBuffer();
+      ctmsCharts[2] = { base64: buf.toString("base64"), mime: "image/png" };
+      logger.info(`[DEV Report] Clinical2 로드 완료`);
+    } catch (e) {
+      logger.error(`[DEV Report] Clinical2 로드 실패: ${(e as Error).message}`);
     }
   }
 
@@ -1387,7 +1706,8 @@ export async function generateDevReport(jobId: string): Promise<DevReportResult>
   }
 
   // 2-b) GCP 분할 이미지 OCR → 차트 2~6 헤드메시지용 통계
-  let gcpStats: GcpStats | null = null;
+  let gcpStats:      GcpStats      | null = null;
+  let medcommsStats: MedcommsStats | null = null;
   if (gcpSrc) {
     logger.info("[DEV Report] ── GCP 차트 OCR 시작 ──");
     try {
@@ -1402,6 +1722,37 @@ export async function generateDevReport(jobId: string): Promise<DevReportResult>
       logger.info(`[DEV Report] GCP OCR 완료: ${JSON.stringify(gcpStats)}`);
     } catch (e) {
       logger.error(`[DEV Report] GCP OCR 실패 (무시): ${(e as Error).message}`);
+    }
+  }
+
+  // 2-c) Medcomms 분할 이미지 OCR → 차트 1~6 헤드메시지용 통계
+  if (medcommsSrc) {
+    logger.info("[DEV Report] ── Medcomms 차트 OCR 시작 ──");
+    try {
+      const [
+        activeUsers,
+        uniqueLogin,
+        topDocType,
+        newDocuments,
+        taskTotal,
+        reviewStats,
+      ] = await Promise.all([
+        extractMedcommsRightmostBar(path.join(uploadPath, "medcomms_split_0.png"), "chart1"),
+        extractMedcommsUniqueLogin  (path.join(uploadPath, "medcomms_split_1.png")),
+        extractMedcommsTopDocType  (path.join(uploadPath, "medcomms_split_2.png")),
+        extractMedcommsNewDocuments(path.join(uploadPath, "medcomms_split_3.png")),
+        extractMedcommsTaskTotal   (path.join(uploadPath, "medcomms_split_4.png")),
+        extractMedcommsReviewStats (path.join(uploadPath, "medcomms_split_5.png")),
+      ]);
+      logger.info(`[MC OCR] ── Promise.all 결과 ── activeUsers=${activeUsers} uniqueLogin=${uniqueLogin} topDocType=${JSON.stringify(topDocType)} newDocuments=${newDocuments} taskTotal=${taskTotal}`);
+      medcommsStats = {
+        activeUsers, uniqueLogin, topDocType, newDocuments, taskTotal,
+        recordCount:  reviewStats.recordCount,
+        timeInReview: reviewStats.timeInReview,
+      };
+      logger.info(`[DEV Report] Medcomms OCR 완료: ${JSON.stringify(medcommsStats)}`);
+    } catch (e) {
+      logger.error(`[DEV Report] Medcomms OCR 실패 (무시): ${(e as Error).message}`);
     }
   }
 
@@ -1443,9 +1794,10 @@ export async function generateDevReport(jobId: string): Promise<DevReportResult>
   }
 
   // 3) HTML → PDF 생성
+  logger.info(`[DEV Report] ── buildDevReportHtml 호출 직전 ── medcommsStats=${JSON.stringify(medcommsStats)}`);
   const { year, month } = getLastMonth();
   const titleDate  = `${year}년 ${String(month).padStart(2, "0")}월`;
-  const html       = buildDevReportHtml(titleDate, gcpDonutBase64, gcpCounts, gcpCharts, medcommsCharts, ctmsCharts, msData, msBarCharts, gcpStats);
+  const html       = buildDevReportHtml(titleDate, gcpDonutBase64, gcpCounts, gcpCharts, medcommsCharts, ctmsCharts, msData, msBarCharts, gcpStats, medcommsStats);
   const outputDir  = path.resolve(process.env.OUTPUT_DIR ?? "outputs");
   fs.mkdirSync(outputDir, { recursive: true });
 

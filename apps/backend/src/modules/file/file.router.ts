@@ -194,7 +194,7 @@ fileRouter.get("/list", async (req: Request, res: Response, next: NextFunction) 
   }
 });
 
-// ── 고정명 슬롯 정의 (LHOUSE + DEV) ──────────────────────────────────────────
+// ── 고정명 슬롯 정의 (LHOUSE + DEV + BIO) ────────────────────────────────────
 
 const NAMED_SLOTS = {
   // ── LHOUSE ────────────────────────────────────────────────────────────────
@@ -236,11 +236,57 @@ const NAMED_SLOTS = {
     extensions: new Set([".jpg", ".jpeg", ".png"]),
     label: "System Usage — Medical Contents Management System (Medcomms)",
   },
-  systemusage_ctms: {
-    filename:   "Systemusage_CTMS.jpg",
+  systemusage_ctms1: {
+    filename:   "Systemusage_Clinical1.jpg",
     mimeTypes:  new Set(["image/jpeg", "image/png"]),
     extensions: new Set([".jpg", ".jpeg", ".png"]),
-    label: "System Usage — Clinical Trial Management System (CTMS / eTMF)",
+    label: "System Usage — Clinical Trial Management System 이미지 1",
+  },
+  systemusage_ctms2: {
+    filename:   "Systemusage_Clinical2.jpg",
+    mimeTypes:  new Set(["image/jpeg", "image/png"]),
+    extensions: new Set([".jpg", ".jpeg", ".png"]),
+    label: "System Usage — Clinical Trial Management System 이미지 2",
+  },
+  // ── BIO ───────────────────────────────────────────────────────────────────
+  systemusage_rd: {
+    filename:   "Systemusage_RD.jpg",
+    mimeTypes:  new Set(["image/jpeg", "image/png"]),
+    extensions: new Set([".jpg", ".jpeg", ".png"]),
+    label: "System Usage — Bio연구본부 Veeva System",
+  },
+  lims: {
+    filename:  "LIMS.xlsx",
+    mimeTypes: new Set([
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "application/vnd.ms-excel",
+    ]),
+    extensions: new Set([".xlsx", ".xls"]),
+    label: "임검분 LIMS — 데이터 (Excel)",
+  },
+  lims_image: {
+    filename:   "LIMS.png",
+    mimeTypes:  new Set(["image/jpeg", "image/png"]),
+    extensions: new Set([".jpg", ".jpeg", ".png"]),
+    label: "임검분 LIMS — 사용 현황 이미지",
+  },
+  eln_report: {
+    filename:  "ELN_report.xlsx",
+    mimeTypes: new Set([
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "application/vnd.ms-excel",
+    ]),
+    extensions: new Set([".xlsx", ".xls"]),
+    label: "전자연구노트 (ELN) — ELN Report",
+  },
+  eln_service: {
+    filename:  "ELN_service.xlsx",
+    mimeTypes: new Set([
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "application/vnd.ms-excel",
+    ]),
+    extensions: new Set([".xlsx", ".xls"]),
+    label: "전자연구노트 (ELN) — ELN Service",
   },
   // ── 공유 ──────────────────────────────────────────────────────────────────
   timesheet: {
@@ -261,7 +307,9 @@ const IMAGE_SLOTS = new Set<NamedSlot>([
   "systemusage",
   "systemusage_gcp",
   "systemusage_medcomms",
-  "systemusage_ctms",
+  "systemusage_ctms1",
+  "systemusage_ctms2",
+  "systemusage_rd",
 ]);
 
 // ── Multer: 고정명 저장 ───────────────────────────────────────────────────────
@@ -307,13 +355,14 @@ function namedFileFilter(
   const cfg  = slot ? NAMED_SLOTS[slot] : undefined;
 
   if (!cfg) {
-    return cb(new AppError(400, `알 수 없는 slot 값입니다. activity / systemusage / activity_gcp / systemusage_gcp / systemusage_medcomms / systemusage_ctms / timesheet 를 사용하세요.`));
+    return cb(new AppError(400, `알 수 없는 slot 값입니다. activity / systemusage / activity_gcp / systemusage_gcp / systemusage_medcomms / systemusage_ctms1 / systemusage_ctms2 / systemusage_rd / lims / lims_image / eln_report / eln_service / timesheet 를 사용하세요.`));
   }
 
-  const ext  = path.extname(file.originalname).toLowerCase();
-  const mime = file.mimetype.toLowerCase();
+  const ext = path.extname(file.originalname).toLowerCase();
 
-  if (!cfg.extensions.has(ext as never) || !cfg.mimeTypes.has(mime as never)) {
+  // MIME 타입은 브라우저/OS마다 다르게 보고될 수 있으므로 확장자만 검증
+  // (xlsx → application/zip, jpg → image/pjpeg 등 비표준 보고 사례 존재)
+  if (!cfg.extensions.has(ext as never)) {
     return cb(
       new AppError(
         400,

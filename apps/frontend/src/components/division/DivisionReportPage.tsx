@@ -492,6 +492,9 @@ const TIMESHEET_SLOT: {
   accept:  {
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": [".xlsx"],
     "application/vnd.ms-excel": [".xls"],
+    "application/zip":              [".xlsx"],
+    "application/x-zip-compressed": [".xlsx"],
+    "application/octet-stream":     [".xlsx", ".xls"],
   },
   hint:    "Excel 파일 1개 (.xlsx / .xls)",
   icon:    "T",
@@ -514,6 +517,9 @@ const LHOUSE_SLOTS: Array<{
     accept:  {
       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": [".xlsx"],
       "application/vnd.ms-excel": [".xls"],
+      "application/zip":              [".xlsx"],
+      "application/x-zip-compressed": [".xlsx"],
+      "application/octet-stream":     [".xlsx", ".xls"],
     },
     hint:    "Excel 파일 1개 (.xlsx / .xls)",
     icon:    "X",
@@ -771,13 +777,22 @@ const DEV_SLOT_GROUPS: DevSlotGroup[] = [
     chartLayout: "3×2",
   },
   {
-    groupLabel:  "Clinical Trial Management System (CTMS / eTMF)",
-    subLabel:    "차트 3개 (상단 좌우 + 하단 전폭) 자동 분할",
+    groupLabel:  "Clinical Trial Management System — 이미지 1",
+    subLabel:    "CTMS 임상시험 현황 (Systemusage_Clinical1)",
     color:       "border-purple-400 text-purple-700 bg-purple-50",
-    slot:        "systemusage_ctms",
-    savedAs:     "Systemusage_CTMS.jpg",
-    chartCount:  3,
-    chartLayout: "2+1",
+    slot:        "systemusage_ctms1",
+    savedAs:     "Systemusage_Clinical1.jpg",
+    chartCount:  1,
+    chartLayout: "1",
+  },
+  {
+    groupLabel:  "Clinical Trial Management System — 이미지 2",
+    subLabel:    "eTMF 문서 현황 (Systemusage_Clinical2)",
+    color:       "border-purple-400 text-purple-700 bg-purple-50",
+    slot:        "systemusage_ctms2",
+    savedAs:     "Systemusage_Clinical2.jpg",
+    chartCount:  1,
+    chartLayout: "1",
   },
 ];
 
@@ -795,6 +810,9 @@ function findDevServerFile(fileList: UploadedFileRow[], savedAs: string): Upload
 const EXCEL_ACCEPT = {
   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": [".xlsx"],
   "application/vnd.ms-excel": [".xls"],
+  "application/zip":              [".xlsx"],
+  "application/x-zip-compressed": [".xlsx"],
+  "application/octet-stream":     [".xlsx", ".xls"],
 };
 
 function DevNamedUploadPanel({
@@ -864,7 +882,254 @@ function DevNamedUploadPanel({
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 서브 컴포넌트 2-C: SharedTimesheetPanel (L HOUSE·Bio·Dev 3본부 공유 업로드)
+// 서브 컴포넌트 2-C: BioNamedUploadPanel (BIO 전용 3개 보고서 업로드 + 생성)
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface BioFileConfig {
+  slot:      string;
+  label:     string;
+  savedAs:   string;
+  accept:    Record<string, string[]>;
+  hint:      string;
+  icon:      string;
+  iconColor: string;
+}
+
+interface BioReportSection {
+  /** 보고서 섹션 제목 (e.g. "1. Veeva System") */
+  sectionTitle: string;
+  /** 보고서 생성 API 엔드포인트 */
+  endpoint:     string;
+  /** 다운로드 파일명 */
+  filename:     string;
+  /** 업로드 파일 목록 (1개 이상) */
+  files:        BioFileConfig[];
+  /** 색상 테마 */
+  color:        string;
+}
+
+const BIO_REPORT_SECTIONS: BioReportSection[] = [
+  {
+    sectionTitle: "1. Veeva System",
+    endpoint:     "/report/generate-bio",
+    filename:     "Bio연구본부 Veeva System Report.pdf",
+    color:        "border-blue-400 text-blue-700 bg-blue-50",
+    files: [
+      {
+        slot:      "systemusage_rd",
+        label:     "System Usage (DX)",
+        savedAs:   "Systemusage_RD.jpg",
+        accept:    { "image/jpeg": [".jpg", ".jpeg"], "image/png": [".png"] },
+        hint:      "JPG / PNG 파일 1개 (.jpg / .jpeg / .png)",
+        icon:      "I",
+        iconColor: "text-indigo-500",
+      },
+    ],
+  },
+  {
+    sectionTitle: "2. 임검분 LIMS",
+    endpoint:     "/report/generate-bio-lims",
+    filename:     "Bio연구본부 임검분 LIMS Report.pdf",
+    color:        "border-emerald-400 text-emerald-700 bg-emerald-50",
+    files: [
+      {
+        slot:      "lims",
+        label:     "LIMS 데이터",
+        savedAs:   "LIMS.xlsx",
+        accept:    {
+          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": [".xlsx"],
+          "application/vnd.ms-excel": [".xls"],
+          "application/zip":              [".xlsx"],
+          "application/x-zip-compressed": [".xlsx"],
+          "application/octet-stream":     [".xlsx", ".xls"],
+        },
+        hint:      "LIMS.xlsx (.xlsx / .xls)",
+        icon:      "X",
+        iconColor: "text-green-600",
+      },
+      {
+        slot:      "lims_image",
+        label:     "LIMS 사용 현황 이미지",
+        savedAs:   "LIMS.png",
+        accept:    { "image/jpeg": [".jpg", ".jpeg"], "image/png": [".png"] },
+        hint:      "LIMS.png (.jpg / .jpeg / .png)",
+        icon:      "I",
+        iconColor: "text-emerald-600",
+      },
+    ],
+  },
+  {
+    sectionTitle: "3. 전자연구노트(ELN)",
+    endpoint:     "/report/generate-bio-eln",
+    filename:     "Bio연구본부 전자연구노트(ELN) Report.pdf",
+    color:        "border-purple-400 text-purple-700 bg-purple-50",
+    files: [
+      {
+        slot:      "eln_report",
+        label:     "ELN Report",
+        savedAs:   "ELN_report.xlsx",
+        accept:    {
+          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": [".xlsx"],
+          "application/vnd.ms-excel": [".xls"],
+          "application/zip":              [".xlsx"],
+          "application/x-zip-compressed": [".xlsx"],
+          "application/octet-stream":     [".xlsx", ".xls"],
+        },
+        hint:      "ELN_report.xlsx (.xlsx / .xls)",
+        icon:      "X",
+        iconColor: "text-green-600",
+      },
+      {
+        slot:      "eln_service",
+        label:     "ELN Service",
+        savedAs:   "ELN_service.xlsx",
+        accept:    {
+          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": [".xlsx"],
+          "application/vnd.ms-excel": [".xls"],
+          "application/zip":              [".xlsx"],
+          "application/x-zip-compressed": [".xlsx"],
+          "application/octet-stream":     [".xlsx", ".xls"],
+        },
+        hint:      "ELN_service.xlsx (.xlsx / .xls)",
+        icon:      "X",
+        iconColor: "text-purple-600",
+      },
+    ],
+  },
+];
+
+function BioNamedUploadPanel({
+  jobId,
+  divisionCode,
+  onUploadDone,
+  fileList,
+  onLog,
+}: {
+  jobId:        string;
+  divisionCode: string;
+  onUploadDone: () => void;
+  fileList:     UploadedFileRow[];
+  onLog?:       (systemName: string, msg: string, kind: LogEntry["kind"]) => void;
+}) {
+  const { success, error: toastError } = useToast();
+
+  // 각 섹션마다 독립적인 generating 상태
+  const [generating, setGenerating] = useState<Record<string, boolean>>({});
+
+  function prevMonth() {
+    const now = new Date();
+    const m   = now.getMonth() === 0 ? 12 : now.getMonth();
+    const y   = now.getMonth() === 0 ? now.getFullYear() - 1 : now.getFullYear();
+    return { y, m };
+  }
+
+  // 섹션 고유 키: endpoint URL 사용 (section.slot 이 없어졌으므로)
+  async function handleGenerate(section: BioReportSection) {
+    const key = section.endpoint;
+    if (generating[key]) return;
+    setGenerating((prev) => ({ ...prev, [key]: true }));
+    onLog?.(section.sectionTitle, "PDF 보고서 생성 시작…", "info");
+    try {
+      const { y, m } = prevMonth();
+      const mm = String(m).padStart(2, "0");
+      const filename = `${y}.${mm} ${section.filename}`;
+      const res = await apiClient.post(section.endpoint, { jobId }, { responseType: "blob" });
+      const url = URL.createObjectURL(new Blob([res.data as BlobPart], { type: "application/pdf" }));
+      const a   = document.createElement("a");
+      a.href = url; a.download = filename; a.click();
+      URL.revokeObjectURL(url);
+      success("보고서 PDF가 다운로드되었습니다.");
+      onLog?.(section.sectionTitle, `${filename} 다운로드 완료`, "success");
+    } catch (err: unknown) {
+      const msg =
+        (err as { response?: { data?: { error?: string } } })
+          ?.response?.data?.error ?? "보고서 생성에 실패했습니다.";
+      toastError(msg);
+      onLog?.(section.sectionTitle, `PDF 생성 실패: ${msg}`, "error");
+    } finally {
+      setGenerating((prev) => ({ ...prev, [key]: false }));
+    }
+  }
+
+  function findServerFile(savedAs: string): UploadedFileRow | null {
+    return (
+      fileList.find((f) =>
+        f.original_name === savedAs ||
+        (savedAs.endsWith(".jpg") &&
+          f.original_name === savedAs.replace(/\.jpg$/, ".png"))
+      ) ?? null
+    );
+  }
+
+  return (
+    <section className="space-y-5">
+      {BIO_REPORT_SECTIONS.map((section) => {
+        const key          = section.endpoint;
+        const isGenerating = generating[key] ?? false;
+        return (
+          <div key={key} className="bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden">
+            {/* 섹션 헤더 */}
+            <div className={`flex items-center justify-between px-5 py-3 border-b border-gray-200 ${section.color}`}>
+              <div>
+                <h3 className="text-sm font-bold">{section.sectionTitle}</h3>
+              </div>
+              {/* 보고서 생성 버튼 */}
+              <button
+                onClick={() => void handleGenerate(section)}
+                disabled={isGenerating}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all
+                  ${!isGenerating
+                    ? "bg-secondary text-white hover:bg-secondary-600 shadow-sm"
+                    : "bg-white/60 text-gray-400 cursor-not-allowed"}`}
+              >
+                {isGenerating ? (
+                  <>
+                    <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+                    </svg>
+                    생성 중…
+                  </>
+                ) : (
+                  <>
+                    <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                        d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                    </svg>
+                    보고서 생성
+                  </>
+                )}
+              </button>
+            </div>
+            {/* 업로드 드롭존 — files 배열의 각 파일마다 드롭존 렌더링 */}
+            <div className="p-4 space-y-3">
+              {section.files.map((fileConf) => (
+                <SingleNamedDropzone
+                  key={fileConf.slot}
+                  slot={fileConf.slot}
+                  label={fileConf.label}
+                  savedAs={fileConf.savedAs}
+                  accept={fileConf.accept}
+                  hint={fileConf.hint}
+                  icon={fileConf.icon}
+                  iconColor={fileConf.iconColor}
+                  jobId={jobId}
+                  divisionCode={divisionCode}
+                  onUploadDone={onUploadDone}
+                  serverFile={findServerFile(fileConf.savedAs)}
+                  onLog={onLog}
+                />
+              ))}
+            </div>
+          </div>
+        );
+      })}
+    </section>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 서브 컴포넌트 2-D: SharedTimesheetPanel (L HOUSE·Bio·Dev 3본부 공유 업로드)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -964,7 +1229,7 @@ function CrawlLogPanel({ logs, isConnected }: { logs: LogEntry[]; isConnected: b
   }, [logs]);
 
   return (
-    <aside className="w-72 flex-shrink-0 flex flex-col bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden">
+    <aside className="w-72 flex-shrink-0 flex flex-col bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden sticky top-6 self-start max-h-[calc(100vh-108px)]">
       {/* 헤더 */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100 bg-gray-50">
         <div className="flex items-center gap-2">
@@ -975,7 +1240,7 @@ function CrawlLogPanel({ logs, isConnected }: { logs: LogEntry[]; isConnected: b
       </div>
 
       {/* 로그 목록 */}
-      <div ref={containerRef} className="flex-1 overflow-y-auto min-h-0 p-3 space-y-1.5" style={{ maxHeight: "calc(100vh - 280px)" }}>
+      <div ref={containerRef} className="flex-1 overflow-y-auto min-h-0 p-3 space-y-1.5">
         {logs.length === 0 ? (
           <p className="text-[11px] text-gray-300 text-center pt-8">
             파일 업로드 또는 보고서 생성 시<br />진행 상황이 표시됩니다.
@@ -1254,6 +1519,17 @@ export function DivisionReportPage({
     refetchInterval: 5_000,
   });
 
+  // ── BIO 전용: 업로드 파일 목록 조회 (5초 폴링) ───────────────────────────────
+  const { data: bioFileList = [], refetch: refetchBioFiles } = useQuery({
+    queryKey:        ["files", jobId, "bio"],
+    queryFn:         () =>
+      apiClient
+        .get<{ success: boolean; data: { files: UploadedFileRow[] } }>(`/file/list?jobId=${jobId}`)
+        .then((r) => r.data.data?.files ?? []),
+    enabled:         divisionCode === "BIO",
+    refetchInterval: 5_000,
+  });
+
   const hasActivityFile    = lhouseFileList.some((f) => f.original_name === "Activity_LHOUSE.xlsx");
   const hasSystemusageFile = lhouseFileList.some((f) =>
     f.original_name === "Systemusage_LHOUSE.jpg" || f.original_name === "Systemusage_LHOUSE.png"
@@ -1323,30 +1599,6 @@ export function DivisionReportPage({
       setDevGenerating(false);
     }
   }, [devGenerating, addLocalLog, jobId, success, toastError]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // ── BIO 전용: 보고서 생성 (직접 다운로드) ────────────────────────────────────
-  const [bioGenerating, setBioGenerating] = useState(false);
-
-  const handleBioGenerate = useCallback(async () => {
-    if (bioGenerating) return;
-    setBioGenerating(true);
-    addLocalLog("보고서", "PDF 보고서 생성 시작…", "info");
-    try {
-      const { y, m } = prevMonth();
-      const filename = `${y}.${String(m).padStart(2, "0")} Bio연구본부 시스템 운영 현황 Report.pdf`;
-      await downloadPdfBlob("/report/generate-bio", filename);
-      success("보고서 PDF가 다운로드되었습니다.");
-      addLocalLog("보고서", `${filename} 다운로드 완료`, "success");
-    } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { error?: string } } })
-          ?.response?.data?.error ?? "보고서 생성에 실패했습니다.";
-      toastError(msg);
-      addLocalLog("보고서", `PDF 생성 실패: ${msg}`, "error");
-    } finally {
-      setBioGenerating(false);
-    }
-  }, [bioGenerating, addLocalLog, jobId, success, toastError]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── 진행 현황 집계 ────────────────────────────────────────────────────────────
   const totalCount     = systems.length;
@@ -1436,29 +1688,6 @@ export function DivisionReportPage({
               )}
               {devGenerating ? "생성 중…" : "보고서 생성"}
             </button>
-          ) : divisionCode === "BIO" ? (
-            /* BIO: 업로드된 파일로 보고서 생성 */
-            <button
-              onClick={() => void handleBioGenerate()}
-              disabled={bioGenerating}
-              className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition-all
-                ${!bioGenerating
-                  ? "bg-secondary text-white hover:bg-secondary-600 shadow-sm"
-                  : "bg-gray-100 text-gray-400 cursor-not-allowed"}`}
-            >
-              {bioGenerating ? (
-                <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
-                </svg>
-              ) : (
-                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                    d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                </svg>
-              )}
-              {bioGenerating ? "생성 중…" : "보고서 생성"}
-            </button>
           ) : null}
         </div>
       </div>
@@ -1527,6 +1756,14 @@ export function DivisionReportPage({
                 onUploadDone={() => void refetchDevFiles()}
                 onLog={addLocalLog}
               />
+            ) : divisionCode === "BIO" ? (
+              <BioNamedUploadPanel
+                jobId={jobId}
+                divisionCode={divisionCode}
+                fileList={bioFileList}
+                onUploadDone={() => void refetchBioFiles()}
+                onLog={addLocalLog}
+              />
             ) : (
               <FileDropzonePanel
                 jobId={jobId}
@@ -1577,6 +1814,14 @@ export function DivisionReportPage({
                 divisionCode={divisionCode}
                 fileList={devFileList}
                 onUploadDone={() => void refetchDevFiles()}
+                onLog={addLocalLog}
+              />
+            ) : divisionCode === "BIO" ? (
+              <BioNamedUploadPanel
+                jobId={jobId}
+                divisionCode={divisionCode}
+                fileList={bioFileList}
+                onUploadDone={() => void refetchBioFiles()}
                 onLog={addLocalLog}
               />
             ) : (
@@ -1689,7 +1934,7 @@ export function DivisionReportPage({
       {/* ── 우측: 진행 로그 패널 (항상 표시) ── */}
       <CrawlLogPanel
         logs={allLogs}
-        isConnected={sse.isConnected || lhouseGenerating || devGenerating || bioGenerating}
+        isConnected={sse.isConnected || lhouseGenerating || devGenerating}
       />
 
       </div>{/* end 2열 flex */}

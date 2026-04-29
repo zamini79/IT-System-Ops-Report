@@ -26,7 +26,7 @@ import {
 } from "./report.service";
 import { generateLhouseReport } from "./lhouse.report.service";
 import { generateDevReport }    from "./dev.report.service";
-import { generateBioReport }    from "./bio.report.service";
+import { generateBioReport, generateBioLimsReport, generateBioElnReport } from "./bio.report.service";
 import type { DivisionCode } from "../../engines/playwright/types";
 
 export const reportRouter = Router();
@@ -150,6 +150,56 @@ reportRouter.post(
       if (!UUID_RE.test(jobId)) throw new AppError(400, "jobId 는 UUID 형식이어야 합니다.");
 
       const result = await generateBioReport(jobId);
+
+      res.download(result.filePath, result.filename, (err) => {
+        if (err && !res.headersSent) {
+          next(new AppError(500, `PDF 다운로드 실패: ${err.message}`));
+        }
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// POST /api/report/generate-bio-lims
+// BIO 임검분 LIMS 전용 PDF 생성 (동기, 직접 다운로드)
+// ---------------------------------------------------------------------------
+reportRouter.post(
+  "/generate-bio-lims",
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { jobId } = req.body as { jobId?: string };
+      if (!jobId) throw new AppError(400, "jobId 는 필수입니다.");
+      if (!UUID_RE.test(jobId)) throw new AppError(400, "jobId 는 UUID 형식이어야 합니다.");
+
+      const result = await generateBioLimsReport(jobId);
+
+      res.download(result.filePath, result.filename, (err) => {
+        if (err && !res.headersSent) {
+          next(new AppError(500, `PDF 다운로드 실패: ${err.message}`));
+        }
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// POST /api/report/generate-bio-eln
+// BIO 전자연구노트(ELN) 전용 PDF 생성 (동기, 직접 다운로드)
+// ---------------------------------------------------------------------------
+reportRouter.post(
+  "/generate-bio-eln",
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { jobId } = req.body as { jobId?: string };
+      if (!jobId) throw new AppError(400, "jobId 는 필수입니다.");
+      if (!UUID_RE.test(jobId)) throw new AppError(400, "jobId 는 UUID 형식이어야 합니다.");
+
+      const result = await generateBioElnReport(jobId);
 
       res.download(result.filePath, result.filename, (err) => {
         if (err && !res.headersSent) {

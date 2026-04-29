@@ -139,7 +139,7 @@ export async function saveNamedUploadedFile(
     const rows = await query<UploadedFileRow>(
       `UPDATE uploaded_files
        SET stored_path = $1, file_type = $2, file_size = $3,
-           analysis_result = NULL, created_at = NOW()
+           analysis_result = '{}'::jsonb, created_at = NOW()
        WHERE id = $4
        RETURNING id, report_job_id, original_name, stored_path,
                  file_type, file_size, analysis_result, created_at`,
