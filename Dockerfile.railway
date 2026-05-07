@@ -1,0 +1,52 @@
+# ── Railway 백엔드 배포용 Dockerfile ─────────────────────────────────────────
+# 빌드 컨텍스트: 루트 (모노레포 전체)
+# Railway 설정: Dockerfile Path = Dockerfile.railway
+
+# ── 1단계: 빌드 ──────────────────────────────────────────────────────────────
+FROM node:20-slim AS builder
+
+WORKDIR /app
+
+# 모노레포 루트 의존성
+COPY package*.json ./
+COPY packages/shared/package*.json ./packages/shared/
+COPY apps/backend/package*.json ./apps/backend/
+
+RUN npm ci
+
+# 소스 복사
+COPY packages/ ./packages/
+COPY apps/backend/ ./apps/backend/
+
+# shared → backend 순서로 빌드
+RUN npm run build --workspace=packages/shared
+RUN npm run build --workspace=apps/backend
+
+# ── 2단계: 런타임 ─────────────────────────────────────────────────────────────
+# Playwright 공식 이미지 (Chromium + 시스템 의존성 포함)
+FROM mcr.microsoft.com/playwright:v1.44.0-jammy
+
+WORKDIR /app
+
+ENV NODE_ENV=production
+
+# 프로덕션 의존성만 설치
+COPY package*.json ./
+COPY packages/shared/package*.json ./packages/shared/
+COPY apps/backend/package*.json ./apps/backend/
+
+RUN npm ci --omit=dev
+
+# 빌드 결과물 복사
+COPY --from=builder /app/apps/backend/dist ./apps/backend/dist
+COPY --from=builder /app/packages/shared/dist ./packages/shared/dist
+
+# Playwright 브라우저 설치 (Chromium만)
+RUN npx playwright install chromium --with-deps
+
+# 업로드/출력 디렉터리 생성
+RUN mkdir -p /app/uploads /app/outputs
+
+EXPOSE 4000
+
+CMD ["node", "apps/backend/dist/index.js"]
