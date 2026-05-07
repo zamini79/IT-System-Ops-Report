@@ -29,12 +29,21 @@ const allowedOrigins = (process.env.CORS_ORIGIN ?? "http://localhost:5173")
   .split(",")
   .map((o) => o.trim());
 
+// *.vercel.app 패턴 매칭 (Vercel 프리뷰 배포 포함)
+const isAllowedOrigin = (origin: string | undefined): boolean => {
+  if (!origin) return false;
+  if (allowedOrigins.includes(origin)) return true;
+  // Vercel 배포 도메인 자동 허용
+  if (/^https:\/\/[a-zA-Z0-9-]+\.vercel\.app$/.test(origin)) return true;
+  return false;
+};
+
 app.use(
   cors({
     origin: (origin, callback) => {
       // curl / Postman 등 origin 없는 요청은 개발 환경에서만 허용
       if (!origin && process.env.NODE_ENV !== "production") return callback(null, true);
-      if (origin && allowedOrigins.includes(origin)) return callback(null, true);
+      if (isAllowedOrigin(origin)) return callback(null, true);
       callback(new Error(`CORS: origin '${origin}' not allowed`));
     },
     credentials: true,
