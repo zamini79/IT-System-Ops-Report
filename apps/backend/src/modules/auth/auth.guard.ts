@@ -6,10 +6,12 @@ import type { AccessPayload, AuthRequest, DivisionCode } from "./auth.types";
 export const REFRESH_COOKIE = "skbs_rt";
 
 // Refresh Token 쿠키 공통 옵션
+const isProd = process.env.NODE_ENV === "production";
 export const refreshCookieOptions = {
   httpOnly: true,
-  secure:   process.env.NODE_ENV === "production",
-  sameSite: "strict" as const,
+  secure:   isProd,
+  // 프론트(Vercel)와 백엔드(Railway)가 다른 도메인 → 프로덕션에서 none 필요
+  sameSite: (isProd ? "none" : "strict") as "none" | "strict",
   maxAge:   7 * 24 * 60 * 60 * 1000,   // 7일 (ms)
   path:     "/api/auth",                 // refresh·logout 엔드포인트에만 전송
 };
