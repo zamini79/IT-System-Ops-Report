@@ -7,6 +7,12 @@ interface Props {
   /** Header 에 표시될 페이지 제목 */
   title:    string;
   children: ReactNode;
+  /**
+   * false 로 설정하면 main 영역의 overflow-y-auto 와 padding wrapper 를 제거합니다.
+   * 자체 스크롤 영역이 필요한 페이지(DivisionReportPage 등)에서 사용합니다.
+   * 기본값: true
+   */
+  scroll?:  boolean;
 }
 
 /**
@@ -19,7 +25,7 @@ interface Props {
  * │            │                              │
  * └────────────┴──────────────────────────────┘
  */
-export function AppLayout({ title, children }: Props) {
+export function AppLayout({ title, children, scroll = true }: Props) {
   const mainRef  = useRef<HTMLElement>(null);
   const location = useLocation();
 
@@ -36,12 +42,19 @@ export function AppLayout({ title, children }: Props) {
       <div className="flex flex-col flex-1 min-w-0 overflow-hidden">
         <Header title={title} />
 
-        {/* 스크롤 가능한 콘텐츠 영역 */}
-        <main ref={mainRef} className="flex-1 overflow-y-auto">
-          <div className="p-6 max-w-screen-xl mx-auto">
+        {scroll ? (
+          /* 기본: main 자체가 스크롤 컨테이너 */
+          <main ref={mainRef} className="flex-1 overflow-y-auto">
+            <div className="p-6 max-w-screen-xl mx-auto">
+              {children}
+            </div>
+          </main>
+        ) : (
+          /* scroll=false: children 이 직접 스크롤 영역을 관리 */
+          <main ref={mainRef} className="flex-1 overflow-hidden flex flex-col min-h-0">
             {children}
-          </div>
-        </main>
+          </main>
+        )}
       </div>
     </div>
   );

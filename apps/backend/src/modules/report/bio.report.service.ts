@@ -1396,6 +1396,20 @@ interface ElnReportData {
 function readElnReportData(xlsxPath: string): ElnReportData {
   const wb = XLSX.readFile(xlsxPath);
 
+  // 첫 번째 시트명 "팀별_xx월(yy년)" 에서 기준 월(cutoff) 추출
+  // 예: "팀별_04월(26년)" → "2026-04"
+  let cutoffMonth: string | null = null;
+  const firstSheetName = wb.SheetNames[0] ?? "";
+  const cutoffMatch = firstSheetName.match(/팀별_(\d{1,2})월\((\d{2})년\)/);
+  if (cutoffMatch) {
+    const mm       = cutoffMatch[1].padStart(2, "0");
+    const fullYear = 2000 + parseInt(cutoffMatch[2], 10);
+    cutoffMonth    = `${fullYear}-${mm}`;
+    logger.info(`[BIO ELN] 기준 시트: "${firstSheetName}" → cutoff: ${cutoffMonth}`);
+  } else {
+    logger.warn(`[BIO ELN] 첫 번째 시트명에서 기준 월을 파악할 수 없습니다: "${firstSheetName}"`);
+  }
+
   const sheetName = wb.SheetNames.find((n: string) => /browser\s+export/i.test(n));
   if (!sheetName) throw new Error("ELN_report.xlsx: 'browser export' 시트를 찾을 수 없습니다.");
   logger.info(`[BIO ELN] 시트: "${sheetName}"`);
@@ -1413,6 +1427,7 @@ function readElnReportData(xlsxPath: string): ElnReportData {
   };
 
   // row 0 = 헤더, row 1~ = 데이터
+  // cutoffMonth 가 있으면 해당 월 이하 데이터만 포함
   const records: { month: string; lastName: string; prjCode: string }[] = [];
   for (let i = 1; i < rows.length; i++) {
     const row      = rows[i] as unknown[];
@@ -1420,9 +1435,10 @@ function readElnReportData(xlsxPath: string): ElnReportData {
     const lastName = String(row[5] ?? "").trim();
     const prjCode  = String(row[7] ?? "").trim();
     if (!month) continue;
+    if (cutoffMonth && month > cutoffMonth) continue;
     records.push({ month, lastName, prjCode });
   }
-  logger.info(`[BIO ELN] 파싱 행 수: ${records.length}`);
+  logger.info(`[BIO ELN] 파싱 행 수: ${records.length} (cutoff: ${cutoffMonth ?? "없음"})`);
 
   // 최근 3개월 (오름차순)
   const allMonths = [...new Set(records.map((r) => r.month))].sort();
@@ -1757,13 +1773,17 @@ function readElnServiceData(xlsxPath: string): { rows: ElnServiceRow[]; latestMo
   const cell = (row: unknown[], idx: number) =>
     idx >= 0 ? String(row[idx] ?? "").trim() : "";
 
-  // 전체 행에서 접수일 → 월 목록
+  // 현재 월 (미래 날짜 제외 기준)
+  const now = new Date();
+  const currentMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+
+  // 전체 행에서 접수일 → 월 목록 (미래 월 제외)
   const allMonths = rows
     .slice(1)
     .map((r) => toMonth((r as unknown[])[colReception]))
-    .filter(Boolean);
+    .filter((m) => !!m && m <= currentMonth);
   const latestMonth = allMonths.sort().at(-1) ?? "";
-  logger.info(`[BIO ELN Svc] 접수일 최근 월: ${latestMonth}`);
+  logger.info(`[BIO ELN Svc] 접수일 최근 월: ${latestMonth} (현재 월 기준: ${currentMonth})`);
 
   // 최근 월 행만 필터링
   const result: ElnServiceRow[] = [];

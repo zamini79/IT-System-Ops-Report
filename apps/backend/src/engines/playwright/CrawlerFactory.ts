@@ -28,7 +28,8 @@ import { DevGitlabCrawler }        from "./crawlers/dev/DevGitlabCrawler";
 import { DevJiraCrawler }          from "./crawlers/dev/DevJiraCrawler";
 
 // ── LHOUSE 크롤러 ─────────────────────────────────────────────────────────────
-import { LhouseVeevaCrawler }      from "./crawlers/lhouse/LhouseVeevaCrawler";
+import { LhouseVeevaCrawler }           from "./crawlers/lhouse/LhouseVeevaCrawler";
+import { LhouseVeevaDashboardCrawler }  from "./crawlers/lhouse/LhouseVeevaDashboardCrawler";
 
 // ── 크롤러 레지스트리 ─────────────────────────────────────────────────────────
 // 새 크롤러 추가 시 이 맵에만 등록하면 됩니다.
@@ -55,6 +56,11 @@ const REGISTRY: Record<DivisionCode, Record<string, CrawlerCtor>> = {
   LHOUSE: {
     VEEVA: LhouseVeevaCrawler,   // Veeva Vault (eQMS · eDMS · eLMS 통합)
   },
+};
+
+// 전체 크롤 대상에는 포함되지 않는 단일 실행 전용 크롤러
+const SINGLE_REGISTRY: Record<string, CrawlerCtor> = {
+  VEEVA_DASHBOARD: LhouseVeevaDashboardCrawler,
 };
 
 // ── 팩토리 ───────────────────────────────────────────────────────────────────
@@ -197,6 +203,48 @@ export class CrawlerFactory {
       logger.error(`[CrawlerFactory] Screenshot failed: ${divisionCode}/${systemName}`, {
         error: (err as Error).message,
       });
+      throw err;
+    } finally {
+      await crawler.close();
+      release();
+    }
+  }
+
+  /**
+   * SINGLE_REGISTRY 에 등록된 단일 크롤러를 실행합니다.
+   * 전체 사업부 크롤 잡(listAvailable)과 독립적으로 동작합니다.
+   *
+   * @param systemName  SINGLE_REGISTRY 키 (예: "VEEVA_DASHBOARD")
+   * @param jobId       저장 디렉토리 구분자
+   * @param onProgress  진행 상태 콜백
+   */
+  static async runSingle(
+    systemName:  string,
+    jobId:       string,
+    onProgress?: ProgressCallback,
+  ): Promise<CrawlerResult> {
+    const CrawlerClass = SINGLE_REGISTRY[systemName];
+    if (!CrawlerClass) {
+      const available = Object.keys(SINGLE_REGISTRY).join(", ");
+      throw new Error(`단일 크롤러 미등록: '${systemName}'. 사용 가능: ${available}`);
+    }
+
+    const manager = BrowserManager.getInstance();
+    const { browser, release } = await manager.acquire();
+
+    logger.info(`[CrawlerFactory] RunSingle: ${systemName} (job=${jobId})`);
+
+    const ctx     = await BaseCrawler.createContext(browser, jobId, systemName);
+    const crawler = new CrawlerClass(ctx);
+
+    if (onProgress) crawler.onProgress(onProgress);
+
+    try {
+      const result = await crawler.run();
+      logger.info(`[CrawlerFactory] RunSingle done: ${systemName} (${result.files.length} files, ${result.durationMs}ms)`);
+      return result;
+    } catch (err) {
+      logger.error(`[CrawlerFactory] RunSingle failed: ${systemName}`, { error: (err as Error).message });
       throw err;
     } finally {
       await crawler.close();

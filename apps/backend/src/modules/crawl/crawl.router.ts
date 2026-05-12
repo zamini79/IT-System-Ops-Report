@@ -18,6 +18,7 @@ import {
   streamCrawlHandler,
   getJobStatusHandler,
   screenshotHandler,
+  veevaDashboardHandler,
 } from "./crawl.controller";
 
 export const crawlRouter = Router();
@@ -33,6 +34,12 @@ crawlRouter.post("/start", startCrawlHandler);
 // 로그인 후 지정 URL 스크린샷 캡처 (비동기, SSE로 완료 알림)
 // ---------------------------------------------------------------------------
 crawlRouter.post("/screenshot", screenshotHandler);
+
+// ---------------------------------------------------------------------------
+// POST /api/crawl/veeva-dashboard
+// Veeva 대시보드 6개 차트 스크린샷 캡처 (임시 기능, SSE로 완료 알림)
+// ---------------------------------------------------------------------------
+crawlRouter.post("/veeva-dashboard", veevaDashboardHandler);
 
 // ---------------------------------------------------------------------------
 // GET /api/crawl/:jobId/stream  (SSE)
