@@ -8,6 +8,7 @@
  */
 
 import path                         from "path";
+import fs                          from "fs";
 import { query, withTransaction }  from "../../config/db";
 import { logger }                  from "../../utils/logger";
 import { CrawlerFactory }          from "../../engines/playwright/CrawlerFactory";
@@ -292,6 +293,160 @@ async function runScreenshotInBackground(params: {
     });
   }
 
+  jobEventBus.scheduleCleanup(jobId);
+}
+
+// ── Veeva 대시보드 캡처 잡 ──────────────────────────────────────────────────────
+
+const VEEVA_DASHBOARD_SYSTEM = "VEEVA_DASHBOARD";
+const VEEVA_DASHBOARD_DIV    = "LHOUSE" as const;
+
+/**
+ * Veeva 대시보드 스크린샷 캡처를 시작합니다 (임시 기능).
+ *
+ * 1. divisions 에서 LHOUSE division_id 조회
+ * 2. report_jobs upsert
+ * 3. crawl_tasks 레코드 생성 (PENDING)
+ * 4. runDashboardInBackground() 로 비동기 실행
+ */
+export async function startDashboardCapture(params: {
+  jobId:  string;
+  userId: string;
+}): Promise<{ taskId: string }> {
+  const { jobId, userId } = params;
+
+  const divRows = await query<{ id: string }>(
+    "SELECT id FROM divisions WHERE code = $1",
+    [VEEVA_DASHBOARD_DIV]
+  );
+  if (!divRows.length) throw new AppError(400, "LHOUSE 사업부를 찾을 수 없습니다.");
+  const divisionId = divRows[0].id;
+
+  await query(
+    `INSERT INTO report_jobs (id, division_id, status, started_at, created_by)
+     VALUES ($1, $2, 'RUNNING', NOW(), $3)
+     ON CONFLICT (id) DO UPDATE SET status = 'RUNNING', updated_at = NOW()`,
+    [jobId, divisionId, userId]
+  );
+
+  const crawlTaskResult = await query<{ id: string }>(
+    `INSERT INTO crawl_tasks (report_job_id, system_name, task_type, status)
+     VALUES ($1, $2, 'DOWNLOAD', 'PENDING')
+     ON CONFLICT (report_job_id, system_name) DO UPDATE
+       SET task_type = 'DOWNLOAD', status = 'PENDING', updated_at = NOW()
+     RETURNING id`,
+    [jobId, VEEVA_DASHBOARD_SYSTEM]
+  );
+  const taskId = crawlTaskResult[0].id;
+
+  void runDashboardInBackground(jobId, taskId);
+
+  logger.info(`[CrawlService] Dashboard capture started: job=${jobId}, task=${taskId}`);
+  return { taskId };
+}
+
+async function runDashboardInBackground(jobId: string, taskId: string): Promise<void> {
+  jobEventBus.emit(jobId, {
+    type:       "task_start",
+    systemName: VEEVA_DASHBOARD_SYSTEM,
+    total:      1,
+  });
+
+  await query(
+    `UPDATE crawl_tasks SET status = 'RUNNING', updated_at = NOW() WHERE id = $1`,
+    [taskId]
+  ).catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
+
+  try {
+    const result = await CrawlerFactory.runSingle(
+      VEEVA_DASHBOARD_SYSTEM,
+      jobId,
+      (event) => {
+        if (event.percent !== undefined || event.message) {
+          jobEventBus.emit(jobId, {
+            type:       "progress",
+            systemName: VEEVA_DASHBOARD_SYSTEM,
+            percent:    event.percent,
+            message:    event.message,
+          });
+        }
+      }
+    );
+
+    const resultPath = result.files[0] ?? null;
+
+    // ── System Usage (DX) 슬롯에 자동 등록 ──────────────────────────────────
+    if (resultPath) {
+      try {
+        const uploadDir  = process.env.UPLOAD_DIR ?? "uploads";
+        const uploadsDir = path.resolve(uploadDir, jobId, "uploads");
+        fs.mkdirSync(uploadsDir, { recursive: true });
+
+        const savedFilename = "Systemusage_LHOUSE.png";
+        const destPath      = path.join(uploadsDir, savedFilename);
+        fs.copyFileSync(resultPath, destPath);
+
+        const fileSize = fs.statSync(destPath).size;
+
+        const existing = await query<{ id: string }>(
+          "SELECT id FROM uploaded_files WHERE report_job_id = $1 AND original_name = $2",
+          [jobId, savedFilename]
+        );
+        if (existing.length) {
+          await query(
+            `UPDATE uploaded_files
+             SET stored_path = $1, file_type = 'image/png', file_size = $2,
+                 analysis_result = '{}'::jsonb, created_at = NOW()
+             WHERE id = $3`,
+            [destPath, fileSize, existing[0].id]
+          );
+          logger.info(`[CrawlService] System Usage updated: ${destPath}`);
+        } else {
+          await query(
+            `INSERT INTO uploaded_files
+               (report_job_id, original_name, stored_path, file_type, file_size)
+             VALUES ($1, $2, $3, 'image/png', $4)`,
+            [jobId, savedFilename, destPath, fileSize]
+          );
+          logger.info(`[CrawlService] System Usage saved: ${destPath}`);
+        }
+      } catch (saveErr) {
+        logger.warn(
+          `[CrawlService] System Usage 파일 등록 실패 (무시): ${(saveErr as Error).message}`
+        );
+      }
+    }
+
+    await query(
+      `UPDATE crawl_tasks SET status = 'COMPLETED', result_path = $1, updated_at = NOW() WHERE id = $2`,
+      [resultPath, taskId]
+    ).catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
+
+    jobEventBus.emit(jobId, {
+      type:       "task_done",
+      systemName: VEEVA_DASHBOARD_SYSTEM,
+      filePaths:  result.files,
+    });
+
+    logger.info(`[CrawlService] Dashboard capture done: ${resultPath}`);
+
+  } catch (err) {
+    const errMsg = (err as Error).message;
+    logger.error(`[CrawlService] Dashboard capture failed: ${errMsg}`);
+
+    await query(
+      `UPDATE crawl_tasks SET status = 'FAILED', error = $1, updated_at = NOW() WHERE id = $2`,
+      [errMsg, taskId]
+    ).catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
+
+    jobEventBus.emit(jobId, {
+      type:       "task_error",
+      systemName: VEEVA_DASHBOARD_SYSTEM,
+      error:      errMsg,
+    });
+  }
+
+  jobEventBus.emit(jobId, { type: "all_done", jobId });
   jobEventBus.scheduleCleanup(jobId);
 }
 

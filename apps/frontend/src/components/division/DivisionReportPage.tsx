@@ -93,6 +93,13 @@ function fmtDatetime(iso: string | null): string {
   return `${d.getFullYear()}.${p(d.getMonth() + 1)}.${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
+/** 백엔드 절대 경로(Windows/Unix 모두)를 /uploads/... URL로 변환 */
+function toUploadUrl(absPath: string): string {
+  const fwd = absPath.replace(/\\/g, "/");
+  const rel = fwd.replace(/^.*\/uploads\//, "");
+  return `/uploads/${rel}`;
+}
+
 function progressVariant(s: TaskState) {
   if (s.status === "FAILED")    return "danger"  as const;
   if (s.status === "COMPLETED") return "success" as const;
@@ -188,13 +195,20 @@ function SystemCard({
   onPreview,
   onCrawl,
   crawlActive,
+  onDashboardCapture,
+  dashboardCapturing,
+  dashboardTask,
 }: {
   config:       SystemConfig;
   task:         TaskState;
   onPreview:    (code: string) => void;
   /** LHOUSE 전용: 카드 내 "시스템 조회" 버튼 클릭 핸들러 */
-  onCrawl?:     () => void;
-  crawlActive?: boolean;
+  onCrawl?:             () => void;
+  crawlActive?:         boolean;
+  /** LHOUSE VEEVA 전용: 대시보드 캡처 버튼 */
+  onDashboardCapture?:  () => void;
+  dashboardCapturing?:  boolean;
+  dashboardTask?:       TaskState | null;
 }) {
   const icon = SYSTEM_ICONS[config.code] ?? DEFAULT_ICON;
 
@@ -241,6 +255,37 @@ function SystemCard({
               )}
             </button>
           )}
+          {onDashboardCapture && (
+            <button
+              onClick={onDashboardCapture}
+              disabled={dashboardCapturing}
+              title="로그인 후 Veeva 대시보드 6개 차트를 1장 이미지로 캡처합니다"
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all border
+                ${dashboardCapturing
+                  ? "bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed"
+                  : "bg-amber-50 text-amber-700 border-amber-300 hover:bg-amber-100 shadow-sm"}`}
+            >
+              {dashboardCapturing ? (
+                <>
+                  <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+                  </svg>
+                  캡처 중
+                </>
+              ) : (
+                <>
+                  <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                      d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                      d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" />
+                  </svg>
+                  대시보드 캡처
+                </>
+              )}
+            </button>
+          )}
         </div>
       </div>
 
@@ -273,6 +318,29 @@ function SystemCard({
           </button>
         )}
       </div>
+
+      {/* 대시보드 캡처 결과 다운로드 */}
+      {dashboardTask?.status === "COMPLETED" && dashboardTask.filePaths.length > 0 && (
+        <div className="flex items-center justify-between pt-1 border-t border-amber-100 bg-amber-50/60 -mx-4 px-4 pb-1 rounded-b-xl mt-1">
+          <span className="text-[11px] text-amber-700 font-medium">대시보드 캡처 완료</span>
+          <a
+            href={toUploadUrl(dashboardTask.filePaths[0])}
+            download="Systemusage_LHOUSE.jpg"
+            className="text-[11px] text-amber-600 hover:text-amber-800 hover:underline font-semibold flex items-center gap-1"
+          >
+            <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+            </svg>
+            이미지 다운로드
+          </a>
+        </div>
+      )}
+      {dashboardTask?.status === "FAILED" && dashboardTask.error && (
+        <p className="text-[11px] text-red-500 bg-red-50 rounded px-2 py-1 truncate mt-1" title={dashboardTask.error}>
+          캡처 실패: {dashboardTask.error}
+        </p>
+      )}
     </div>
   );
 }
@@ -524,15 +592,6 @@ const LHOUSE_SLOTS: Array<{
     hint:    "Excel 파일 1개 (.xlsx / .xls)",
     icon:    "X",
     iconColor: "text-green-600",
-  },
-  {
-    slot:    "systemusage",
-    label:   "System Usage (DX)",
-    savedAs: "Systemusage_LHOUSE.jpg",
-    accept:  { "image/jpeg": [".jpg", ".jpeg"], "image/png": [".png"] },
-    hint:    "JPG / PNG 파일 1개 (.jpg / .jpeg / .png)",
-    icon:    "I",
-    iconColor: "text-purple-500",
   },
 ];
 
@@ -1229,7 +1288,7 @@ function CrawlLogPanel({ logs, isConnected }: { logs: LogEntry[]; isConnected: b
   }, [logs]);
 
   return (
-    <aside className="w-72 flex-shrink-0 flex flex-col bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden sticky top-6 self-start max-h-[calc(100vh-108px)]">
+    <aside className="w-72 flex-shrink-0 flex flex-col bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden sticky top-0 self-start max-h-[calc(100vh-200px)]">
       {/* 헤더 */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100 bg-gray-50">
         <div className="flex items-center gap-2">
@@ -1357,7 +1416,7 @@ function DataPreviewPanel({
                   <p className="text-xs font-semibold text-gray-600 mb-2">스크린샷</p>
                   <div className="bg-gray-100 rounded-lg p-2">
                     <img
-                      src={`/uploads/${task.screenshot.path.split("/uploads/")[1]}`}
+                      src={toUploadUrl(task.screenshot.path)}
                       alt={`${systemLabel} 스크린샷`}
                       className="w-full rounded object-cover"
                       onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
@@ -1434,9 +1493,13 @@ export function DivisionReportPage({
   // ── 크롤 활성 상태 (버튼 클릭 후 SSE 연결) ──────────────────────────────────
   const [crawlActive, setCrawlActive] = useState(false);
 
+  // ── LHOUSE VEEVA 전용: 대시보드 캡처 상태 (시스템 조회와 독립) ─────────────────
+  const [dashboardCapturing, setDashboardCapturing] = useState(false);
+  const [dashboardActive,    setDashboardActive]    = useState(false);
+
   // ── SSE ──────────────────────────────────────────────────────────────────────
   const systemCodes = systems.map((s) => s.code);
-  const sse = useCrawlSSE(jobId, systemCodes, crawlActive);
+  const sse = useCrawlSSE(jobId, systemCodes, crawlActive || dashboardActive);
 
   // ── 로컬 진행 로그 (업로드·PDF생성 이벤트) ────────────────────────────────────
   const [localLogs, setLocalLogs] = useState<LogEntry[]>([]);
@@ -1478,6 +1541,41 @@ export function DivisionReportPage({
       toastError(msg);
     },
   });
+
+  // ── LHOUSE 전용: Veeva 대시보드 캡처 ─────────────────────────────────────────
+  const handleDashboardCapture = useCallback(async () => {
+    if (dashboardCapturing) return;
+    setDashboardCapturing(true);
+    setDashboardActive(true);
+    addLocalLog("VEEVA Dashboard", "대시보드 캡처 시작 (로그인 중…)", "info");
+    try {
+      await apiClient.post("/crawl/veeva-dashboard", {
+        jobId,
+        userId: user?.id,
+      });
+    } catch (err: unknown) {
+      const msg =
+        (err as { response?: { data?: { error?: string } } })
+          ?.response?.data?.error ?? "대시보드 캡처 요청에 실패했습니다.";
+      toastError(msg);
+      addLocalLog("VEEVA Dashboard", `캡처 요청 실패: ${msg}`, "error");
+      setDashboardCapturing(false);
+      setDashboardActive(false);
+    }
+  }, [dashboardCapturing, addLocalLog, jobId, user, toastError]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // VEEVA_DASHBOARD 태스크 완료/실패 시 dashboardCapturing · dashboardActive 해제
+  useEffect(() => {
+    if (!dashboardCapturing) return;
+    const dashTask = sse.taskMap["VEEVA_DASHBOARD"];
+    if (dashTask?.status === "COMPLETED" || dashTask?.status === "FAILED") {
+      setDashboardCapturing(false);
+      setDashboardActive(false);
+      if (dashTask.status === "COMPLETED") {
+        addLocalLog("VEEVA Dashboard", "대시보드 캡처 완료 — 이미지 다운로드 버튼을 확인하세요.", "success");
+      }
+    }
+  }, [sse.taskMap, dashboardCapturing, addLocalLog]);
 
   // ── PDF 생성 뮤테이션 (BIO / DEV 공용) ──────────────────────────────────────
   const generatePdf = useMutation({
@@ -1530,9 +1628,9 @@ export function DivisionReportPage({
     refetchInterval: 5_000,
   });
 
-  const hasActivityFile    = lhouseFileList.some((f) => f.original_name === "Activity_LHOUSE.xlsx");
-  const hasSystemusageFile = lhouseFileList.some((f) =>
-    f.original_name === "Systemusage_LHOUSE.jpg" || f.original_name === "Systemusage_LHOUSE.png"
+  const hasActivityFile      = lhouseFileList.some((f) => f.original_name === "Activity_LHOUSE.xlsx");
+  const hasSystemusageFile   = lhouseFileList.some(
+    (f) => f.original_name === "Systemusage_LHOUSE.jpg" || f.original_name === "Systemusage_LHOUSE.png"
   );
   const canGenerateLhousePdf = hasActivityFile && hasSystemusageFile;
 
@@ -1545,7 +1643,21 @@ export function DivisionReportPage({
   }
 
   async function downloadPdfBlob(endpoint: string, filename: string): Promise<void> {
-    const res = await apiClient.post(endpoint, { jobId }, { responseType: "blob" });
+    let res;
+    try {
+      res = await apiClient.post(endpoint, { jobId }, { responseType: "blob" });
+    } catch (err: unknown) {
+      // responseType:"blob" 이면 에러 응답 바디도 Blob → JSON 으로 파싱해서 재throw
+      const axiosErr = err as { response?: { data?: unknown } };
+      if (axiosErr?.response?.data instanceof Blob) {
+        try {
+          const text = await (axiosErr.response.data as Blob).text();
+          const json = JSON.parse(text) as { error?: string };
+          (axiosErr.response as Record<string, unknown>).data = json;
+        } catch { /* JSON 파싱 실패 시 원본 오류 유지 */ }
+      }
+      throw err;
+    }
     const url = URL.createObjectURL(new Blob([res.data as BlobPart], { type: "application/pdf" }));
     const a   = document.createElement("a");
     a.href = url; a.download = filename; a.click();
@@ -1617,14 +1729,15 @@ export function DivisionReportPage({
 
   // ── 렌더 ──────────────────────────────────────────────────────────────────────
   return (
-    <AppLayout title={divisionName}>
-      {/* 전체를 좌(콘텐츠) + 우(로그 패널) 2열로 */}
-      <div className="flex gap-5 items-start">
-      {/* ── 좌측: 메인 콘텐츠 ── */}
-      <div className="flex-1 min-w-0">
+    <AppLayout title={divisionName} scroll={false}>
+      <div className="h-full flex flex-col overflow-hidden">
+
+      {/* ── 고정 영역: 페이지 헤더 + 진행률 바 ── */}
+      <div className="flex-shrink-0 px-6 pt-5 pb-4 bg-gray-50 border-b border-gray-200/60">
+        <div className="max-w-screen-xl mx-auto">
 
       {/* ── 1. 페이지 헤더 ── */}
-      <div className="flex flex-wrap items-start justify-between gap-4 mb-6">
+      <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
           <h1 className="text-xl font-bold text-primary">{divisionName}</h1>
           <p className="text-sm text-gray-500 mt-0.5">
@@ -1646,7 +1759,11 @@ export function DivisionReportPage({
             <button
               onClick={() => void handleLhouseGenerate()}
               disabled={!canGenerateLhousePdf || lhouseGenerating}
-              title={!canGenerateLhousePdf ? "Activity_LHOUSE.xlsx 와 Systemusage_LHOUSE.jpg / .png 를 모두 업로드해야 합니다." : ""}
+              title={
+                !hasActivityFile    ? "Activity_LHOUSE.xlsx 를 업로드해야 합니다." :
+                !hasSystemusageFile ? "대시보드 캡처를 먼저 수행해야 합니다." :
+                ""
+              }
               className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition-all
                 ${canGenerateLhousePdf && !lhouseGenerating
                   ? "bg-secondary text-white hover:bg-secondary-600 shadow-sm"
@@ -1714,6 +1831,15 @@ export function DivisionReportPage({
           )}
         </div>
       )}
+        </div>{/* end max-w */}
+      </div>{/* end 고정 영역 */}
+
+      {/* ── 스크롤 영역: 메인 콘텐츠 + 로그 패널 ── */}
+      <div className="flex-1 overflow-y-auto min-h-0">
+        <div className="px-6 pt-4 pb-6 max-w-screen-xl mx-auto">
+          <div className="flex gap-5 items-start">
+          {/* ── 좌측: 메인 콘텐츠 ── */}
+          <div className="flex-1 min-w-0">
 
       {/* ── 2 + 3. 시스템 카드 + 파일 업로드 (sideLayout 이면 좌우 분할) ── */}
       {sideLayout ? (
@@ -1733,6 +1859,9 @@ export function DivisionReportPage({
                   onPreview={setPreviewCode}
                   onCrawl={divisionCode === "LHOUSE" || divisionCode === "DEV" ? () => startCrawl.mutate() : undefined}
                   crawlActive={crawlActive || startCrawl.isPending}
+                  onDashboardCapture={divisionCode === "LHOUSE" && sys.code === "VEEVA" ? handleDashboardCapture : undefined}
+                  dashboardCapturing={divisionCode === "LHOUSE" && sys.code === "VEEVA" ? dashboardCapturing : undefined}
+                  dashboardTask={divisionCode === "LHOUSE" && sys.code === "VEEVA" ? (sse.taskMap["VEEVA_DASHBOARD"] ?? null) : undefined}
                 />
               ))}
             </div>
@@ -1929,15 +2058,18 @@ export function DivisionReportPage({
         </div>
       </div>
 
-      </div>{/* end 좌측 콘텐츠 */}
+          </div>{/* end 좌측 콘텐츠 */}
 
-      {/* ── 우측: 진행 로그 패널 (항상 표시) ── */}
-      <CrawlLogPanel
-        logs={allLogs}
-        isConnected={sse.isConnected || lhouseGenerating || devGenerating}
-      />
+          {/* ── 우측: 진행 로그 패널 (항상 표시) ── */}
+          <CrawlLogPanel
+            logs={allLogs}
+            isConnected={sse.isConnected || lhouseGenerating || devGenerating}
+          />
 
-      </div>{/* end 2열 flex */}
+          </div>{/* end 2열 flex */}
+        </div>{/* end max-w */}
+      </div>{/* end 스크롤 영역 */}
+      </div>{/* end h-full flex-col */}
 
       {/* ── 5. 데이터 미리보기 슬라이드 패널 ── */}
       <DataPreviewPanel

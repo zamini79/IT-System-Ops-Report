@@ -9,7 +9,7 @@ import { Request, Response, NextFunction } from "express";
 import type { AuthRequest }  from "../auth/auth.types";
 import { AppError }          from "../../utils/errors";
 import { respond }           from "../../utils/response";
-import { startCrawlJob, getCrawlJobStatus, takeScreenshotJob, type ScreenshotConfig } from "./crawl.service";
+import { startCrawlJob, getCrawlJobStatus, takeScreenshotJob, startDashboardCapture, type ScreenshotConfig } from "./crawl.service";
 import { jobEventBus }       from "./crawl.events";
 import type { DivisionCode } from "../../engines/playwright/types";
 import { logger }            from "../../utils/logger";
@@ -219,6 +219,45 @@ export async function screenshotHandler(
       success: true,
       data:    { taskId, jobId },
       message: "스크린샷 작업이 시작되었습니다. SSE 스트림에서 진행 상태를 확인하세요.",
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── POST /api/crawl/veeva-dashboard ──────────────────────────────────────────
+
+/**
+ * Veeva 대시보드 스크린샷 캡처 (임시 기능).
+ *
+ * 로그인 → SKY QMS Production Vault 선택 → 대시보드 접속 →
+ * 차트 6개 렌더링 대기 → 전체 화면 스크린샷 1장 저장
+ *
+ * Request body: { jobId, userId? }
+ * 응답: 202 Accepted + { taskId }
+ * SSE: GET /:jobId/stream 에서 진행 상태 수신
+ */
+export async function veevaDashboardHandler(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
+  try {
+    const { jobId } = req.body as { jobId?: string };
+
+    if (!jobId) throw new AppError(400, "jobId 는 필수입니다.");
+
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!UUID_RE.test(jobId)) throw new AppError(400, "jobId 는 UUID 형식이어야 합니다.");
+
+    const user = (req as AuthRequest).user!;
+
+    const { taskId } = await startDashboardCapture({ jobId, userId: user.sub });
+
+    res.status(202).json({
+      success: true,
+      data:    { taskId, jobId },
+      message: "대시보드 캡처가 시작되었습니다. SSE 스트림에서 진행 상태를 확인하세요.",
     });
   } catch (err) {
     next(err);

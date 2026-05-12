@@ -10,6 +10,7 @@
  *   /dev-division
  *   /lhouse
  *   /report/generate
+ *   /report/history
  *   /mail/compose
  *
  * PrivateRoute adminOnly (role=admin 필수)
@@ -24,6 +25,7 @@ import { BioResearchPage }      from "./pages/BioResearchPage";
 import { DevDivisionPage }      from "./pages/DevDivisionPage";
 import { LhousePage }           from "./pages/LhousePage";
 import { ReportGeneratePage }   from "./pages/ReportGeneratePage";
+import { ReportHistoryPage }    from "./pages/ReportHistoryPage";
 import { MailCompose }          from "./pages/MailCompose";
 import { Settings }             from "./pages/Settings";
 
@@ -41,6 +43,7 @@ export default function App() {
         <Route path="/dev-division"   element={<DevDivisionPage />} />
         <Route path="/lhouse"         element={<LhousePage />} />
         <Route path="/report/generate" element={<ReportGeneratePage />} />
+        <Route path="/report/history" element={<ReportHistoryPage />} />
         <Route path="/mail/compose"   element={<MailCompose />} />
       </Route>
 

@@ -181,7 +181,16 @@ function lookupApprox(
 function readCategorySheet(xlsxPath: string): CategoryCounts {
   logger.info(`[LHOUSE] Category 집계 시작: ${xlsxPath}`);
 
-  const wb = XLSX.readFile(xlsxPath);
+  let wb: ReturnType<typeof XLSX.readFile>;
+  try {
+    wb = XLSX.readFile(xlsxPath);
+  } catch (e) {
+    const msg = (e as Error).message ?? "";
+    if (/encrypt|password|ecma-376/i.test(msg)) {
+      throw new AppError(400, "Activity_LHOUSE.xlsx 파일이 암호화(비밀번호 보호)되어 있습니다. Excel에서 암호를 해제한 후 다시 업로드해주세요.");
+    }
+    throw new AppError(400, `Activity_LHOUSE.xlsx 파일을 읽을 수 없습니다: ${msg}`);
+  }
   const ws = wb.Sheets["Category"];
 
   if (!ws) {
@@ -226,13 +235,24 @@ function readCategorySheet(xlsxPath: string): CategoryCounts {
   try {
     fs.mkdirSync(tmpDir, { recursive: true });
 
-    // workbook.xml + rels 로 Export 시트 XML 파일명 확인
-    execSync(
-      `unzip -j "${xlsxPath}" "xl/workbook.xml" "xl/_rels/workbook.xml.rels" -d "${tmpDir}" 2>/dev/null`,
-      { stdio: "pipe" }
-    );
-    const wbXml   = fs.readFileSync(path.join(tmpDir, "workbook.xml"),     "utf-8");
-    const relsXml = fs.readFileSync(path.join(tmpDir, "workbook.xml.rels"), "utf-8");
+    // xlsx(ZIP) 압축 해제 — Windows: PowerShell Expand-Archive, Others: unzip
+    if (process.platform === "win32") {
+      const src  = xlsxPath.replace(/'/g, "''");
+      const dst  = tmpDir.replace(/'/g, "''");
+      execSync(
+        `powershell -NoProfile -Command "Expand-Archive -LiteralPath '${src}' -DestinationPath '${dst}' -Force"`,
+        { stdio: "pipe", timeout: 60_000 }
+      );
+    } else {
+      execSync(
+        `unzip -o "${xlsxPath}" -d "${tmpDir}" 2>/dev/null`,
+        { stdio: "pipe" }
+      );
+    }
+
+    // Expand-Archive/unzip 모두 디렉터리 구조를 유지하므로 xl/ 하위에서 읽음
+    const wbXml   = fs.readFileSync(path.join(tmpDir, "xl", "workbook.xml"),           "utf-8");
+    const relsXml = fs.readFileSync(path.join(tmpDir, "xl", "_rels", "workbook.xml.rels"), "utf-8");
 
     const sheetMatch = wbXml.match(/name="Export"[^>]+r:id="(rId\d+)"/);
     const rId        = sheetMatch?.[1];
@@ -247,8 +267,8 @@ function readCategorySheet(xlsxPath: string): CategoryCounts {
       logger.info(`[LHOUSE] Export XML 경로: ${xmlPath ?? "미발견"}`);
 
       if (xmlPath) {
-        execSync(`unzip -j "${xlsxPath}" "${xmlPath}" -d "${tmpDir}" 2>/dev/null`, { stdio: "pipe" });
-        const sheetXml = fs.readFileSync(path.join(tmpDir, path.basename(xmlPath)), "utf-8");
+        // 파일은 이미 압축 해제됨 — xmlPath 의 세그먼트로 직접 읽음
+        const sheetXml = fs.readFileSync(path.join(tmpDir, ...xmlPath.split("/")), "utf-8");
         logger.info(`[LHOUSE] Export XML 크기: ${sheetXml.length.toLocaleString()} bytes`);
 
         for (const m of sheetXml.matchAll(
