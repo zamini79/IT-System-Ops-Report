@@ -818,15 +818,6 @@ interface DevSlotGroup {
 
 const DEV_SLOT_GROUPS: DevSlotGroup[] = [
   {
-    groupLabel:  "GCP Quality System (eDMS / eQMS / eLMS)",
-    subLabel:    "차트 6개 (3열 × 2행) 자동 분할",
-    color:       "border-blue-400 text-blue-700 bg-blue-50",
-    slot:        "systemusage_gcp",
-    savedAs:     "Systemusage_GCP.jpg",
-    chartCount:  6,
-    chartLayout: "3×2",
-  },
-  {
     groupLabel:  "Medical Contents Management System (Medcomms)",
     subLabel:    "차트 6개 (3열 × 2행) 자동 분할",
     color:       "border-orange-400 text-orange-700 bg-orange-50",
@@ -1497,9 +1488,17 @@ export function DivisionReportPage({
   const [dashboardCapturing, setDashboardCapturing] = useState(false);
   const [dashboardActive,    setDashboardActive]    = useState(false);
 
+  // ── DEV GCP 전용: 대시보드 캡처 상태 ──────────────────────────────────────────
+  const [gcpDashboardCapturing, setGcpDashboardCapturing] = useState(false);
+  const [gcpDashboardActive,    setGcpDashboardActive]    = useState(false);
+
+  // ── DEV Medcomms 전용: 대시보드 캡처 상태 ─────────────────────────────────────
+  const [medcommsDashboardCapturing, setMedcommsDashboardCapturing] = useState(false);
+  const [medcommsDashboardActive,    setMedcommsDashboardActive]    = useState(false);
+
   // ── SSE ──────────────────────────────────────────────────────────────────────
   const systemCodes = systems.map((s) => s.code);
-  const sse = useCrawlSSE(jobId, systemCodes, crawlActive || dashboardActive);
+  const sse = useCrawlSSE(jobId, systemCodes, crawlActive || dashboardActive || gcpDashboardActive || medcommsDashboardActive);
 
   // ── 로컬 진행 로그 (업로드·PDF생성 이벤트) ────────────────────────────────────
   const [localLogs, setLocalLogs] = useState<LogEntry[]>([]);
@@ -1577,6 +1576,50 @@ export function DivisionReportPage({
     }
   }, [sse.taskMap, dashboardCapturing, addLocalLog]);
 
+  // ── DEV GCP 전용: GCP Quality System 대시보드 캡처 ───────────────────────────
+  const handleGcpDashboardCapture = useCallback(async () => {
+    if (gcpDashboardCapturing) return;
+    setGcpDashboardCapturing(true);
+    setGcpDashboardActive(true);
+    addLocalLog("GCP Dashboard", "GCP 대시보드 캡처 시작 (로그인 중…)", "info");
+    try {
+      await apiClient.post("/crawl/gcp-dashboard", {
+        jobId,
+        userId: user?.id,
+      });
+    } catch (err: unknown) {
+      const msg =
+        (err as { response?: { data?: { error?: string } } })
+          ?.response?.data?.error ?? "GCP 대시보드 캡처 요청에 실패했습니다.";
+      toastError(msg);
+      addLocalLog("GCP Dashboard", `캡처 요청 실패: ${msg}`, "error");
+      setGcpDashboardCapturing(false);
+      setGcpDashboardActive(false);
+    }
+  }, [gcpDashboardCapturing, addLocalLog, jobId, user, toastError]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── DEV Medcomms 전용: Medcomms 대시보드 캡처 ─────────────────────────────────
+  const handleMedcommsDashboardCapture = useCallback(async () => {
+    if (medcommsDashboardCapturing) return;
+    setMedcommsDashboardCapturing(true);
+    setMedcommsDashboardActive(true);
+    addLocalLog("Medcomms Dashboard", "Medcomms 대시보드 캡처 시작 (로그인 중…)", "info");
+    try {
+      await apiClient.post("/crawl/medcomms-dashboard", {
+        jobId,
+        userId: user?.id,
+      });
+    } catch (err: unknown) {
+      const msg =
+        (err as { response?: { data?: { error?: string } } })
+          ?.response?.data?.error ?? "Medcomms 대시보드 캡처 요청에 실패했습니다.";
+      toastError(msg);
+      addLocalLog("Medcomms Dashboard", `캡처 요청 실패: ${msg}`, "error");
+      setMedcommsDashboardCapturing(false);
+      setMedcommsDashboardActive(false);
+    }
+  }, [medcommsDashboardCapturing, addLocalLog, jobId, user, toastError]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // ── PDF 생성 뮤테이션 (BIO / DEV 공용) ──────────────────────────────────────
   const generatePdf = useMutation({
     mutationFn: () =>
@@ -1616,6 +1659,34 @@ export function DivisionReportPage({
     enabled:         divisionCode === "DEV",
     refetchInterval: 5_000,
   });
+
+  // GCP_DASHBOARD 태스크 완료/실패 시 상태 해제 + 파일 목록 즉시 갱신
+  useEffect(() => {
+    if (!gcpDashboardCapturing) return;
+    const gcpTask = sse.taskMap["GCP_DASHBOARD"];
+    if (gcpTask?.status === "COMPLETED" || gcpTask?.status === "FAILED") {
+      setGcpDashboardCapturing(false);
+      setGcpDashboardActive(false);
+      if (gcpTask.status === "COMPLETED") {
+        addLocalLog("GCP Dashboard", "대시보드 캡처 완료 — Systemusage_GCP.png 로 저장되었습니다.", "success");
+        void refetchDevFiles();
+      }
+    }
+  }, [sse.taskMap, gcpDashboardCapturing, addLocalLog, refetchDevFiles]);
+
+  // MEDCOMMS_DASHBOARD 태스크 완료/실패 시 상태 해제 + 파일 목록 즉시 갱신
+  useEffect(() => {
+    if (!medcommsDashboardCapturing) return;
+    const medcommsTask = sse.taskMap["MEDCOMMS_DASHBOARD"];
+    if (medcommsTask?.status === "COMPLETED" || medcommsTask?.status === "FAILED") {
+      setMedcommsDashboardCapturing(false);
+      setMedcommsDashboardActive(false);
+      if (medcommsTask.status === "COMPLETED") {
+        addLocalLog("Medcomms Dashboard", "대시보드 캡처 완료 — Systemusage_Medcomms.png 로 저장되었습니다.", "success");
+        void refetchDevFiles();
+      }
+    }
+  }, [sse.taskMap, medcommsDashboardCapturing, addLocalLog, refetchDevFiles]);
 
   // ── BIO 전용: 업로드 파일 목록 조회 (5초 폴링) ───────────────────────────────
   const { data: bioFileList = [], refetch: refetchBioFiles } = useQuery({
@@ -1859,9 +1930,24 @@ export function DivisionReportPage({
                   onPreview={setPreviewCode}
                   onCrawl={divisionCode === "LHOUSE" || divisionCode === "DEV" ? () => startCrawl.mutate() : undefined}
                   crawlActive={crawlActive || startCrawl.isPending}
-                  onDashboardCapture={divisionCode === "LHOUSE" && sys.code === "VEEVA" ? handleDashboardCapture : undefined}
-                  dashboardCapturing={divisionCode === "LHOUSE" && sys.code === "VEEVA" ? dashboardCapturing : undefined}
-                  dashboardTask={divisionCode === "LHOUSE" && sys.code === "VEEVA" ? (sse.taskMap["VEEVA_DASHBOARD"] ?? null) : undefined}
+                  onDashboardCapture={
+                    (divisionCode === "LHOUSE" && sys.code === "VEEVA")         ? handleDashboardCapture :
+                    (divisionCode === "DEV"    && sys.code === "GCP_QUALITY")   ? handleGcpDashboardCapture :
+                    (divisionCode === "DEV"    && sys.code === "MEDCOMMS")      ? handleMedcommsDashboardCapture :
+                    undefined
+                  }
+                  dashboardCapturing={
+                    (divisionCode === "LHOUSE" && sys.code === "VEEVA")         ? dashboardCapturing :
+                    (divisionCode === "DEV"    && sys.code === "GCP_QUALITY")   ? gcpDashboardCapturing :
+                    (divisionCode === "DEV"    && sys.code === "MEDCOMMS")      ? medcommsDashboardCapturing :
+                    undefined
+                  }
+                  dashboardTask={
+                    (divisionCode === "LHOUSE" && sys.code === "VEEVA")         ? (sse.taskMap["VEEVA_DASHBOARD"]    ?? null) :
+                    (divisionCode === "DEV"    && sys.code === "GCP_QUALITY")   ? (sse.taskMap["GCP_DASHBOARD"]      ?? null) :
+                    (divisionCode === "DEV"    && sys.code === "MEDCOMMS")      ? (sse.taskMap["MEDCOMMS_DASHBOARD"] ?? null) :
+                    undefined
+                  }
                 />
               ))}
             </div>

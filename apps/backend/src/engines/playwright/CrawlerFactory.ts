@@ -31,6 +31,10 @@ import { DevJiraCrawler }          from "./crawlers/dev/DevJiraCrawler";
 import { LhouseVeevaCrawler }           from "./crawlers/lhouse/LhouseVeevaCrawler";
 import { LhouseVeevaDashboardCrawler }  from "./crawlers/lhouse/LhouseVeevaDashboardCrawler";
 
+// ── DEV 대시보드 전용 크롤러 ──────────────────────────────────────────────────
+import { DevGcpDashboardCrawler }       from "./crawlers/dev/DevGcpDashboardCrawler";
+import { DevMedcommsDashboardCrawler }  from "./crawlers/dev/DevMedcommsDashboardCrawler";
+
 // ── 크롤러 레지스트리 ─────────────────────────────────────────────────────────
 // 새 크롤러 추가 시 이 맵에만 등록하면 됩니다.
 type CrawlerCtor = new (ctx: ConstructorParameters<typeof BaseCrawler>[0]) => BaseCrawler;
@@ -60,7 +64,9 @@ const REGISTRY: Record<DivisionCode, Record<string, CrawlerCtor>> = {
 
 // 전체 크롤 대상에는 포함되지 않는 단일 실행 전용 크롤러
 const SINGLE_REGISTRY: Record<string, CrawlerCtor> = {
-  VEEVA_DASHBOARD: LhouseVeevaDashboardCrawler,
+  VEEVA_DASHBOARD:    LhouseVeevaDashboardCrawler,
+  GCP_DASHBOARD:      DevGcpDashboardCrawler,
+  MEDCOMMS_DASHBOARD: DevMedcommsDashboardCrawler,
 };
 
 // ── 팩토리 ───────────────────────────────────────────────────────────────────

@@ -19,6 +19,8 @@ import {
   getJobStatusHandler,
   screenshotHandler,
   veevaDashboardHandler,
+  gcpDashboardHandler,
+  medcommsDashboardHandler,
 } from "./crawl.controller";
 
 export const crawlRouter = Router();
@@ -37,9 +39,21 @@ crawlRouter.post("/screenshot", screenshotHandler);
 
 // ---------------------------------------------------------------------------
 // POST /api/crawl/veeva-dashboard
-// Veeva 대시보드 6개 차트 스크린샷 캡처 (임시 기능, SSE로 완료 알림)
+// Veeva 대시보드 6개 차트 스크린샷 캡처 (LHOUSE, SSE로 완료 알림)
 // ---------------------------------------------------------------------------
 crawlRouter.post("/veeva-dashboard", veevaDashboardHandler);
+
+// ---------------------------------------------------------------------------
+// POST /api/crawl/gcp-dashboard
+// GCP Quality System Veeva 대시보드 스크린샷 캡처 (DEV, SSE로 완료 알림)
+// ---------------------------------------------------------------------------
+crawlRouter.post("/gcp-dashboard", gcpDashboardHandler);
+
+// ---------------------------------------------------------------------------
+// POST /api/crawl/medcomms-dashboard
+// Medcomms Veeva 대시보드 스크린샷 캡처 (DEV, SSE로 완료 알림)
+// ---------------------------------------------------------------------------
+crawlRouter.post("/medcomms-dashboard", medcommsDashboardHandler);
 
 // ---------------------------------------------------------------------------
 // GET /api/crawl/:jobId/stream  (SSE)
