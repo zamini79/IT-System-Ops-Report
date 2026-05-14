@@ -12,9 +12,11 @@ import type { AuthRequest } from "../auth/auth.types";
 import multer, { FileFilterCallback } from "multer";
 import path   from "path";
 import fs     from "fs";
+import * as XLSX from "xlsx";
 import { v4 as uuidv4 } from "uuid";
 import { respond }       from "../../utils/response";
 import { AppError }      from "../../utils/errors";
+import { logger }        from "../../utils/logger";
 import {
   saveUploadedFiles,
   saveNamedUploadedFile,
@@ -408,6 +410,27 @@ fileRouter.post(
         : cfg.filename;
 
       const saved = await saveNamedUploadedFile(jobId, divisionCode, userId!, file, savedFilename);
+
+      // Excel 슬롯: 암호화 여부 검증 (저장 직후 읽기 시도)
+      const EXCEL_SLOTS = new Set<NamedSlot>(["timesheet", "activity", "activity_gcp", "lims", "eln_report", "eln_service"]);
+      if (EXCEL_SLOTS.has(slot)) {
+        try {
+          XLSX.readFile(file.path, { sheetRows: 1 });
+        } catch (e) {
+          const msg = (e as Error).message ?? "";
+          if (/ecma-376|encrypt|password/i.test(msg)) {
+            await deleteFile(saved.id);
+            throw new AppError(
+              400,
+              `'${cfg.label}' 파일이 암호화(비밀번호 보호)되어 있어 읽을 수 없습니다. ` +
+              "Excel에서 비밀번호를 제거한 후 다시 업로드해 주세요. " +
+              "(방법: [검토] 탭 → [시트 보호 해제] 또는 저장 시 암호 옵션 제거)"
+            );
+          }
+          // 그 외 읽기 오류는 경고만 남기고 허용
+          logger.warn(`[FileRouter] xlsx 검증 경고 (${savedFilename}): ${msg}`);
+        }
+      }
 
       triggerAnalysis([saved.id]);
 

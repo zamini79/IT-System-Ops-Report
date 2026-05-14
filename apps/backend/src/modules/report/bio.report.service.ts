@@ -17,6 +17,7 @@ import { chromium } from "playwright";
 const sharp = require("sharp") as (input: any, options?: any) => any;
 
 import { logger }       from "../../utils/logger";
+import { AppError }     from "../../utils/errors";
 import { PdfGenerator } from "../../engines/report/PdfGenerator";
 import { query }        from "../../config/db";
 
@@ -386,7 +387,20 @@ function loadChartJsScript(): string {
  *  - 최신 월 시트의 SKB R&D 그룹 하위 행 → E/G/H/I/J/K/L/M 수집 (표 용)
  */
 function readMsTimesheetData(xlsxPath: string): MsTimesheetData {
-  const wb = XLSX.readFile(xlsxPath);
+  let wb: XLSX.WorkBook;
+  try {
+    wb = XLSX.readFile(xlsxPath);
+  } catch (e) {
+    const msg = (e as Error).message ?? "";
+    if (/ecma-376|encrypt|password/i.test(msg)) {
+      throw new AppError(
+        400,
+        "Timesheet 파일이 암호화(비밀번호 보호)되어 있습니다. " +
+        "Excel에서 비밀번호를 제거한 후 다시 업로드해 주세요."
+      );
+    }
+    throw e;
+  }
 
   // YYYY-MM 시트만 오름차순 정렬
   const monthSheets = wb.SheetNames
@@ -1059,6 +1073,7 @@ export async function generateBioReport(jobId: string): Promise<BioReportResult>
       logger.info("[BIO Report] Timesheet 파일 없음 — MS 페이지 생략");
     }
   } catch (e) {
+    if (e instanceof AppError) throw e;
     logger.error(`[BIO Report] Timesheet 처리 실패 (무시): ${(e as Error).message}`);
     msData = null;
   }

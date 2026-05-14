@@ -2,22 +2,13 @@
  * LHOUSE 보고서 생성 서비스
  *
  * ── 차트 데이터 읽기 ────────────────────────────────────────────────────────
- *  Activity.xlsx → Category 시트
- *    D2 / D3 / D4 : 시스템 구분 이름 (레이블) — SheetJS 직접 읽기
- *    E2 / E3 / E4 : 총 Task 실행 수 (값)     — 직접 계산 (캐시값 불신)
+ *  Activity_LHOUSE.xlsx → Export 시트 B열
+ *    B열: 이름(카테고리) 값 → 고유값별 건수 집계 → 도넛 차트
  *
- *  ── E2:E4 캐시값이 항상 0인 이유 ────────────────────────────────────────
- *  E2 = COUNTIF(Export!B:B, "eQMS")
- *  Export!B = LOOKUP(A, Category!A, Category!B)  ← 결과 텍스트여야 하나
- *             xlsx 저장 시 t:"n"(숫자) 타입으로 캐시됨
- *  → COUNTIF 가 문자열 "eQMS"를 찾지 못해 항상 0
- *  → SheetJS 는 공식을 재계산하지 않으므로 캐시값 0을 그대로 반환
- *
- *  ── 직접 계산 방법 ───────────────────────────────────────────────────────
- *  ① Category!A/B → Name→Category 매핑 테이블 구성 (SheetJS)
- *  ② Export 시트 XML 직접 파싱 → A열 inlineStr 추출 (54,488개)
- *     (SheetJS 는 inlineStr 셀을 정상 파싱 못해 행수 1로 반환)
- *  ③ D2/D3/D4 레이블 순서대로 카운트 → E2/E3/E4 값으로 사용
+ *  ── 왜 XML 직접 파싱인가 ──────────────────────────────────────────────────
+ *  Export 시트 B열 셀이 inlineStr / sharedString / str 등 다양한 타입으로
+ *  저장될 수 있어 SheetJS 만으로는 정확하게 읽히지 않을 수 있음.
+ *  xlsx(ZIP)를 직접 해제하여 XML 원문을 파싱하고 타입별로 값을 추출함.
  */
 
 import fs   from "fs";
@@ -56,11 +47,6 @@ function normalizeXmlText(s: string): string {
     .replace(/&apos;/g, "'")
     .trim()
     .replace(/\s+/g, " ");   // 이중 공백 → 단일 공백
-}
-
-/** 일반 문자열 정규화 (SheetJS 읽기값, 매핑 키 통일용) */
-function normalizeText(s: string): string {
-  return String(s).trim().replace(/\s+/g, " ");
 }
 
 // ── 차트 데이터 집계 ──────────────────────────────────────────────────────────
@@ -141,47 +127,28 @@ function formatMonthKorean(yyyymm: string): string {
 }
 
 /**
- * Excel LOOKUP 근사 매칭을 재현합니다.
+ * Activity_LHOUSE.xlsx → Export B열 카테고리별 건수 집계
  *
- * LOOKUP(target, sortedKeys, values) 는 정렬된 키 목록에서
- * target 보다 알파벳순으로 크지 않은 마지막 항목의 값을 반환합니다.
- * 정확히 일치하지 않아도 모든 행에 카테고리를 할당합니다.
+ * ── Export B열이 왜 직접 읽히지 않는가 ────────────────────────────────────
+ * Export!B = LOOKUP(A, Category!A, Category!B)
+ * xlsx 저장 시 수식 결과가 t="n"(숫자 0.0)으로 잘못 캐시됨.
+ * SheetJS 및 XML 파싱 모두 실제 카테고리 텍스트를 읽지 못함.
+ *
+ * ── 대안: 서버에서 LOOKUP 직접 재계산 ─────────────────────────────────────
+ * ① Category!A/B (SheetJS) → {name→category} 매핑 테이블 구성
+ * ② Export!A (XML 직접파싱, inlineStr ~44,000행) → Activity 이름 목록 추출
+ * ③ 각 Activity 이름을 LOOKUP 근사 매칭으로 카테고리 분류 → 건수 집계
+ *
+ * ── 왜 XML 직접 파싱인가 ──────────────────────────────────────────────────
+ * Export!A 셀이 t="inlineStr" 타입으로 저장되어 SheetJS로 정상 파싱 불가.
+ * xlsx(ZIP)를 압축 해제하여 XML 원문을 정규식으로 읽음.
+ * Windows에서 Expand-Archive는 .xlsx 확장자를 거부하므로 .zip 복사본 사용.
  */
-function lookupApprox(
-  target: string,
-  table:  Array<{ name: string; cat: string }>,  // name 기준 오름차순 정렬 필수
-): string | null {
-  let result: string | null = null;
-  for (const entry of table) {
-    if (entry.name.localeCompare(target) <= 0) result = entry.cat;
-    else break;
-  }
-  return result;
-}
+function readExportBColumn(xlsxPath: string): CategoryCounts {
+  logger.info(`[LHOUSE] Export B열(카테고리) 집계 시작: ${xlsxPath}`);
 
-/**
- * Category 시트 D2:D4 레이블을 읽고,
- * Export 시트 A열 전체를 파싱하여 Excel LOOKUP 근사 매칭으로
- * eQMS / eDMS / eLMS 건수를 집계합니다.
- *
- * ── 왜 직접 계산하는가 ────────────────────────────────────────────────────
- * E2 = COUNTIF(Export!B:B, "eQMS")
- * Export!B = LOOKUP(A, Category!A, Category!B)  ← 결과가 텍스트여야 하나
- *            xlsx 저장 시 t:"n"(숫자) 타입으로 캐시되어 항상 0 반환
- * → SheetJS 캐시값 사용 불가, 서버에서 LOOKUP 공식을 직접 재현
- *
- * ── HTML 엔티티 & 공백 정규화 ────────────────────────────────────────────
- * Export A열 XML 에 &amp; 등 HTML 엔티티와 이중 공백이 포함될 수 있음
- * → normalizeXmlText / normalizeText 로 통일하여 매핑 오류 방지
- *
- * ── LOOKUP 근사 매칭으로 전체 집계 ──────────────────────────────────────
- * Category A열에 없는 activity name 도 LOOKUP 이 가장 가까운 값으로 카테고리 반환
- * → 정확 매칭만 하면 일부 행 누락; 근사 매칭으로 전체 54,488건 카운트
- */
-function readCategorySheet(xlsxPath: string): CategoryCounts {
-  logger.info(`[LHOUSE] Category 집계 시작: ${xlsxPath}`);
-
-  let wb: ReturnType<typeof XLSX.readFile>;
+  // ── 암호화 검사 ───────────────────────────────────────────────────────────
+  let wb: XLSX.WorkBook;
   try {
     wb = XLSX.readFile(xlsxPath);
   } catch (e) {
@@ -191,67 +158,48 @@ function readCategorySheet(xlsxPath: string): CategoryCounts {
     }
     throw new AppError(400, `Activity_LHOUSE.xlsx 파일을 읽을 수 없습니다: ${msg}`);
   }
-  const ws = wb.Sheets["Category"];
 
-  if (!ws) {
-    logger.error("[LHOUSE] Category 시트 없음. 존재 시트: " + JSON.stringify(wb.SheetNames));
-    return { labels: ["eQMS", "eDMS", "eLMS"], values: [0, 0, 0], total: 0 };
+  // ── ① Category!A/B → {name → category} 매핑 테이블 (SheetJS) ──────────
+  const catWs = wb.Sheets["Category"];
+  if (!catWs) {
+    logger.error("[LHOUSE] Category 시트 없음");
+    return { labels: [], values: [], total: 0 };
   }
 
-  // ── ① D2:D4 레이블 읽기 (SheetJS — 정상 동작) ───────────────────────────
-  const labels = ["D2", "D3", "D4"].map((addr) => {
-    const c = ws[addr];
-    const v = c ? String(c.v ?? "").trim() : "";
-    logger.info(`[LHOUSE] 셀 ${addr}: "${v}"`);
-    return v;
-  }).filter(Boolean);
-
-  if (labels.length === 0) {
-    logger.error("[LHOUSE] D2:D4 레이블 읽기 실패");
-    return { labels: ["eQMS", "eDMS", "eLMS"], values: [0, 0, 0], total: 0 };
-  }
-  logger.info(`[LHOUSE] 레이블: ${JSON.stringify(labels)}`);
-
-  // ── ② Category A/B → LOOKUP 테이블 구성 (알파벳 오름차순 정렬) ──────────
-  //    Excel LOOKUP 근사 매칭은 정렬된 배열 필수
-  const raw        = XLSX.utils.sheet_to_json<unknown[]>(ws, { header: 1, defval: "" }) as unknown[][];
-  const lookupTable = raw
+  const catRows = XLSX.utils.sheet_to_json<unknown[]>(catWs, { header: 1, defval: "" }) as unknown[][];
+  const lookupTable = catRows
     .slice(1)
     .map((row) => ({
-      name: normalizeText(String((row as unknown[])[0] ?? "")),
-      cat:  normalizeText(String((row as unknown[])[1] ?? "")),
+      name: String((row as unknown[])[0] ?? "").trim().replace(/\s+/g, " "),
+      cat:  String((row as unknown[])[1] ?? "").trim().replace(/\s+/g, " "),
     }))
     .filter((e) => e.name && e.cat)
     .sort((a, b) => a.name.localeCompare(b.name));
 
-  logger.info(`[LHOUSE] LOOKUP 테이블: ${lookupTable.length}개 항목`);
+  logger.info(`[LHOUSE] Category LOOKUP 테이블: ${lookupTable.length}개 항목`);
 
-  // ── ③ Export 시트 A열 XML 직접 파싱 (inlineStr, 54,488행) ────────────────
-  //    SheetJS 는 inlineStr 타입 셀을 읽지 못해 행수 1로 반환하므로
-  //    xlsx(ZIP) 에서 Export 시트 XML 을 꺼내 정규식으로 파싱합니다.
-  const tmpDir = path.join(path.dirname(xlsxPath), `_tmp_${Date.now()}`);
+  // ── ② Export!A (inlineStr) XML 직접 파싱 ────────────────────────────────
+  const tmpDir       = path.join(path.dirname(xlsxPath), `_tmp_${Date.now()}`);
   let   exportAValues: string[] = [];
 
   try {
     fs.mkdirSync(tmpDir, { recursive: true });
 
-    // xlsx(ZIP) 압축 해제 — Windows: PowerShell Expand-Archive, Others: unzip
     if (process.platform === "win32") {
-      const src  = xlsxPath.replace(/'/g, "''");
-      const dst  = tmpDir.replace(/'/g, "''");
+      // Expand-Archive는 .xlsx 확장자를 거부 → .zip 복사본으로 압축 해제
+      const zipCopy = path.join(tmpDir, "source.zip");
+      fs.copyFileSync(xlsxPath, zipCopy);
+      const zipSrc = zipCopy.replace(/'/g, "''");
+      const dst    = tmpDir.replace(/'/g, "''");
       execSync(
-        `powershell -NoProfile -Command "Expand-Archive -LiteralPath '${src}' -DestinationPath '${dst}' -Force"`,
+        `powershell -NoProfile -Command "Expand-Archive -LiteralPath '${zipSrc}' -DestinationPath '${dst}' -Force"`,
         { stdio: "pipe", timeout: 60_000 }
       );
     } else {
-      execSync(
-        `unzip -o "${xlsxPath}" -d "${tmpDir}" 2>/dev/null`,
-        { stdio: "pipe" }
-      );
+      execSync(`unzip -o "${xlsxPath}" -d "${tmpDir}" 2>/dev/null`, { stdio: "pipe" });
     }
 
-    // Expand-Archive/unzip 모두 디렉터리 구조를 유지하므로 xl/ 하위에서 읽음
-    const wbXml   = fs.readFileSync(path.join(tmpDir, "xl", "workbook.xml"),           "utf-8");
+    const wbXml   = fs.readFileSync(path.join(tmpDir, "xl", "workbook.xml"), "utf-8");
     const relsXml = fs.readFileSync(path.join(tmpDir, "xl", "_rels", "workbook.xml.rels"), "utf-8");
 
     const sheetMatch = wbXml.match(/name="Export"[^>]+r:id="(rId\d+)"/);
@@ -260,24 +208,21 @@ function readCategorySheet(xlsxPath: string): CategoryCounts {
 
     if (rId) {
       const relMatch  = relsXml.match(new RegExp(`Id="${rId}"[^>]*Target="([^"]+)"`));
-      const relTarget = relMatch?.[1];   // e.g. "worksheets/sheet2.xml"
+      const relTarget = relMatch?.[1];
       const xmlPath   = relTarget
         ? (relTarget.startsWith("xl/") ? relTarget : `xl/${relTarget}`)
         : null;
-      logger.info(`[LHOUSE] Export XML 경로: ${xmlPath ?? "미발견"}`);
 
       if (xmlPath) {
-        // 파일은 이미 압축 해제됨 — xmlPath 의 세그먼트로 직접 읽음
         const sheetXml = fs.readFileSync(path.join(tmpDir, ...xmlPath.split("/")), "utf-8");
         logger.info(`[LHOUSE] Export XML 크기: ${sheetXml.length.toLocaleString()} bytes`);
 
         for (const m of sheetXml.matchAll(
           /<c r="A\d+"[^>]*t="inlineStr"[^>]*><is><t>(.*?)<\/t><\/is><\/c>/g
         )) {
-          // HTML 엔티티 디코드 + 공백 정규화 (예: &amp; → &, 이중공백 → 단일공백)
           exportAValues.push(normalizeXmlText(m[1]));
         }
-        logger.info(`[LHOUSE] Export A열 추출: ${exportAValues.length.toLocaleString()}건`);
+        logger.info(`[LHOUSE] Export A열(inlineStr) 추출: ${exportAValues.length.toLocaleString()}건`);
       }
     }
   } catch (e) {
@@ -286,26 +231,49 @@ function readCategorySheet(xlsxPath: string): CategoryCounts {
     if (fs.existsSync(tmpDir)) fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 
-  // ── ④ 레이블별 카운트 (LOOKUP 근사 매칭으로 전체 행 카운트) ───────────────
-  //    정확 매칭이 아닌 LOOKUP 근사 매칭 사용 → 모든 행이 카운트됨
-  const counts = new Map<string, number>(labels.map((l) => [l, 0]));
-  let noMatch = 0;
+  if (exportAValues.length === 0) {
+    logger.warn("[LHOUSE] Export A열에서 추출된 값 없음");
+    return { labels: [], values: [], total: 0 };
+  }
+
+  // ── ③ LOOKUP 근사 매칭으로 카테고리별 건수 집계 ─────────────────────────
+  const countsMap = new Map<string, number>();
 
   for (const name of exportAValues) {
-    const cat = lookupApprox(name, lookupTable);
-    if (cat && counts.has(cat)) {
-      counts.set(cat, counts.get(cat)! + 1);
-    } else {
-      noMatch++;
+    // Excel LOOKUP 근사 매칭: 정렬된 배열에서 ≤ name 인 마지막 항목 반환
+    let cat: string | null = null;
+    for (const entry of lookupTable) {
+      if (entry.name.localeCompare(name) <= 0) cat = entry.cat;
+      else break;
     }
-  }
-  if (noMatch > 0) {
-    logger.warn(`[LHOUSE] LOOKUP 결과가 레이블 외 카테고리인 행: ${noMatch}건`);
+    if (cat) countsMap.set(cat, (countsMap.get(cat) ?? 0) + 1);
   }
 
-  const values = labels.map((l) => counts.get(l) ?? 0);
-  const total  = values.reduce((s, v) => s + v, 0);
+  logger.info(`[LHOUSE] 카테고리 분류 완료: ${[...countsMap.entries()].map(([k,v])=>`${k}:${v}`).join(", ")}`);
 
+  if (countsMap.size === 0) {
+    logger.warn("[LHOUSE] 카테고리 매칭 결과 없음");
+    return { labels: [], values: [], total: 0 };
+  }
+
+  // 건수 내림차순 정렬 → 상위 9개 초과 시 "기타" 통합
+  const MAX_SLICES = 9;
+  const sorted = [...countsMap.entries()].sort((a, b) => b[1] - a[1]);
+
+  let labels: string[];
+  let values: number[];
+
+  if (sorted.length <= MAX_SLICES) {
+    labels = sorted.map(([k]) => k);
+    values = sorted.map(([, v]) => v);
+  } else {
+    const top  = sorted.slice(0, MAX_SLICES);
+    const rest = sorted.slice(MAX_SLICES);
+    labels = [...top.map(([k]) => k), "기타"];
+    values = [...top.map(([, v]) => v), rest.reduce((s, [, v]) => s + v, 0)];
+  }
+
+  const total = values.reduce((s, v) => s + v, 0);
   logger.info(`[LHOUSE] 집계 완료 — ${labels.map((l, i) => `${l}:${values[i]}`).join(", ")}, 합계:${total}`);
   return { labels, values, total };
 }
@@ -343,13 +311,11 @@ async function renderDoughnutToPng(counts: CategoryCounts, outputPng: string): P
 
   logger.info(`[LHOUSE] 도넛 렌더링 시작 — allZero: ${allZero}, labels: ${JSON.stringify(labels)}, values: ${JSON.stringify(values)}, total: ${total}`);
 
-  const colorMap: Record<string, string> = {
-    eQMS: "#4472C4",
-    eDMS: "#ED7D31",
-    eLMS: "#A9D18E",
-  };
-  const fallback = ["#4472C4", "#ED7D31", "#A9D18E", "#5B9BD5", "#FFC000"];
-  const bgColors = labels.map((l, i) => colorMap[l] ?? fallback[i % fallback.length]);
+  const PALETTE = [
+    "#4472C4", "#ED7D31", "#A9D18E", "#5B9BD5", "#FFC000",
+    "#FF7F50", "#7030A0", "#00B0F0", "#70AD47", "#C9C9C9",
+  ];
+  const bgColors = labels.map((_, i) => PALETTE[i % PALETTE.length]);
 
   // 값이 모두 0이면 동일 크기 회색 도넛으로 형태 유지
   const displayValues = allZero ? labels.map(() => 1)        : values;
@@ -548,7 +514,11 @@ async function generateChartPng(
 ): Promise<{ png: string | null; counts: CategoryCounts }> {
   fs.mkdirSync(outDir, { recursive: true });
   const outputPng = path.join(outDir, `chart_${Date.now()}.png`);
-  const counts    = readCategorySheet(xlsxPath);
+  const counts    = readExportBColumn(xlsxPath);
+  if (counts.labels.length === 0) {
+    logger.warn("[LHOUSE] Export B열 집계 결과 없음 — 차트 스킵");
+    return { png: null, counts };
+  }
   try {
     await renderDoughnutToPng(counts, outputPng);
     return { png: outputPng, counts };
@@ -937,7 +907,20 @@ async function extractTrainingCount(imagePath: string): Promise<number> {
  *  - 최신 월 시트의 SKB GMP 그룹 하위 행 → E/G/H/I/J/K/L/M 수집 (표 용)
  */
 function readMsTimesheetData(xlsxPath: string): MsTimesheetData {
-  const wb = XLSX.readFile(xlsxPath);
+  let wb: XLSX.WorkBook;
+  try {
+    wb = XLSX.readFile(xlsxPath);
+  } catch (e) {
+    const msg = (e as Error).message ?? "";
+    if (/ecma-376|encrypt|password/i.test(msg)) {
+      throw new AppError(
+        400,
+        "Timesheet 파일이 암호화(비밀번호 보호)되어 있습니다. " +
+        "Excel에서 비밀번호를 제거한 후 다시 업로드해 주세요."
+      );
+    }
+    throw e;
+  }
 
   // YYYY-MM 시트만 오름차순 정렬
   const monthSheets = wb.SheetNames
@@ -1602,6 +1585,7 @@ export async function generateLhouseReport(jobId: string): Promise<LhouseReportR
       logger.info("[LHOUSE Report] Timesheet 파일 없음 — MS 페이지 생략");
     }
   } catch (e) {
+    if (e instanceof AppError) throw e;
     logger.error(`[LHOUSE Report] Timesheet 처리 실패 (무시): ${(e as Error).message}`);
     msData = null;
   }
