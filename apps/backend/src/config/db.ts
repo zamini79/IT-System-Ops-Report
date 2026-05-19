@@ -66,6 +66,21 @@ export async function runMigrations(): Promise<void> {
       name: "users.updated_at",
       sql:  "ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
     },
+    {
+      name: "crawl_tasks.uq_job_system",
+      sql:  `DO $$
+             BEGIN
+               IF NOT EXISTS (
+                 SELECT 1 FROM pg_constraint
+                 WHERE conname = 'uq_crawl_task_job_system'
+                   AND conrelid = 'crawl_tasks'::regclass
+               ) THEN
+                 ALTER TABLE crawl_tasks
+                   ADD CONSTRAINT uq_crawl_task_job_system
+                   UNIQUE (report_job_id, system_name);
+               END IF;
+             END $$;`,
+    },
   ];
 
   for (const m of migrations) {
