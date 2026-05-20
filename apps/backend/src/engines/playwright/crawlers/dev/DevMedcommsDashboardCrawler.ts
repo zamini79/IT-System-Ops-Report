@@ -72,106 +72,13 @@ export class DevMedcommsDashboardCrawler extends BaseCrawler {
     return false;
   }
 
-  // ── 헬퍼: 날짜 포맷 (MM/DD/YYYY) ──────────────────────────────────────────
+  // ── 헬퍼: 날짜 포맷 (DD MMM YYYY, 예: "01 Feb 2026") ─────────────────────
 
   private fmtDate(d: Date): string {
-    const mm = String(d.getMonth() + 1).padStart(2, "0");
+    const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
     const dd = String(d.getDate()).padStart(2, "0");
-    return `${mm}/${dd}/${d.getFullYear()}`;
-  }
-
-  /**
-   * page.frameLocator() 를 사용해 cross-origin iframe 안의 FILTERS 연필 아이콘을 클릭하고
-   * 날짜를 설정합니다.
-   * 성공하면 true, 실패(FILTERS 미발견 포함)하면 false 를 반환합니다.
-   */
-  private async _applyDateFilterViaFrameLocator(
-    startStr: string,
-    endStr:   string,
-  ): Promise<boolean> {
-    this.emit("navigating", `[frameLocator] 날짜 필터 설정 시도… (${startStr} ~ ${endStr})`, 31);
-
-    // 모든 iframe 후보를 순서대로 시도
-    const iframeSelectors = ["iframe:first-of-type", "iframe:nth-of-type(2)", "iframe:nth-of-type(3)", "iframe"];
-
-    for (const iframeSel of iframeSelectors) {
-      try {
-        const fl = this.page.frameLocator(iframeSel);
-
-        // FILTERS 텍스트 가시성 확인 (timeout 짧게)
-        const filtersVisible = await fl.getByText(/FILTERS/i).first()
-          .isVisible({ timeout: 3_000 })
-          .catch(() => false);
-        if (!filtersVisible) continue;
-
-        this.emit("navigating", `[frameLocator] FILTERS 발견 (${iframeSel})`, 32);
-
-        // 연필 아이콘 클릭: FILTERS 텍스트의 조상 요소에서 SVG 버튼 탐색
-        let pencilClicked = false;
-        for (const upPath of ["..", "../..", "../../..", "../../../..", "../../../../.."]) {
-          try {
-            const ancestor = fl.getByText(/FILTERS/i).first().locator(upPath);
-            const svgBtns = ancestor.locator('button:has(svg), [role="button"]:has(svg)');
-            const btnCount = await svgBtns.count().catch(() => 0);
-            if (btnCount === 0) continue;
-            await svgBtns.first().click({ timeout: 3_000 });
-            pencilClicked = true;
-            this.emit("navigating", `[frameLocator] 연필 버튼 클릭 완료 (depth: ${upPath})`, 33);
-            break;
-          } catch { /* try next depth */ }
-        }
-
-        if (!pencilClicked) {
-          this.emit("navigating", "[frameLocator] 연필 버튼 미발견 — 다음 iframe 시도", 32);
-          continue;
-        }
-
-        await this.page.waitForTimeout(3_000);
-
-        // 날짜 입력: FrameLocator 기반 Locator.fill() 사용 (evaluate 대신)
-        // FrameLocator는 evaluate()를 지원하지 않으므로 Locator API로 처리합니다.
-        let datesSet = false;
-        const panelSels = ["dialog", "[role='dialog']", "[class*='modal']", "[class*='popup']", "[class*='filter']"];
-        for (const panelSel of panelSels) {
-          const panelInputs = fl.locator(`${panelSel} input`);
-          const cnt = await panelInputs.count().catch(() => 0);
-          if (cnt >= 2) {
-            await panelInputs.nth(0).fill(startStr).catch(() => {});
-            await panelInputs.nth(1).fill(endStr).catch(() => {});
-            datesSet = true;
-            break;
-          }
-        }
-        if (!datesSet) {
-          const allInputs = fl.locator("input:visible");
-          const cnt = await allInputs.count().catch(() => 0);
-          if (cnt >= 2) {
-            await allInputs.nth(0).fill(startStr).catch(() => {});
-            await allInputs.nth(1).fill(endStr).catch(() => {});
-            datesSet = true;
-          }
-        }
-
-        this.emit("navigating", datesSet ? `[frameLocator] 날짜 입력 완료: ${startStr} ~ ${endStr}` : "[frameLocator] 날짜 입력 필드 미발견", 35);
-
-        // Continue 버튼 클릭
-        for (const name of ["Continue", "Apply", "OK", "확인", "Submit"]) {
-          const btn = fl.getByRole("button", { name, exact: false });
-          if (await btn.first().isVisible({ timeout: 1_000 }).catch(() => false)) {
-            await btn.first().click();
-            this.emit("navigating", `[frameLocator] "${name}" 클릭 완료`, 36);
-            break;
-          }
-        }
-
-        await this.page.waitForTimeout(2_000);
-        return true;
-
-      } catch { /* try next iframe */ }
-    }
-
-    this.emit("navigating", "[frameLocator] FILTERS 미발견 — 필터 건너뜀", 36);
-    return false;
+    return `${dd} ${MONTHS[d.getMonth()]} ${d.getFullYear()}`;
   }
 
   /**
@@ -350,8 +257,15 @@ export class DevMedcommsDashboardCrawler extends BaseCrawler {
     }
 
     // ── ③ Continue 버튼 클릭 (frame 내) ──────────────────────────────────
+    const BTN_NAMES = [
+      "Continue", "Apply", "OK", "확인", "Submit",
+      "Save", "Done", "Update", "Refresh", "Run",
+      "View", "Show", "Filter", "Go", "저장", "적용",
+    ];
+    const CANCEL_NAMES = /cancel|close|취소|reset|clear/i;
+
     let continueDone = false;
-    for (const name of ["Continue", "Apply", "OK", "확인", "Submit"]) {
+    for (const name of BTN_NAMES) {
       const btn = frame.getByRole("button", { name, exact: false });
       if (await btn.count() > 0 && await btn.first().isVisible().catch(() => false)) {
         await btn.first().click();
@@ -360,9 +274,47 @@ export class DevMedcommsDashboardCrawler extends BaseCrawler {
         break;
       }
     }
+
+    // 후보 라벨로 못 찾으면 팝업 내 primary 버튼 휴리스틱 탐색
     if (!continueDone) {
-      this.emit("navigating", "Continue 버튼 미발견 — Escape 시도", 38);
-      await this.page.keyboard.press("Escape");
+      const clicked = await frame.evaluate((cancelPattern: string): string | null => {
+        const cancelRe = new RegExp(cancelPattern, "i");
+        const PANEL_SELS = [
+          "dialog", "[role='dialog']",
+          "[class*='modal']", "[class*='popup']", "[class*='overlay']",
+          "[class*='filter']", "[class*='Filter']",
+        ];
+        for (const sel of PANEL_SELS) {
+          const panel = document.querySelector(sel);
+          if (!panel) continue;
+          const btns = Array.from(
+            panel.querySelectorAll<HTMLElement>('button, [role="button"], input[type="submit"]')
+          ).filter((el) => {
+            const s = window.getComputedStyle(el);
+            if (s.display === "none" || s.visibility === "hidden" || el.offsetParent === null) return false;
+            const label = (el.innerText || el.getAttribute("aria-label") || "").trim();
+            return label.length > 0 && !cancelRe.test(label);
+          });
+          if (btns.length === 0) continue;
+          // primary 우선: class에 primary 포함 → 마지막 버튼 (보통 confirm)
+          const primary = btns.find((b) => /primary|confirm|action/i.test(b.className));
+          const target  = primary ?? btns[btns.length - 1];
+          target.click();
+          return (target.innerText || target.getAttribute("aria-label") || "").trim();
+        }
+        return null;
+      }, CANCEL_NAMES.source);
+
+      if (clicked) {
+        this.emit("navigating", `휴리스틱 버튼 클릭: "${clicked}"`, 38);
+        continueDone = true;
+      }
+    }
+
+    // 휴리스틱도 실패 시 Enter 키로 폼 제출 시도 (Escape 사용 금지 — 팝업 취소됨)
+    if (!continueDone) {
+      this.emit("navigating", "Continue 버튼 미발견 — Enter 키 시도", 38);
+      await this.page.keyboard.press("Enter");
     }
 
     await this.page.waitForTimeout(2_000);
@@ -497,83 +449,53 @@ export class DevMedcommsDashboardCrawler extends BaseCrawler {
     await this.page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => {});
     await this.page.waitForTimeout(3_000);
 
-    // ── Step 3.5. 페이지 상태 진단 ────────────────────────────────────────────
-    const diagUrl   = this.page.url();
-    const diagTitle = await this.page.title().catch(() => "unknown");
-    const diagFrames = this.page.frames().length;
-    this.emit("navigating", `현재 URL: ${diagUrl.substring(0, 100)}`, 29);
-    this.emit("navigating", `타이틀: ${diagTitle} | 프레임 수: ${diagFrames}`, 29);
+    // ── Step 3.5. 대시보드 프레임 탐지 ────────────────────────────────────────
+    // Veeva 대시보드가 iframe 안에 렌더링될 경우를 대비해 FILTERS 포함 프레임을 탐색합니다.
+    this.emit("navigating", "대시보드 프레임 탐색 중…", 29);
+    const targetFrame = await this._findTargetFrame();
+    const isIframe    = targetFrame !== this.page.mainFrame();
+    this.emit(
+      "navigating",
+      isIframe ? `iframe 내 대시보드 감지: ${targetFrame.url().substring(0, 80)}` : "메인 프레임에서 대시보드 렌더링",
+      30,
+    );
 
     // ── Step 3.6. 날짜 필터 설정 ─────────────────────────────────────────────
     const now = new Date();
     const filterStart = new Date(now.getFullYear(), now.getMonth() - 3, 1);
     const filterEnd   = new Date(now.getFullYear(), now.getMonth(),     0);
 
-    // 1순위: page.frameLocator() — cross-origin iframe 포함 전체 접근
-    // 2순위: _findTargetFrame() + frame.evaluate() 방식 (same-origin fallback)
-    const filterApplied = await this._applyDateFilterViaFrameLocator(
+    await this._applyDateFilter(
       this.fmtDate(filterStart),
       this.fmtDate(filterEnd),
+      targetFrame,
     );
 
-    if (!filterApplied) {
-      this.emit("navigating", "frameLocator 방식 실패 — frame.evaluate 방식으로 재시도…", 33);
-      const targetFrameFallback = await this._findTargetFrame();
-      await this._applyDateFilter(
-        this.fmtDate(filterStart),
-        this.fmtDate(filterEnd),
-        targetFrameFallback,
-      );
-    }
-
-    // 필터 적용 후 차트 재렌더링 대기
     await this.page.waitForLoadState("networkidle", { timeout: 60_000 }).catch(() => {});
-    await this.page.waitForTimeout(5_000);
+    await this.page.waitForTimeout(3_000);
 
     // ── Step 4. 차트 로딩 대기 ─────────────────────────────────────────────────
-    // cross-origin iframe 환경에서는 frame.evaluate()로 SVG를 카운트할 수 없으므로
-    // frameLocator 기반 카운팅 + same-origin frame 카운팅을 병행합니다.
     this.emit("navigating", "대시보드 차트 로딩 대기 중…", 42);
 
-    // targetFrame 은 루프 밖에서 한 번만 확보 (Step 6 좌표 추출에도 재사용)
-    const targetFrame = await this._findTargetFrame();
-
-    const CHART_TIMEOUT_MS = 90_000;
+    const CHART_TIMEOUT_MS = 120_000;
     const chartDeadline    = Date.now() + CHART_TIMEOUT_MS;
     let   svgCount         = 0;
     let   prevSvgCount     = -1;
     let   stableIterations = 0;
 
     while (Date.now() < chartDeadline) {
-      // frameLocator 로 cross-origin iframe 내 대형 SVG/Canvas 수 집계
-      const flSvg = await this.page.frameLocator("iframe")
-        .locator("svg:not(svg svg), canvas")
-        .all()
-        .then(async (els) => {
-          let count = 0;
-          for (const el of els) {
-            const bb = await el.boundingBox().catch(() => null);
-            if (bb && bb.width > 150 && bb.height > 100) count++;
-          }
-          return count;
-        })
-        .catch(() => 0);
-
-      // same-origin frame 에서도 시도 (루프 밖에서 확보한 targetFrame 사용)
-      const frameSvg = await targetFrame.evaluate(() => {
+      svgCount = await targetFrame.evaluate(() => {
         const large = (sel: string) =>
           Array.from(document.querySelectorAll<Element>(sel)).filter((el) => {
             const r = el.getBoundingClientRect();
             return r.width > 150 && r.height > 100;
           }).length;
         return large("svg:not(svg svg)") + large("canvas");
-      }).catch(() => 0);
-
-      svgCount = Math.max(flSvg, frameSvg);
+      });
 
       const elapsed = CHART_TIMEOUT_MS - (chartDeadline - Date.now());
       const pct     = Math.min(78, 42 + Math.floor((elapsed / CHART_TIMEOUT_MS) * 36));
-      this.emit("navigating", `차트 요소 감지 중… (SVG/Canvas: ${svgCount}개)`, pct);
+      this.emit("navigating", `차트 요소 감지 중… (대형 SVG/Canvas: ${svgCount}개)`, pct);
 
       if (svgCount > 0 && svgCount === prevSvgCount) {
         stableIterations++;

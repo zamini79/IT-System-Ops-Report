@@ -818,15 +818,6 @@ interface DevSlotGroup {
 
 const DEV_SLOT_GROUPS: DevSlotGroup[] = [
   {
-    groupLabel:  "Medical Contents Management System (Medcomms)",
-    subLabel:    "차트 6개 (3열 × 2행) 자동 분할",
-    color:       "border-orange-400 text-orange-700 bg-orange-50",
-    slot:        "systemusage_medcomms",
-    savedAs:     "Systemusage_Medcomms.jpg",
-    chartCount:  6,
-    chartLayout: "3×2",
-  },
-  {
     groupLabel:  "Clinical Trial Management System — 이미지 1",
     subLabel:    "CTMS 임상시험 현황 (Systemusage_Clinical1)",
     color:       "border-purple-400 text-purple-700 bg-purple-50",
@@ -1544,6 +1535,7 @@ export function DivisionReportPage({
   // ── LHOUSE 전용: Veeva 대시보드 캡처 ─────────────────────────────────────────
   const handleDashboardCapture = useCallback(async () => {
     if (dashboardCapturing) return;
+    sse.resetTask("VEEVA_DASHBOARD");
     setDashboardCapturing(true);
     setDashboardActive(true);
     addLocalLog("VEEVA Dashboard", "대시보드 캡처 시작 (로그인 중…)", "info");
@@ -1579,6 +1571,7 @@ export function DivisionReportPage({
   // ── DEV GCP 전용: GCP Quality System 대시보드 캡처 ───────────────────────────
   const handleGcpDashboardCapture = useCallback(async () => {
     if (gcpDashboardCapturing) return;
+    sse.resetTask("GCP_DASHBOARD");
     setGcpDashboardCapturing(true);
     setGcpDashboardActive(true);
     addLocalLog("GCP Dashboard", "GCP 대시보드 캡처 시작 (로그인 중…)", "info");
@@ -1601,6 +1594,7 @@ export function DivisionReportPage({
   // ── DEV Medcomms 전용: Medcomms 대시보드 캡처 ─────────────────────────────────
   const handleMedcommsDashboardCapture = useCallback(async () => {
     if (medcommsDashboardCapturing) return;
+    sse.resetTask("MEDCOMMS_DASHBOARD");
     setMedcommsDashboardCapturing(true);
     setMedcommsDashboardActive(true);
     addLocalLog("Medcomms Dashboard", "Medcomms 대시보드 캡처 시작 (로그인 중…)", "info");

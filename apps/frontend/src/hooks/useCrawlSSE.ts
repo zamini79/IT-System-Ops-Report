@@ -153,6 +153,21 @@ export function useCrawlSSE(
     setLogs([]);
   }, [systems]);
 
+  // 재실행 시 잔존 상태(COMPLETED/FAILED)가 새 실행의 완료로 오인되는 것 방지
+  const resetTask = useCallback((systemName: string) => {
+    setTaskMap((prev) => ({
+      ...prev,
+      [systemName]: {
+        status:     "PENDING",
+        progress:   0,
+        error:      null,
+        updatedAt:  null,
+        screenshot: null,
+        filePaths:  [],
+      },
+    }));
+  }, []);
+
   // 이벤트 핸들러 (setState 함수형 업데이트로 stale closure 방지)
   const handlePayload = useCallback((p: SsePayload) => {
     switch (p.type) {
@@ -328,5 +343,5 @@ export function useCrawlSSE(
     return () => ctrl.abort();
   }, [jobId, active, handlePayload]);
 
-  return { phase, taskMap, isConnected, pdfReady, pdfInfo, globalError, logs, reset };
+  return { phase, taskMap, isConnected, pdfReady, pdfInfo, globalError, logs, reset, resetTask };
 }
