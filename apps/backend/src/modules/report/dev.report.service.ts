@@ -1071,7 +1071,9 @@ function readDevMsTimesheetData(xlsxPath: string): DevMsTimesheetData {
           return min;
         })();
 
-        for (let i = gmpRowIdx + 1; i < nextGroupRow; i++) {
+        // 그룹 헤더 행 자체가 첫 번째 작업 행을 겸하는 케이스를 포함하기 위해
+        // gmpRowIdx 부터 시작 (헤더 행도 E열에 시간 값이 있으면 작업 행으로 수집)
+        for (let i = gmpRowIdx; i < nextGroupRow; i++) {
           const row  = rows[i] as unknown[];
           const aVal = String(row[0] ?? "").trim();
           if (aVal !== "" && aVal !== groupName) break;
