@@ -9,7 +9,7 @@ import { Request, Response, NextFunction } from "express";
 import type { AuthRequest }  from "../auth/auth.types";
 import { AppError }          from "../../utils/errors";
 import { respond }           from "../../utils/response";
-import { startCrawlJob, getCrawlJobStatus, takeScreenshotJob, startDashboardCapture, startGcpDashboardCapture, startMedcommsDashboardCapture, startClinicalDashboardCapture, type ScreenshotConfig } from "./crawl.service";
+import { startCrawlJob, getCrawlJobStatus, takeScreenshotJob, startDashboardCapture, startGcpDashboardCapture, startMedcommsDashboardCapture, startClinicalDashboardCapture, startBioRdDashboardCapture, type ScreenshotConfig } from "./crawl.service";
 import { jobEventBus }       from "./crawl.events";
 import type { DivisionCode } from "../../engines/playwright/types";
 import { logger }            from "../../utils/logger";
@@ -316,6 +316,35 @@ export async function medcommsDashboardHandler(
       success: true,
       data:    { taskId, jobId },
       message: "Medcomms 대시보드 캡처가 시작되었습니다. SSE 스트림에서 진행 상태를 확인하세요.",
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── POST /api/crawl/bio-rd-dashboard ─────────────────────────────────────────
+
+export async function bioRdDashboardHandler(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
+  try {
+    const { jobId } = req.body as { jobId?: string };
+
+    if (!jobId) throw new AppError(400, "jobId 는 필수입니다.");
+
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!UUID_RE.test(jobId)) throw new AppError(400, "jobId 는 UUID 형식이어야 합니다.");
+
+    const user = (req as AuthRequest).user!;
+
+    const { taskId } = await startBioRdDashboardCapture({ jobId, userId: user.sub });
+
+    res.status(202).json({
+      success: true,
+      data:    { taskId, jobId },
+      message: "BIO R&D 대시보드 캡처가 시작되었습니다. SSE 스트림에서 진행 상태를 확인하세요.",
     });
   } catch (err) {
     next(err);

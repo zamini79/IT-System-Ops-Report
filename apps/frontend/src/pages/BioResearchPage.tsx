@@ -10,6 +10,7 @@ export function BioResearchPage() {
       divisionCode="BIO"
       divisionName="Bio연구본부"
       systems={SYSTEMS}
+      sideLayout
     />
   );
 }

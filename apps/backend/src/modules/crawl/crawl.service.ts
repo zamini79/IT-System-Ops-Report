@@ -748,6 +748,154 @@ async function runMedcommsDashboardInBackground(jobId: string, taskId: string): 
   jobEventBus.scheduleCleanup(jobId);
 }
 
+// ── BIO 연구본부 R&D 대시보드 캡처 잡 ────────────────────────────────────────
+
+const BIO_RD_DASHBOARD_SYSTEM = "BIO_RD_DASHBOARD";
+const BIO_RD_DASHBOARD_DIV    = "BIO" as const;
+
+export async function startBioRdDashboardCapture(params: {
+  jobId:  string;
+  userId: string;
+}): Promise<{ taskId: string }> {
+  const { jobId, userId } = params;
+
+  const divRows = await query<{ id: string }>(
+    "SELECT id FROM divisions WHERE code = $1",
+    [BIO_RD_DASHBOARD_DIV]
+  );
+  if (!divRows.length) throw new AppError(400, "BIO 사업부를 찾을 수 없습니다.");
+  const divisionId = divRows[0].id;
+
+  await query(
+    `INSERT INTO report_jobs (id, division_id, status, started_at, created_by)
+     VALUES ($1, $2, 'RUNNING', NOW(), $3)
+     ON CONFLICT (id) DO UPDATE SET status = 'RUNNING', updated_at = NOW()`,
+    [jobId, divisionId, userId]
+  );
+
+  const crawlTaskResult = await query<{ id: string }>(
+    `INSERT INTO crawl_tasks (report_job_id, system_name, task_type, status)
+     VALUES ($1, $2, 'DOWNLOAD', 'PENDING')
+     ON CONFLICT (report_job_id, system_name) DO UPDATE
+       SET task_type = 'DOWNLOAD', status = 'PENDING', updated_at = NOW()
+     RETURNING id`,
+    [jobId, BIO_RD_DASHBOARD_SYSTEM]
+  );
+  const taskId = crawlTaskResult[0].id;
+
+  void runBioRdDashboardInBackground(jobId, taskId);
+
+  logger.info(`[CrawlService] BIO R&D Dashboard capture started: job=${jobId}, task=${taskId}`);
+  return { taskId };
+}
+
+async function runBioRdDashboardInBackground(jobId: string, taskId: string): Promise<void> {
+  jobEventBus.emit(jobId, {
+    type:       "task_start",
+    systemName: BIO_RD_DASHBOARD_SYSTEM,
+    total:      1,
+  });
+
+  await query(
+    `UPDATE crawl_tasks SET status = 'RUNNING', updated_at = NOW() WHERE id = $1`,
+    [taskId]
+  ).catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
+
+  try {
+    const result = await CrawlerFactory.runSingle(
+      BIO_RD_DASHBOARD_SYSTEM,
+      jobId,
+      (event) => {
+        if (event.percent !== undefined || event.message) {
+          jobEventBus.emit(jobId, {
+            type:       "progress",
+            systemName: BIO_RD_DASHBOARD_SYSTEM,
+            percent:    event.percent,
+            message:    event.message,
+          });
+        }
+      }
+    );
+
+    const resultPath = result.files[0] ?? null;
+
+    if (resultPath) {
+      try {
+        const uploadDir  = process.env.UPLOAD_DIR ?? "uploads";
+        const uploadsDir = path.resolve(uploadDir, jobId, "uploads");
+        fs.mkdirSync(uploadsDir, { recursive: true });
+
+        const savedFilename = "Systemusage_RD.png";
+        const destPath      = path.join(uploadsDir, savedFilename);
+        fs.copyFileSync(resultPath, destPath);
+
+        const fileSize = fs.statSync(destPath).size;
+
+        const existing = await query<{ id: string }>(
+          `SELECT id FROM uploaded_files
+           WHERE report_job_id = $1
+             AND original_name IN ('Systemusage_RD.png', 'Systemusage_RD.jpg')
+           ORDER BY created_at DESC LIMIT 1`,
+          [jobId]
+        );
+        if (existing.length) {
+          await query(
+            `UPDATE uploaded_files
+             SET original_name = $1, stored_path = $2, file_type = 'image/png', file_size = $3,
+                 analysis_result = '{}'::jsonb, created_at = NOW()
+             WHERE id = $4`,
+            [savedFilename, destPath, fileSize, existing[0].id]
+          );
+          logger.info(`[CrawlService] BIO RD System Usage replaced: ${destPath}`);
+        } else {
+          await query(
+            `INSERT INTO uploaded_files
+               (report_job_id, original_name, stored_path, file_type, file_size)
+             VALUES ($1, $2, $3, 'image/png', $4)`,
+            [jobId, savedFilename, destPath, fileSize]
+          );
+          logger.info(`[CrawlService] BIO RD System Usage saved: ${destPath}`);
+        }
+      } catch (saveErr) {
+        logger.warn(
+          `[CrawlService] BIO RD System Usage 파일 등록 실패 (무시): ${(saveErr as Error).message}`
+        );
+      }
+    }
+
+    await query(
+      `UPDATE crawl_tasks SET status = 'COMPLETED', result_path = $1, updated_at = NOW() WHERE id = $2`,
+      [resultPath, taskId]
+    ).catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
+
+    jobEventBus.emit(jobId, {
+      type:       "task_done",
+      systemName: BIO_RD_DASHBOARD_SYSTEM,
+      filePaths:  result.files,
+    });
+
+    logger.info(`[CrawlService] BIO R&D Dashboard capture done: ${resultPath}`);
+
+  } catch (err) {
+    const errMsg = (err as Error).message;
+    logger.error(`[CrawlService] BIO R&D Dashboard capture failed: ${errMsg}`);
+
+    await query(
+      `UPDATE crawl_tasks SET status = 'FAILED', error = $1, updated_at = NOW() WHERE id = $2`,
+      [errMsg, taskId]
+    ).catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
+
+    jobEventBus.emit(jobId, {
+      type:       "task_error",
+      systemName: BIO_RD_DASHBOARD_SYSTEM,
+      error:      errMsg,
+    });
+  }
+
+  // 단일 태스크 잡 — all_done 미발행 (병렬 캡처 시 다른 잡의 SSE 스트림이 끊기는 것 방지)
+  jobEventBus.scheduleCleanup(jobId);
+}
+
 // ── DEV Clinical (CTMS) 대시보드 캡처 잡 ─────────────────────────────────────
 
 const CLINICAL_DASHBOARD_SYSTEM = "CLINICAL_DASHBOARD";

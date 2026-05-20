@@ -936,17 +936,7 @@ const BIO_REPORT_SECTIONS: BioReportSection[] = [
     endpoint:     "/report/generate-bio",
     filename:     "Bio연구본부 Veeva System Report.pdf",
     color:        "border-blue-400 text-blue-700 bg-blue-50",
-    files: [
-      {
-        slot:      "systemusage_rd",
-        label:     "System Usage (DX)",
-        savedAs:   "Systemusage_RD.jpg",
-        accept:    { "image/jpeg": [".jpg", ".jpeg"], "image/png": [".png"] },
-        hint:      "JPG / PNG 파일 1개 (.jpg / .jpeg / .png)",
-        icon:      "I",
-        iconColor: "text-indigo-500",
-      },
-    ],
+    files: [],
   },
   {
     sectionTitle: "2. 임검분 LIMS",
@@ -971,11 +961,16 @@ const BIO_REPORT_SECTIONS: BioReportSection[] = [
       },
       {
         slot:      "lims_image",
-        label:     "LIMS 사용 현황 이미지",
+        label:     "LIMS 사용 현황 (Excel — Dash Board 시트)",
         savedAs:   "LIMS.png",
-        accept:    { "image/jpeg": [".jpg", ".jpeg"], "image/png": [".png"] },
-        hint:      "LIMS.png (.jpg / .jpeg / .png)",
-        icon:      "I",
+        accept:    {
+          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": [".xlsx"],
+          "application/vnd.ms-excel": [".xls"],
+          "application/x-zip-compressed": [".xlsx"],
+          "application/octet-stream": [".xlsx", ".xls"],
+        },
+        hint:      "xlsx 업로드 → \"Dash Board\" 시트가 자동으로 LIMS.png 로 변환됨",
+        icon:      "X",
         iconColor: "text-emerald-600",
       },
     ],
@@ -1472,9 +1467,13 @@ export function DivisionReportPage({
   const [clinicalDashboardCapturing, setClinicalDashboardCapturing] = useState(false);
   const [clinicalDashboardActive,    setClinicalDashboardActive]    = useState(false);
 
+  // ── BIO R&D 전용: 대시보드 캡처 상태 ──────────────────────────────────────────
+  const [bioRdDashboardCapturing, setBioRdDashboardCapturing] = useState(false);
+  const [bioRdDashboardActive,    setBioRdDashboardActive]    = useState(false);
+
   // ── SSE ──────────────────────────────────────────────────────────────────────
   const systemCodes = systems.map((s) => s.code);
-  const sse = useCrawlSSE(jobId, systemCodes, crawlActive || dashboardActive || gcpDashboardActive || medcommsDashboardActive || clinicalDashboardActive);
+  const sse = useCrawlSSE(jobId, systemCodes, crawlActive || dashboardActive || gcpDashboardActive || medcommsDashboardActive || clinicalDashboardActive || bioRdDashboardActive);
 
   // ── 로컬 진행 로그 (업로드·PDF생성 이벤트) ────────────────────────────────────
   const [localLogs, setLocalLogs] = useState<LogEntry[]>([]);
@@ -1622,6 +1621,29 @@ export function DivisionReportPage({
     }
   }, [clinicalDashboardCapturing, addLocalLog, jobId, user, toastError]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // ── BIO 연구본부 전용: R&D 대시보드 캡처 ──────────────────────────────────────
+  const handleBioRdDashboardCapture = useCallback(async () => {
+    if (bioRdDashboardCapturing) return;
+    sse.resetTask("BIO_RD_DASHBOARD");
+    setBioRdDashboardCapturing(true);
+    setBioRdDashboardActive(true);
+    addLocalLog("BIO R&D Dashboard", "BIO R&D 대시보드 캡처 시작 (로그인 중…)", "info");
+    try {
+      await apiClient.post("/crawl/bio-rd-dashboard", {
+        jobId,
+        userId: user?.id,
+      });
+    } catch (err: unknown) {
+      const msg =
+        (err as { response?: { data?: { error?: string } } })
+          ?.response?.data?.error ?? "BIO R&D 대시보드 캡처 요청에 실패했습니다.";
+      toastError(msg);
+      addLocalLog("BIO R&D Dashboard", `캡처 요청 실패: ${msg}`, "error");
+      setBioRdDashboardCapturing(false);
+      setBioRdDashboardActive(false);
+    }
+  }, [bioRdDashboardCapturing, addLocalLog, jobId, user, toastError]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // ── PDF 생성 뮤테이션 (BIO / DEV 공용) ──────────────────────────────────────
   const generatePdf = useMutation({
     mutationFn: () =>
@@ -1714,6 +1736,20 @@ export function DivisionReportPage({
     enabled:         divisionCode === "BIO",
     refetchInterval: 5_000,
   });
+
+  // BIO_RD_DASHBOARD 태스크 완료/실패 시 상태 해제 + 파일 목록 즉시 갱신
+  useEffect(() => {
+    if (!bioRdDashboardCapturing) return;
+    const bioTask = sse.taskMap["BIO_RD_DASHBOARD"];
+    if (bioTask?.status === "COMPLETED" || bioTask?.status === "FAILED") {
+      setBioRdDashboardCapturing(false);
+      setBioRdDashboardActive(false);
+      if (bioTask.status === "COMPLETED") {
+        addLocalLog("BIO R&D Dashboard", "대시보드 캡처 완료 — Systemusage_RD.png 로 저장되었습니다.", "success");
+        void refetchBioFiles();
+      }
+    }
+  }, [sse.taskMap, bioRdDashboardCapturing, addLocalLog, refetchBioFiles]);
 
   const hasActivityFile      = lhouseFileList.some((f) => f.original_name === "Activity_LHOUSE.xlsx");
   const hasSystemusageFile   = lhouseFileList.some(
@@ -1951,6 +1987,7 @@ export function DivisionReportPage({
                     (divisionCode === "DEV"    && sys.code === "GCP_QUALITY")   ? handleGcpDashboardCapture :
                     (divisionCode === "DEV"    && sys.code === "MEDCOMMS")      ? handleMedcommsDashboardCapture :
                     (divisionCode === "DEV"    && sys.code === "CTMS")          ? handleClinicalDashboardCapture :
+                    (divisionCode === "BIO"    && sys.code === "EDMS")          ? handleBioRdDashboardCapture :
                     undefined
                   }
                   dashboardCapturing={
@@ -1958,6 +1995,7 @@ export function DivisionReportPage({
                     (divisionCode === "DEV"    && sys.code === "GCP_QUALITY")   ? gcpDashboardCapturing :
                     (divisionCode === "DEV"    && sys.code === "MEDCOMMS")      ? medcommsDashboardCapturing :
                     (divisionCode === "DEV"    && sys.code === "CTMS")          ? clinicalDashboardCapturing :
+                    (divisionCode === "BIO"    && sys.code === "EDMS")          ? bioRdDashboardCapturing :
                     undefined
                   }
                   dashboardTask={
@@ -1965,6 +2003,7 @@ export function DivisionReportPage({
                     (divisionCode === "DEV"    && sys.code === "GCP_QUALITY")   ? (sse.taskMap["GCP_DASHBOARD"]      ?? null) :
                     (divisionCode === "DEV"    && sys.code === "MEDCOMMS")      ? (sse.taskMap["MEDCOMMS_DASHBOARD"] ?? null) :
                     (divisionCode === "DEV"    && sys.code === "CTMS")          ? (sse.taskMap["CLINICAL_DASHBOARD"] ?? null) :
+                    (divisionCode === "BIO"    && sys.code === "EDMS")          ? (sse.taskMap["BIO_RD_DASHBOARD"]   ?? null) :
                     undefined
                   }
                 />

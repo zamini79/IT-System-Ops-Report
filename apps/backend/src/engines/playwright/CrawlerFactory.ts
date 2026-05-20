@@ -36,6 +36,9 @@ import { DevGcpDashboardCrawler }       from "./crawlers/dev/DevGcpDashboardCraw
 import { DevMedcommsDashboardCrawler }  from "./crawlers/dev/DevMedcommsDashboardCrawler";
 import { DevClinicalDashboardCrawler }  from "./crawlers/dev/DevClinicalDashboardCrawler";
 
+// ── BIO 대시보드 전용 크롤러 ──────────────────────────────────────────────────
+import { BioRdDashboardCrawler }        from "./crawlers/bio/BioRdDashboardCrawler";
+
 // ── 크롤러 레지스트리 ─────────────────────────────────────────────────────────
 // 새 크롤러 추가 시 이 맵에만 등록하면 됩니다.
 type CrawlerCtor = new (ctx: ConstructorParameters<typeof BaseCrawler>[0]) => BaseCrawler;
@@ -69,6 +72,7 @@ const SINGLE_REGISTRY: Record<string, CrawlerCtor> = {
   GCP_DASHBOARD:      DevGcpDashboardCrawler,
   MEDCOMMS_DASHBOARD: DevMedcommsDashboardCrawler,
   CLINICAL_DASHBOARD: DevClinicalDashboardCrawler,
+  BIO_RD_DASHBOARD:   BioRdDashboardCrawler,
 };
 
 // ── 팩토리 ───────────────────────────────────────────────────────────────────

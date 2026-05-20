@@ -1126,8 +1126,8 @@ function readLimsServiceData(xlsxPath: string): { rows: LimsServiceRow[]; descri
 
   if (raw.length === 0) return { rows: [], description: "" };
 
-  // 1행(index 0) → Description 텍스트
-  const description = (raw[0] as unknown[])
+  // 2행(index 1) → Description 텍스트
+  const description = (raw[1] as unknown[] | undefined ?? [])
     .map(c => String(c ?? "").trim()).filter(Boolean).join(" ").trim();
 
   // 고정 열 인덱스 (A=0 기준): C=2, D=3, E=4, F=5, G=6, I=8, J=9
@@ -1141,9 +1141,9 @@ function readLimsServiceData(xlsxPath: string): { rows: LimsServiceRow[]; descri
 
   const cell = (row: unknown[], idx: number) => String(row[idx] ?? "").trim();
 
-  // 3행(index 2)부터 데이터 읽기
+  // 4행(index 3)부터 데이터 읽기 (1행 미사용, 2행은 description, 3행은 헤더)
   const rows: LimsServiceRow[] = [];
-  for (let i = 2; i < raw.length; i++) {
+  for (let i = 3; i < raw.length; i++) {
     const row = raw[i] as unknown[];
     const area      = cell(row, COL_AREA);
     const issueType = cell(row, COL_ISSUE_TYPE);

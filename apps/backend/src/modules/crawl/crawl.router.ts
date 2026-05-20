@@ -22,6 +22,7 @@ import {
   gcpDashboardHandler,
   medcommsDashboardHandler,
   clinicalDashboardHandler,
+  bioRdDashboardHandler,
 } from "./crawl.controller";
 
 export const crawlRouter = Router();
@@ -61,6 +62,12 @@ crawlRouter.post("/medcomms-dashboard", medcommsDashboardHandler);
 // Clinical(CTMS) Veeva 대시보드 스크린샷 캡처 (DEV, SSE로 완료 알림)
 // ---------------------------------------------------------------------------
 crawlRouter.post("/clinical-dashboard", clinicalDashboardHandler);
+
+// ---------------------------------------------------------------------------
+// POST /api/crawl/bio-rd-dashboard
+// BIO 연구본부 R&D Veeva 대시보드 스크린샷 캡처 (BIO, SSE로 완료 알림)
+// ---------------------------------------------------------------------------
+crawlRouter.post("/bio-rd-dashboard", bioRdDashboardHandler);
 
 // ---------------------------------------------------------------------------
 // GET /api/crawl/:jobId/stream  (SSE)

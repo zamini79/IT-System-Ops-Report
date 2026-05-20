@@ -17,6 +17,7 @@ import { v4 as uuidv4 } from "uuid";
 import { respond }       from "../../utils/response";
 import { AppError }      from "../../utils/errors";
 import { logger }        from "../../utils/logger";
+import { xlsxSheetToPng } from "../../utils/xlsxSheetToPng";
 import {
   saveUploadedFiles,
   saveNamedUploadedFile,
@@ -267,10 +268,14 @@ const NAMED_SLOTS = {
     label: "임검분 LIMS — 데이터 (Excel)",
   },
   lims_image: {
+    // 사용자는 xlsx 를 업로드하고, 서버에서 "Dash Board" 시트를 LIMS.png 로 변환합니다.
     filename:   "LIMS.png",
-    mimeTypes:  new Set(["image/jpeg", "image/png"]),
-    extensions: new Set([".jpg", ".jpeg", ".png"]),
-    label: "임검분 LIMS — 사용 현황 이미지",
+    mimeTypes:  new Set([
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "application/vnd.ms-excel",
+    ]),
+    extensions: new Set([".xlsx", ".xls"]),
+    label: "임검분 LIMS — Dash Board 시트 (Excel)",
   },
   eln_report: {
     filename:  "ELN_report.xlsx",
@@ -343,6 +348,12 @@ const namedStorage = multer.diskStorage({
       cb(null, `${base}${ext}`);
       return;
     }
+    // lims_image: xlsx 업로드 → 변환 후 LIMS.png 로 저장됨. 우선 임시 xlsx 로 저장.
+    if (slot === "lims_image") {
+      const ext = path.extname(file.originalname).toLowerCase();
+      cb(null, `_lims_dashboard_input${ext}`);
+      return;
+    }
     const cfg = slot ? NAMED_SLOTS[slot] : undefined;
     cb(null, cfg?.filename ?? `upload_${Date.now()}`);
   },
@@ -408,6 +419,24 @@ fileRouter.post(
       const savedFilename = IMAGE_SLOTS.has(slot)
         ? `${cfg.filename.replace(/\.(jpg|jpeg|png)$/i, "")}${path.extname(file.originalname).toLowerCase()}`
         : cfg.filename;
+
+      // lims_image: xlsx → "Dash Board" 시트 PNG 변환 후 LIMS.png 로 저장
+      if (slot === "lims_image") {
+        const targetPath = path.join(path.dirname(file.path), cfg.filename); // .../LIMS.png
+        try {
+          await xlsxSheetToPng(file.path, "Dash Board", targetPath);
+        } catch (e) {
+          try { fs.unlinkSync(file.path); } catch { /* ignore */ }
+          throw new AppError(400, `xlsx → PNG 변환 실패: ${(e as Error).message}`);
+        }
+        // 임시 xlsx 삭제, file 객체를 변환된 PNG 로 교체
+        const pngStat = fs.statSync(targetPath);
+        try { fs.unlinkSync(file.path); } catch { /* ignore */ }
+        file.path     = targetPath;
+        file.filename = cfg.filename;
+        file.mimetype = "image/png";
+        file.size     = pngStat.size;
+      }
 
       const saved = await saveNamedUploadedFile(jobId, divisionCode, userId!, file, savedFilename);
 
