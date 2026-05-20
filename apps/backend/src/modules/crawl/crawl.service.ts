@@ -446,7 +446,7 @@ async function runDashboardInBackground(jobId: string, taskId: string): Promise<
     });
   }
 
-  jobEventBus.emit(jobId, { type: "all_done", jobId });
+  // 단일 태스크 잡 — all_done 미발행 (병렬 캡처 시 다른 잡의 SSE 스트림이 끊기는 것 방지)
   jobEventBus.scheduleCleanup(jobId);
 }
 
@@ -595,7 +595,7 @@ async function runGcpDashboardInBackground(jobId: string, taskId: string): Promi
     });
   }
 
-  jobEventBus.emit(jobId, { type: "all_done", jobId });
+  // 단일 태스크 잡 — all_done 미발행 (병렬 캡처 시 다른 잡의 SSE 스트림이 끊기는 것 방지)
   jobEventBus.scheduleCleanup(jobId);
 }
 
@@ -744,7 +744,7 @@ async function runMedcommsDashboardInBackground(jobId: string, taskId: string): 
     });
   }
 
-  jobEventBus.emit(jobId, { type: "all_done", jobId });
+  // 단일 태스크 잡 — all_done 미발행 (병렬 캡처 시 다른 잡의 SSE 스트림이 끊기는 것 방지)
   jobEventBus.scheduleCleanup(jobId);
 }
 
