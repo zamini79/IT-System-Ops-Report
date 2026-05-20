@@ -816,26 +816,7 @@ interface DevSlotGroup {
   chartLayout: string;
 }
 
-const DEV_SLOT_GROUPS: DevSlotGroup[] = [
-  {
-    groupLabel:  "Clinical Trial Management System — 이미지 1",
-    subLabel:    "CTMS 임상시험 현황 (Systemusage_Clinical1)",
-    color:       "border-purple-400 text-purple-700 bg-purple-50",
-    slot:        "systemusage_ctms1",
-    savedAs:     "Systemusage_Clinical1.jpg",
-    chartCount:  1,
-    chartLayout: "1",
-  },
-  {
-    groupLabel:  "Clinical Trial Management System — 이미지 2",
-    subLabel:    "eTMF 문서 현황 (Systemusage_Clinical2)",
-    color:       "border-purple-400 text-purple-700 bg-purple-50",
-    slot:        "systemusage_ctms2",
-    savedAs:     "Systemusage_Clinical2.jpg",
-    chartCount:  1,
-    chartLayout: "1",
-  },
-];
+const DEV_SLOT_GROUPS: DevSlotGroup[] = [];
 
 /** 이미지 슬롯은 .jpg / .png 두 가지 이름으로 저장될 수 있어 양쪽을 탐색 */
 function findDevServerFile(fileList: UploadedFileRow[], savedAs: string): UploadedFileRow | null {
@@ -1487,9 +1468,13 @@ export function DivisionReportPage({
   const [medcommsDashboardCapturing, setMedcommsDashboardCapturing] = useState(false);
   const [medcommsDashboardActive,    setMedcommsDashboardActive]    = useState(false);
 
+  // ── DEV Clinical(CTMS) 전용: 대시보드 캡처 상태 ───────────────────────────────
+  const [clinicalDashboardCapturing, setClinicalDashboardCapturing] = useState(false);
+  const [clinicalDashboardActive,    setClinicalDashboardActive]    = useState(false);
+
   // ── SSE ──────────────────────────────────────────────────────────────────────
   const systemCodes = systems.map((s) => s.code);
-  const sse = useCrawlSSE(jobId, systemCodes, crawlActive || dashboardActive || gcpDashboardActive || medcommsDashboardActive);
+  const sse = useCrawlSSE(jobId, systemCodes, crawlActive || dashboardActive || gcpDashboardActive || medcommsDashboardActive || clinicalDashboardActive);
 
   // ── 로컬 진행 로그 (업로드·PDF생성 이벤트) ────────────────────────────────────
   const [localLogs, setLocalLogs] = useState<LogEntry[]>([]);
@@ -1614,6 +1599,29 @@ export function DivisionReportPage({
     }
   }, [medcommsDashboardCapturing, addLocalLog, jobId, user, toastError]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // ── DEV Clinical(CTMS) 전용: Clinical 대시보드 캡처 ───────────────────────────
+  const handleClinicalDashboardCapture = useCallback(async () => {
+    if (clinicalDashboardCapturing) return;
+    sse.resetTask("CLINICAL_DASHBOARD");
+    setClinicalDashboardCapturing(true);
+    setClinicalDashboardActive(true);
+    addLocalLog("Clinical Dashboard", "Clinical 대시보드 캡처 시작 (로그인 중…)", "info");
+    try {
+      await apiClient.post("/crawl/clinical-dashboard", {
+        jobId,
+        userId: user?.id,
+      });
+    } catch (err: unknown) {
+      const msg =
+        (err as { response?: { data?: { error?: string } } })
+          ?.response?.data?.error ?? "Clinical 대시보드 캡처 요청에 실패했습니다.";
+      toastError(msg);
+      addLocalLog("Clinical Dashboard", `캡처 요청 실패: ${msg}`, "error");
+      setClinicalDashboardCapturing(false);
+      setClinicalDashboardActive(false);
+    }
+  }, [clinicalDashboardCapturing, addLocalLog, jobId, user, toastError]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // ── PDF 생성 뮤테이션 (BIO / DEV 공용) ──────────────────────────────────────
   const generatePdf = useMutation({
     mutationFn: () =>
@@ -1681,6 +1689,20 @@ export function DivisionReportPage({
       }
     }
   }, [sse.taskMap, medcommsDashboardCapturing, addLocalLog, refetchDevFiles]);
+
+  // CLINICAL_DASHBOARD 태스크 완료/실패 시 상태 해제 + 파일 목록 즉시 갱신
+  useEffect(() => {
+    if (!clinicalDashboardCapturing) return;
+    const clinicalTask = sse.taskMap["CLINICAL_DASHBOARD"];
+    if (clinicalTask?.status === "COMPLETED" || clinicalTask?.status === "FAILED") {
+      setClinicalDashboardCapturing(false);
+      setClinicalDashboardActive(false);
+      if (clinicalTask.status === "COMPLETED") {
+        addLocalLog("Clinical Dashboard", "대시보드 캡처 완료 — Systemusage_Clinical1.png / Systemusage_Clinical2.png 로 저장되었습니다.", "success");
+        void refetchDevFiles();
+      }
+    }
+  }, [sse.taskMap, clinicalDashboardCapturing, addLocalLog, refetchDevFiles]);
 
   // ── BIO 전용: 업로드 파일 목록 조회 (5초 폴링) ───────────────────────────────
   const { data: bioFileList = [], refetch: refetchBioFiles } = useQuery({
@@ -1928,18 +1950,21 @@ export function DivisionReportPage({
                     (divisionCode === "LHOUSE" && sys.code === "VEEVA")         ? handleDashboardCapture :
                     (divisionCode === "DEV"    && sys.code === "GCP_QUALITY")   ? handleGcpDashboardCapture :
                     (divisionCode === "DEV"    && sys.code === "MEDCOMMS")      ? handleMedcommsDashboardCapture :
+                    (divisionCode === "DEV"    && sys.code === "CTMS")          ? handleClinicalDashboardCapture :
                     undefined
                   }
                   dashboardCapturing={
                     (divisionCode === "LHOUSE" && sys.code === "VEEVA")         ? dashboardCapturing :
                     (divisionCode === "DEV"    && sys.code === "GCP_QUALITY")   ? gcpDashboardCapturing :
                     (divisionCode === "DEV"    && sys.code === "MEDCOMMS")      ? medcommsDashboardCapturing :
+                    (divisionCode === "DEV"    && sys.code === "CTMS")          ? clinicalDashboardCapturing :
                     undefined
                   }
                   dashboardTask={
                     (divisionCode === "LHOUSE" && sys.code === "VEEVA")         ? (sse.taskMap["VEEVA_DASHBOARD"]    ?? null) :
                     (divisionCode === "DEV"    && sys.code === "GCP_QUALITY")   ? (sse.taskMap["GCP_DASHBOARD"]      ?? null) :
                     (divisionCode === "DEV"    && sys.code === "MEDCOMMS")      ? (sse.taskMap["MEDCOMMS_DASHBOARD"] ?? null) :
+                    (divisionCode === "DEV"    && sys.code === "CTMS")          ? (sse.taskMap["CLINICAL_DASHBOARD"] ?? null) :
                     undefined
                   }
                 />

@@ -21,6 +21,7 @@ import {
   veevaDashboardHandler,
   gcpDashboardHandler,
   medcommsDashboardHandler,
+  clinicalDashboardHandler,
 } from "./crawl.controller";
 
 export const crawlRouter = Router();
@@ -54,6 +55,12 @@ crawlRouter.post("/gcp-dashboard", gcpDashboardHandler);
 // Medcomms Veeva 대시보드 스크린샷 캡처 (DEV, SSE로 완료 알림)
 // ---------------------------------------------------------------------------
 crawlRouter.post("/medcomms-dashboard", medcommsDashboardHandler);
+
+// ---------------------------------------------------------------------------
+// POST /api/crawl/clinical-dashboard
+// Clinical(CTMS) Veeva 대시보드 스크린샷 캡처 (DEV, SSE로 완료 알림)
+// ---------------------------------------------------------------------------
+crawlRouter.post("/clinical-dashboard", clinicalDashboardHandler);
 
 // ---------------------------------------------------------------------------
 // GET /api/crawl/:jobId/stream  (SSE)

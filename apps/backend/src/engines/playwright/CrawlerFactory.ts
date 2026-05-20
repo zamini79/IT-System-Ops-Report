@@ -34,6 +34,7 @@ import { LhouseVeevaDashboardCrawler }  from "./crawlers/lhouse/LhouseVeevaDashb
 // ── DEV 대시보드 전용 크롤러 ──────────────────────────────────────────────────
 import { DevGcpDashboardCrawler }       from "./crawlers/dev/DevGcpDashboardCrawler";
 import { DevMedcommsDashboardCrawler }  from "./crawlers/dev/DevMedcommsDashboardCrawler";
+import { DevClinicalDashboardCrawler }  from "./crawlers/dev/DevClinicalDashboardCrawler";
 
 // ── 크롤러 레지스트리 ─────────────────────────────────────────────────────────
 // 새 크롤러 추가 시 이 맵에만 등록하면 됩니다.
@@ -67,6 +68,7 @@ const SINGLE_REGISTRY: Record<string, CrawlerCtor> = {
   VEEVA_DASHBOARD:    LhouseVeevaDashboardCrawler,
   GCP_DASHBOARD:      DevGcpDashboardCrawler,
   MEDCOMMS_DASHBOARD: DevMedcommsDashboardCrawler,
+  CLINICAL_DASHBOARD: DevClinicalDashboardCrawler,
 };
 
 // ── 팩토리 ───────────────────────────────────────────────────────────────────

@@ -748,6 +748,161 @@ async function runMedcommsDashboardInBackground(jobId: string, taskId: string): 
   jobEventBus.scheduleCleanup(jobId);
 }
 
+// ── DEV Clinical (CTMS) 대시보드 캡처 잡 ─────────────────────────────────────
+
+const CLINICAL_DASHBOARD_SYSTEM = "CLINICAL_DASHBOARD";
+const CLINICAL_DASHBOARD_DIV    = "DEV" as const;
+
+export async function startClinicalDashboardCapture(params: {
+  jobId:  string;
+  userId: string;
+}): Promise<{ taskId: string }> {
+  const { jobId, userId } = params;
+
+  const divRows = await query<{ id: string }>(
+    "SELECT id FROM divisions WHERE code = $1",
+    [CLINICAL_DASHBOARD_DIV]
+  );
+  if (!divRows.length) throw new AppError(400, "DEV 사업부를 찾을 수 없습니다.");
+  const divisionId = divRows[0].id;
+
+  await query(
+    `INSERT INTO report_jobs (id, division_id, status, started_at, created_by)
+     VALUES ($1, $2, 'RUNNING', NOW(), $3)
+     ON CONFLICT (id) DO UPDATE SET status = 'RUNNING', updated_at = NOW()`,
+    [jobId, divisionId, userId]
+  );
+
+  const crawlTaskResult = await query<{ id: string }>(
+    `INSERT INTO crawl_tasks (report_job_id, system_name, task_type, status)
+     VALUES ($1, $2, 'DOWNLOAD', 'PENDING')
+     ON CONFLICT (report_job_id, system_name) DO UPDATE
+       SET task_type = 'DOWNLOAD', status = 'PENDING', updated_at = NOW()
+     RETURNING id`,
+    [jobId, CLINICAL_DASHBOARD_SYSTEM]
+  );
+  const taskId = crawlTaskResult[0].id;
+
+  void runClinicalDashboardInBackground(jobId, taskId);
+
+  logger.info(`[CrawlService] Clinical Dashboard capture started: job=${jobId}, task=${taskId}`);
+  return { taskId };
+}
+
+async function runClinicalDashboardInBackground(jobId: string, taskId: string): Promise<void> {
+  jobEventBus.emit(jobId, {
+    type:       "task_start",
+    systemName: CLINICAL_DASHBOARD_SYSTEM,
+    total:      1,
+  });
+
+  await query(
+    `UPDATE crawl_tasks SET status = 'RUNNING', updated_at = NOW() WHERE id = $1`,
+    [taskId]
+  ).catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
+
+  try {
+    const result = await CrawlerFactory.runSingle(
+      CLINICAL_DASHBOARD_SYSTEM,
+      jobId,
+      (event) => {
+        if (event.percent !== undefined || event.message) {
+          jobEventBus.emit(jobId, {
+            type:       "progress",
+            systemName: CLINICAL_DASHBOARD_SYSTEM,
+            percent:    event.percent,
+            message:    event.message,
+          });
+        }
+      }
+    );
+
+    // result.files[0] = 차트 2+3 결합 → Systemusage_Clinical1.png
+    // result.files[1] = 차트 1 단독   → Systemusage_Clinical2.png
+    const clinical1Src = result.files[0] ?? null;
+    const clinical2Src = result.files[1] ?? null;
+
+    const uploadDir  = process.env.UPLOAD_DIR ?? "uploads";
+    const uploadsDir = path.resolve(uploadDir, jobId, "uploads");
+    fs.mkdirSync(uploadsDir, { recursive: true });
+
+    const saveSlot = async (srcPath: string | null, savedFilename: string) => {
+      if (!srcPath) return;
+      try {
+        const destPath = path.join(uploadsDir, savedFilename);
+        fs.copyFileSync(srcPath, destPath);
+        const fileSize = fs.statSync(destPath).size;
+
+        // .jpg(수동 업로드) / .png(이전 캡처) 모두 탐색 → 최신 1건을 PNG로 덮어씀
+        const jpgName = savedFilename.replace(/\.png$/, ".jpg");
+        const existing = await query<{ id: string }>(
+          `SELECT id FROM uploaded_files
+           WHERE report_job_id = $1
+             AND original_name IN ($2, $3)
+           ORDER BY created_at DESC LIMIT 1`,
+          [jobId, savedFilename, jpgName]
+        );
+        if (existing.length) {
+          await query(
+            `UPDATE uploaded_files
+             SET original_name = $1, stored_path = $2, file_type = 'image/png', file_size = $3,
+                 analysis_result = '{}'::jsonb, created_at = NOW()
+             WHERE id = $4`,
+            [savedFilename, destPath, fileSize, existing[0].id]
+          );
+          logger.info(`[CrawlService] Clinical ${savedFilename} replaced: ${destPath}`);
+        } else {
+          await query(
+            `INSERT INTO uploaded_files
+               (report_job_id, original_name, stored_path, file_type, file_size)
+             VALUES ($1, $2, $3, 'image/png', $4)`,
+            [jobId, savedFilename, destPath, fileSize]
+          );
+          logger.info(`[CrawlService] Clinical ${savedFilename} saved: ${destPath}`);
+        }
+      } catch (saveErr) {
+        logger.warn(
+          `[CrawlService] Clinical ${savedFilename} 등록 실패 (무시): ${(saveErr as Error).message}`
+        );
+      }
+    };
+
+    await saveSlot(clinical1Src, "Systemusage_Clinical1.png");
+    await saveSlot(clinical2Src, "Systemusage_Clinical2.png");
+
+    await query(
+      `UPDATE crawl_tasks SET status = 'COMPLETED', result_path = $1, updated_at = NOW() WHERE id = $2`,
+      [clinical1Src, taskId]
+    ).catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
+
+    jobEventBus.emit(jobId, {
+      type:       "task_done",
+      systemName: CLINICAL_DASHBOARD_SYSTEM,
+      filePaths:  result.files,
+    });
+
+    logger.info(`[CrawlService] Clinical Dashboard capture done`);
+
+  } catch (err) {
+    const errMsg = (err as Error).message;
+    logger.error(`[CrawlService] Clinical Dashboard capture failed: ${errMsg}`);
+
+    await query(
+      `UPDATE crawl_tasks SET status = 'FAILED', error = $1, updated_at = NOW() WHERE id = $2`,
+      [errMsg, taskId]
+    ).catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
+
+    jobEventBus.emit(jobId, {
+      type:       "task_error",
+      systemName: CLINICAL_DASHBOARD_SYSTEM,
+      error:      errMsg,
+    });
+  }
+
+  // 단일 태스크 잡 — all_done 미발행 (병렬 캡처 시 다른 잡의 SSE 스트림이 끊기는 것 방지)
+  jobEventBus.scheduleCleanup(jobId);
+}
+
 // ── 백그라운드 실행 ────────────────────────────────────────────────────────────
 
 const MAX_RETRIES = 3;
