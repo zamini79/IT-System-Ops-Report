@@ -478,22 +478,23 @@ export class DevClinicalDashboardCrawler extends BaseCrawler {
     this.emit("navigating", `차트 ${svgCount}개 감지 — 렌더링 안정화 대기…`, 80);
     await this.page.waitForTimeout(5_000);
 
-    // ── Step 5. 전체 페이지 스크린샷 캡처 ────────────────────────────────────
-    this.emit("downloading", "대시보드 스크린샷 캡처 중…", 90);
+    // ── Step 5. 메인 대시보드 스크린샷 (Clinical1 용) ─────────────────────────
+    this.emit("downloading", "대시보드 스크린샷 캡처 중…", 88);
 
-    const ts        = Date.now();
-    const tempPath  = path.join(this.downloadDir, `_tmp_clinical_dashboard_${ts}.png`);
-    const clinical1Path = path.join(this.downloadDir, `clinical_dashboard_chart23_${ts}.png`);
-    const clinical2Path = path.join(this.downloadDir, `clinical_dashboard_chart1_${ts}.png`);
+    const ts             = Date.now();
+    const tempMainPath   = path.join(this.downloadDir, `_tmp_clinical_main_${ts}.png`);
+    const tempPopupPath  = path.join(this.downloadDir, `_tmp_clinical_popup_${ts}.png`);
+    const clinical1Path  = path.join(this.downloadDir, `clinical_dashboard_chart23_${ts}.png`);
+    const clinical2Path  = path.join(this.downloadDir, `clinical_dashboard_chart1_${ts}.png`);
 
-    await this.page.screenshot({ path: tempPath, fullPage: true, type: "png" });
+    await this.page.screenshot({ path: tempMainPath, fullPage: true, type: "png" });
 
-    // ── Step 6. 3개 차트 좌표 추출 ───────────────────────────────────────────
-    this.emit("downloading", "차트 영역 좌표 계산 중…", 93);
+    // ── Step 6. 차트 좌표 추출 ───────────────────────────────────────────────
+    this.emit("downloading", "차트 영역 좌표 계산 중…", 90);
 
     const iframeOffset = await this._getFrameOffset(targetFrame);
 
-    const chartBoundsRaw = await targetFrame.evaluate(() => {
+    const chartRects = await targetFrame.evaluate(() => {
       const scrollY = window.scrollY;
       const scrollX = window.scrollX;
 
@@ -529,7 +530,7 @@ export class DevClinicalDashboardCrawler extends BaseCrawler {
 
       const cards = Array.from(new Set(innerEls.map(findCard)));
 
-      const rects = cards.map(el => {
+      return cards.map(el => {
         const r = el.getBoundingClientRect();
         return {
           top:    r.top    + scrollY,
@@ -538,33 +539,12 @@ export class DevClinicalDashboardCrawler extends BaseCrawler {
           right:  r.right  + scrollX,
         };
       }).sort((a, b) => a.top - b.top || a.left - b.left);
-
-      if (rects.length < 3) return { partial: true, rects };
-
-      const pad = 8;
-      return {
-        partial: false,
-        // 차트 1 (단독) → Clinical2
-        clinical2: {
-          top:    Math.max(0, Math.round(rects[0].top    - pad)),
-          left:   Math.max(0, Math.round(rects[0].left   - pad)),
-          bottom: Math.round(rects[0].bottom + pad),
-          right:  Math.round(rects[0].right  + pad),
-        },
-        // 차트 2 + 차트 3 (결합) → Clinical1
-        clinical1: {
-          top:    Math.max(0, Math.round(Math.min(rects[1].top,    rects[2].top)    - pad)),
-          left:   Math.max(0, Math.round(Math.min(rects[1].left,   rects[2].left)   - pad)),
-          bottom: Math.round(Math.max(rects[1].bottom, rects[2].bottom) + pad),
-          right:  Math.round(Math.max(rects[1].right,  rects[2].right)  + pad),
-        },
-      };
     });
 
-    // ── Step 7. sharp 로 분할 저장 ────────────────────────────────────────────
-    const meta  = await sharp(tempPath).metadata();
-    const imgW  = meta.width  ?? 1600;
-    const imgH  = meta.height ?? 1000;
+    // 공용 sharp 추출 헬퍼
+    const mainMeta = await sharp(tempMainPath).metadata();
+    const mainW    = mainMeta.width  ?? 1600;
+    const mainH    = mainMeta.height ?? 1000;
 
     const applyOffset = (b: { top: number; left: number; bottom: number; right: number }) => ({
       top:    b.top    + iframeOffset.y,
@@ -573,30 +553,202 @@ export class DevClinicalDashboardCrawler extends BaseCrawler {
       right:  b.right  + iframeOffset.x,
     });
 
-    const extractTo = async (b: { top: number; left: number; bottom: number; right: number }, outPath: string) => {
-      const left   = Math.min(b.left, imgW - 1);
-      const top    = Math.min(b.top,  imgH - 1);
-      const width  = Math.min(b.right  - b.left, imgW - left);
-      const height = Math.min(b.bottom - b.top,  imgH - top);
-      await sharp(tempPath).extract({ left, top, width, height }).toFile(outPath);
+    const extractFrom = async (
+      srcPath: string,
+      imgW:    number,
+      imgH:    number,
+      b:       { top: number; left: number; bottom: number; right: number },
+      outPath: string,
+    ) => {
+      // sharp.extract() 는 정수만 허용 — 모든 값을 정수로 변환
+      const left   = Math.max(0, Math.min(Math.floor(b.left), imgW - 1));
+      const top    = Math.max(0, Math.min(Math.floor(b.top),  imgH - 1));
+      const width  = Math.max(1, Math.min(Math.ceil(b.right  - b.left), imgW - left));
+      const height = Math.max(1, Math.min(Math.ceil(b.bottom - b.top),  imgH - top));
+      await sharp(srcPath).extract({ left, top, width, height }).toFile(outPath);
       return { width, height };
     };
 
-    if (chartBoundsRaw && !chartBoundsRaw.partial) {
-      const sz1 = await extractTo(applyOffset(chartBoundsRaw.clinical1!), clinical1Path);
-      const sz2 = await extractTo(applyOffset(chartBoundsRaw.clinical2!), clinical2Path);
-      this.emit("downloading",
-        `Clinical1 (차트 2+3) ${sz1.width}×${sz1.height}px · Clinical2 (차트 1) ${sz2.width}×${sz2.height}px`,
-        98,
-      );
+    // ── Step 7. Clinical1 (차트 2 + 3 결합) 저장 ────────────────────────────
+    if (chartRects && chartRects.length >= 3) {
+      const pad = 8;
+      const c1 = applyOffset({
+        top:    Math.max(0, Math.round(Math.min(chartRects[1].top,    chartRects[2].top)    - pad)),
+        left:   Math.max(0, Math.round(Math.min(chartRects[1].left,   chartRects[2].left)   - pad)),
+        bottom: Math.round(Math.max(chartRects[1].bottom, chartRects[2].bottom) + pad),
+        right:  Math.round(Math.max(chartRects[1].right,  chartRects[2].right)  + pad),
+      });
+      const sz1 = await extractFrom(tempMainPath, mainW, mainH, c1, clinical1Path);
+      this.emit("downloading", `Clinical1 (차트 2+3) 저장 — ${sz1.width}×${sz1.height}px`, 93);
     } else {
-      // 차트 3개 미감지 — 전체 이미지를 양쪽에 동일하게 저장
-      fs.copyFileSync(tempPath, clinical1Path);
-      fs.copyFileSync(tempPath, clinical2Path);
-      this.emit("downloading", "차트 3개 미감지 — 전체 이미지 저장", 98);
+      fs.copyFileSync(tempMainPath, clinical1Path);
+      this.emit("downloading", "차트 3개 미감지 — Clinical1 에 전체 이미지 저장", 93);
     }
 
-    try { fs.unlinkSync(tempPath); } catch { /* 이미 정리된 경우 무시 */ }
+    // ── Step 8. Clinical2: "Study Person with User" → Full Screen 팝업 캡처 ──
+    this.emit("downloading", "Clinical2: Full Screen 버튼 탐색…", 94);
+
+    const fullScreenClicked = await targetFrame.evaluate((): boolean => {
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+      let textNode: Text | null;
+      let titleEl: Element | null = null;
+      while ((textNode = walker.nextNode() as Text | null)) {
+        if (/Study Person with User/i.test(textNode.textContent ?? "")) {
+          titleEl = textNode.parentElement;
+          break;
+        }
+      }
+      if (!titleEl) return false;
+
+      let ancestor: Element | null = titleEl.parentElement;
+      for (let i = 0; i < 10 && ancestor; i++) {
+        const buttons = Array.from(
+          ancestor.querySelectorAll<HTMLElement>('button, [role="button"], a')
+        );
+        const fsButton = buttons.find((b) => {
+          const label =
+            (b.innerText ?? "") + " " +
+            (b.getAttribute("aria-label") ?? "") + " " +
+            (b.getAttribute("title") ?? "");
+          return /full\s*screen/i.test(label);
+        });
+        if (fsButton) {
+          fsButton.dispatchEvent(new PointerEvent("pointerover",  { bubbles: true }));
+          fsButton.dispatchEvent(new PointerEvent("pointerenter", { bubbles: true }));
+          fsButton.dispatchEvent(new PointerEvent("pointerdown",  { bubbles: true }));
+          fsButton.dispatchEvent(new PointerEvent("pointerup",    { bubbles: true }));
+          fsButton.dispatchEvent(new MouseEvent("click",          { bubbles: true }));
+          return true;
+        }
+        ancestor = ancestor.parentElement;
+      }
+      return false;
+    });
+
+    if (fullScreenClicked) {
+      this.emit("downloading", "Full Screen 팝업 대기 중…", 96);
+      await this.page.waitForTimeout(3_000);
+      await this.page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => {});
+      await this.page.waitForTimeout(2_000); // 차트 렌더링 안정화
+
+      await this.page.screenshot({ path: tempPopupPath, fullPage: true, type: "png" });
+
+      const popupBounds = await targetFrame.evaluate(() => {
+        const scrollY = window.scrollY;
+        const scrollX = window.scrollX;
+        const vw = window.innerWidth;
+        const vh = window.innerHeight;
+
+        const visible = (el: HTMLElement): boolean => {
+          const s = window.getComputedStyle(el);
+          return s.display !== "none" && s.visibility !== "hidden" && s.opacity !== "0";
+        };
+
+        // 백드롭(viewport 와 거의 동일한 크기) 인지 판정
+        const isBackdrop = (r: DOMRect): boolean =>
+          r.width >= vw * 0.99 && r.height >= vh * 0.99;
+
+        // 1순위: dialog/modal/popup 라벨링된 요소 — 백드롭 제외 + 차트 포함
+        const labeledSels = [
+          "dialog", "[role='dialog']", "[aria-modal='true']",
+          "[class*='Dialog']", "[class*='dialog']",
+          "[class*='Modal']", "[class*='modal']",
+          "[class*='Popup']", "[class*='popup']",
+          "[class*='Fullscreen']", "[class*='fullscreen']",
+          "[class*='full-screen']",
+          "[class*='Lightbox']", "[class*='lightbox']",
+        ];
+
+        const seen = new Set<HTMLElement>();
+        const candidates: HTMLElement[] = [];
+        for (const sel of labeledSels) {
+          for (const el of Array.from(document.querySelectorAll<HTMLElement>(sel))) {
+            if (seen.has(el)) continue;
+            if (!visible(el)) continue;
+            const r = el.getBoundingClientRect();
+            if (r.width < 300 || r.height < 200) continue;
+            if (isBackdrop(r)) continue;
+            if (!el.querySelector("svg:not(svg svg), canvas")) continue;
+            seen.add(el);
+            candidates.push(el);
+          }
+        }
+
+        let popup: HTMLElement | null = null;
+
+        if (candidates.length > 0) {
+          // 가장 작은(가장 안쪽) 요소 선택 — 래퍼/백드롭이 아닌 실제 팝업 본체
+          popup = candidates.reduce((a, b) => {
+            const ra = a.getBoundingClientRect();
+            const rb = b.getBoundingClientRect();
+            return (ra.width * ra.height) < (rb.width * rb.height) ? a : b;
+          });
+        } else {
+          // 2순위: position fixed/absolute, viewport 의 40~99% 크기, 차트 포함
+          const positioned = Array.from(document.querySelectorAll<HTMLElement>("*")).filter((el) => {
+            if (!visible(el)) return false;
+            const s = window.getComputedStyle(el);
+            if (s.position !== "fixed" && s.position !== "absolute") return false;
+            const r = el.getBoundingClientRect();
+            if (r.width < vw * 0.4 || r.height < vh * 0.4) return false;
+            if (isBackdrop(r)) return false;
+            return el.querySelector("svg:not(svg svg), canvas") !== null;
+          });
+          if (positioned.length > 0) {
+            popup = positioned.reduce((a, b) => {
+              const ra = a.getBoundingClientRect();
+              const rb = b.getBoundingClientRect();
+              return (ra.width * ra.height) < (rb.width * rb.height) ? a : b;
+            });
+          }
+        }
+
+        if (!popup) return null;
+
+        const r = popup.getBoundingClientRect();
+        const pad = 4;
+        return {
+          top:    Math.max(0, r.top    + scrollY - pad),
+          left:   Math.max(0, r.left   + scrollX - pad),
+          bottom: r.bottom + scrollY + pad,
+          right:  r.right  + scrollX + pad,
+        };
+      });
+
+      const popMeta = await sharp(tempPopupPath).metadata();
+      const popW    = popMeta.width  ?? mainW;
+      const popH    = popMeta.height ?? mainH;
+
+      if (popupBounds) {
+        const sz2 = await extractFrom(tempPopupPath, popW, popH, applyOffset(popupBounds), clinical2Path);
+        this.emit("downloading", `Clinical2 (Full Screen 팝업) 저장 — ${sz2.width}×${sz2.height}px`, 98);
+      } else {
+        fs.copyFileSync(tempPopupPath, clinical2Path);
+        this.emit("downloading", "팝업 영역 미감지 — 전체 페이지를 Clinical2 로 저장", 98);
+      }
+
+      // 안전성: 팝업 닫기
+      await this.page.keyboard.press("Escape").catch(() => {});
+    } else {
+      this.emit("downloading", "Full Screen 버튼 미발견 — 차트 1 영역 크롭으로 폴백", 96);
+      if (chartRects && chartRects.length >= 1) {
+        const pad = 8;
+        const c2 = applyOffset({
+          top:    Math.max(0, Math.round(chartRects[0].top    - pad)),
+          left:   Math.max(0, Math.round(chartRects[0].left   - pad)),
+          bottom: Math.round(chartRects[0].bottom + pad),
+          right:  Math.round(chartRects[0].right  + pad),
+        });
+        const sz2 = await extractFrom(tempMainPath, mainW, mainH, c2, clinical2Path);
+        this.emit("downloading", `Clinical2 (차트 1 폴백 크롭) 저장 — ${sz2.width}×${sz2.height}px`, 98);
+      } else {
+        fs.copyFileSync(tempMainPath, clinical2Path);
+        this.emit("downloading", "차트 미감지 — Clinical2 에 전체 이미지 저장", 98);
+      }
+    }
+
+    try { fs.unlinkSync(tempMainPath); } catch { /* 이미 정리된 경우 무시 */ }
+    try { fs.unlinkSync(tempPopupPath); } catch { /* 팝업 미생성 시 무시 */ }
 
     return [clinical1Path, clinical2Path];
   }
