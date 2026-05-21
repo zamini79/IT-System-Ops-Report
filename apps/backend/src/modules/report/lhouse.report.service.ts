@@ -487,14 +487,46 @@ ${scriptTag}
   const browser = await chromium.launch({ headless: true });
   try {
     const page = await browser.newPage();
+
+    // 인라인 스크립트의 JS 오류를 백엔드 로그로 캡처
+    page.on("pageerror", (err) => {
+      logger.error(`[LHOUSE] 도넛 차트 페이지 JS 오류: ${err.message}`);
+    });
+    page.on("console", (msg) => {
+      if (msg.type() === "error") {
+        logger.warn(`[LHOUSE] 도넛 차트 콘솔 오류: ${msg.text()}`);
+      }
+    });
+
     await page.setViewportSize({ width: 400, height: 400 });
     await page.setContent(html, { waitUntil: "networkidle", timeout: 30_000 });
-    await page.waitForTimeout(400);
 
     const loaded = await page.evaluate(
       () => typeof (window as unknown as Record<string, unknown>).Chart !== "undefined"
     );
     logger.info(`[LHOUSE] Chart.js 로드: ${loaded ? "성공" : "실패"}`);
+
+    // Chart.js 가 캔버스에 실제로 그릴 때까지 대기 — 도넛 위치(상단부) 픽셀 검사
+    const drawn = await page.waitForFunction(() => {
+      const canvas = document.getElementById("myChart") as HTMLCanvasElement | null;
+      if (!canvas) return false;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return false;
+      const w = canvas.width, h = canvas.height;
+      // 도넛 상단부(중앙 텍스트와 겹치지 않는 영역) 에서 알파 > 0 픽셀 검사
+      const data = ctx.getImageData(Math.floor(w / 2) - 20, Math.floor(h * 0.2), 40, 10).data;
+      for (let i = 3; i < data.length; i += 4) {
+        if (data[i] > 0) return true;
+      }
+      return false;
+    }, { timeout: 5_000 }).then(() => true).catch(() => false);
+
+    if (!drawn) {
+      logger.warn("[LHOUSE] 도넛 차트 캔버스 픽셀 미감지 — 추가 대기 후 캡처 시도");
+      await page.waitForTimeout(1_500);
+    } else {
+      await page.waitForTimeout(200); // 그리기 안정화
+    }
 
     const container = page.locator("#chart-container");
     await container.screenshot({ path: outputPng, type: "png" });
@@ -1196,12 +1228,25 @@ function buildReportHtml(
     .cover-date  { font-size:13px; opacity:.45; }
 
     .page { break-before:page; padding:36px 44px 28px; }
+    /* MS 진행 현황 페이지: 좌우 여백만 — 상/하는 thead/tfoot 가 담당 */
+    .ms-page { padding:0 44px; }
     .page-header {
       display:flex; align-items:flex-end; justify-content:space-between;
       border-bottom:2.5px solid #0f2d55; padding-bottom:10px; margin-bottom:20px;
     }
     .page-header h2  { font-size:18px; font-weight:700; color:#0f2d55; }
     .page-header .pg { font-size:11px; color:#9ca3af; }
+    /* MS 진행 현황: 페이지 오버플로우 시 page-header(thead) / footer(tfoot) 가 자동 반복 */
+    .ms-repeat-table { width:100%; border-collapse:collapse; }
+    .ms-repeat-table > thead { display: table-header-group; }
+    .ms-repeat-table > tfoot { display: table-footer-group; }
+    .ms-repeat-table > thead > tr > td { padding:36px 0 0 0; border:none; vertical-align:top; }
+    .ms-repeat-table > tbody > tr > td { padding:0; border:none; vertical-align:top; }
+    .ms-repeat-table > tfoot > tr > td { padding:24px 0 36px 0; border:none; vertical-align:bottom; }
+    .footer-repeating {
+      padding-top:12px; border-top:1px solid #e5e7eb;
+      font-size:10px; color:#d1d5db; display:flex; justify-content:space-between;
+    }
     .section-desc { font-size:11px; color:#6b7280; margin-bottom:16px; line-height:1.6; }
     .headline {
       font-size: 11px;
@@ -1450,17 +1495,31 @@ function buildReportHtml(
 
     return `
   <!-- ── MS 진행 현황 페이지 ── -->
-  <div class="page">
-    <div class="page-header">
-      <h2>2. Managed Service 진행 현황</h2>
-      <span class="pg">${titleDate}</span>
-    </div>
-    ${chartSection}
-    ${tableSection}
-    <div class="footer">
-      <span>SK Bioscience L HOUSE 공장 — Veeva System 운영 현황</span>
-      <span>${titleDate}</span>
-    </div>
+  <div class="page ms-page">
+    <table class="ms-repeat-table">
+      <thead>
+        <tr><td>
+          <div class="page-header">
+            <h2>2. Managed Service 진행 현황</h2>
+            <span class="pg">${titleDate}</span>
+          </div>
+        </td></tr>
+      </thead>
+      <tbody>
+        <tr><td>
+          ${chartSection}
+          ${tableSection}
+        </td></tr>
+      </tbody>
+      <tfoot>
+        <tr><td>
+          <div class="footer-repeating">
+            <span>SK Bioscience L HOUSE 공장 — Veeva System 운영 현황</span>
+            <span>${titleDate}</span>
+          </div>
+        </td></tr>
+      </tfoot>
+    </table>
   </div>`;
   })() : ""}
 </body>

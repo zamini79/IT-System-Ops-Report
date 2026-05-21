@@ -9,6 +9,7 @@
 import path                   from "path";
 import fs                     from "fs";
 import sharp                  from "sharp";
+import type { Frame }          from "playwright";
 import { BaseCrawler }         from "../../BaseCrawler";
 import type { CrawlerContext } from "../../types";
 
@@ -65,6 +66,224 @@ export class LhouseVeevaDashboardCrawler extends BaseCrawler {
       if (el && await el.isVisible().catch(() => false)) { await el.click(); return true; }
     }
     return false;
+  }
+
+  // ── 헬퍼: 날짜 포맷 (YYYY-MM-DD, 예: "2026-02-01") ──────────────────────
+
+  private fmtDate(d: Date): string {
+    const yyyy = d.getFullYear();
+    const mm   = String(d.getMonth() + 1).padStart(2, "0");
+    const dd   = String(d.getDate()).padStart(2, "0");
+    return `${yyyy}-${mm}-${dd}`;
+  }
+
+  private async _findTargetFrame(): Promise<Frame> {
+    const deadline = Date.now() + 15_000;
+    while (Date.now() < deadline) {
+      for (const frame of this.page.frames()) {
+        try {
+          const has = await frame.evaluate(
+            () => /FILTERS/i.test(document.body?.innerText ?? "")
+          ).catch(() => false);
+          if (has) return frame;
+        } catch { /* ignore */ }
+      }
+      await this.page.waitForTimeout(500);
+    }
+    return this.page.mainFrame();
+  }
+
+  private async _getFrameOffset(frame: Frame): Promise<{ x: number; y: number }> {
+    if (frame === this.page.mainFrame()) return { x: 0, y: 0 };
+    for (const el of await this.page.$$("iframe")) {
+      try {
+        const f = await el.contentFrame();
+        if (f === frame) {
+          const box = await el.boundingBox();
+          if (box) return { x: box.x, y: box.y };
+        }
+      } catch { /* ignore */ }
+    }
+    return { x: 0, y: 0 };
+  }
+
+  private async _applyDateFilter(
+    startStr: string,
+    endStr:   string,
+    frame:    Frame,
+  ): Promise<void> {
+    this.emit("navigating", `날짜 필터 설정 중… (${startStr} ~ ${endStr})`, 34);
+
+    const clickedPencil = await frame.evaluate((): boolean => {
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+      let textNode: Text | null;
+      let filtersEl: Element | null = null;
+
+      while ((textNode = walker.nextNode() as Text | null)) {
+        if (/FILTERS/i.test(textNode.textContent ?? "")) {
+          filtersEl = textNode.parentElement;
+          break;
+        }
+      }
+      if (!filtersEl) return false;
+
+      let ancestor: Element | null = filtersEl.parentElement;
+      for (let i = 0; i < 8 && ancestor; i++) {
+        const candidates = Array.from(
+          ancestor.querySelectorAll<HTMLElement>('button, a, [role="button"]')
+        ).filter((el) => {
+          if (!el.offsetParent) return false;
+          if (el.contains(filtersEl)) return false;
+          return el.querySelector("svg") !== null;
+        });
+
+        if (candidates.length > 0) {
+          const filtersRect = filtersEl.getBoundingClientRect();
+          const rightOf = candidates.filter(
+            (el) => el.getBoundingClientRect().left >= filtersRect.right - 4
+          );
+          const target = rightOf.length > 0
+            ? rightOf.reduce((a, b) =>
+                a.getBoundingClientRect().left < b.getBoundingClientRect().left ? a : b)
+            : candidates[0];
+
+          target.dispatchEvent(new PointerEvent("pointerover",  { bubbles: true }));
+          target.dispatchEvent(new PointerEvent("pointerenter", { bubbles: true }));
+          target.dispatchEvent(new PointerEvent("pointerdown",  { bubbles: true }));
+          target.dispatchEvent(new PointerEvent("pointerup",    { bubbles: true }));
+          target.dispatchEvent(new MouseEvent("click",          { bubbles: true }));
+          return true;
+        }
+        ancestor = ancestor.parentElement;
+      }
+      return false;
+    });
+
+    if (!clickedPencil) {
+      this.emit("navigating", "FILTERS 연필 아이콘 미발견 — 필터 건너뜀", 35);
+      return;
+    }
+
+    this.emit("navigating", "필터 팝업 대기 중…", 35);
+    await this.page.waitForTimeout(3_000);
+
+    const datesSet = await frame.evaluate(
+      ([start, end]: [string, string]): boolean => {
+        function isActuallyVisible(el: HTMLElement): boolean {
+          const s = window.getComputedStyle(el);
+          return (
+            s.display     !== "none"    &&
+            s.visibility  !== "hidden"  &&
+            s.opacity     !== "0"       &&
+            el.offsetParent !== null
+          );
+        }
+
+        function setNativeValue(el: HTMLInputElement, value: string) {
+          const setter = Object.getOwnPropertyDescriptor(
+            window.HTMLInputElement.prototype, "value"
+          )?.set;
+          if (setter) setter.call(el, value);
+          else el.value = value;
+          el.dispatchEvent(new Event("input",  { bubbles: true }));
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+
+        const PANEL_SELS = [
+          "dialog", "[role='dialog']",
+          "[class*='modal']", "[class*='popup']", "[class*='overlay']",
+          "[class*='filter']", "[class*='Filter']",
+        ];
+
+        for (const sel of PANEL_SELS) {
+          const panel = document.querySelector(sel);
+          if (!panel) continue;
+          const inputs = Array.from(panel.querySelectorAll<HTMLInputElement>("input"))
+            .filter(el => isActuallyVisible(el));
+          if (inputs.length >= 2) {
+            setNativeValue(inputs[0], start);
+            setNativeValue(inputs[1], end);
+            return true;
+          }
+        }
+
+        const allVisible = Array.from(document.querySelectorAll<HTMLInputElement>("input"))
+          .filter(el => isActuallyVisible(el));
+        if (allVisible.length === 2) {
+          setNativeValue(allVisible[0], start);
+          setNativeValue(allVisible[1], end);
+          return true;
+        }
+
+        return false;
+      },
+      [startStr, endStr] as [string, string],
+    );
+
+    if (datesSet) {
+      this.emit("navigating", `날짜 입력 완료: ${startStr} ~ ${endStr}`, 37);
+    } else {
+      this.emit("navigating", "날짜 입력 필드 미발견 — 날짜 미설정", 37);
+    }
+
+    const BTN_NAMES = [
+      "Continue", "Apply", "OK", "확인", "Submit",
+      "Save", "Done", "Update", "Refresh", "Run",
+      "View", "Show", "Filter", "Go", "저장", "적용",
+    ];
+    const CANCEL_NAMES = /cancel|close|취소|reset|clear/i;
+
+    let continueDone = false;
+    for (const name of BTN_NAMES) {
+      const btn = frame.getByRole("button", { name, exact: false });
+      if (await btn.count() > 0 && await btn.first().isVisible().catch(() => false)) {
+        await btn.first().click();
+        this.emit("navigating", `"${name}" 버튼 클릭 완료`, 38);
+        continueDone = true;
+        break;
+      }
+    }
+
+    if (!continueDone) {
+      const clicked = await frame.evaluate((cancelPattern: string): string | null => {
+        const cancelRe = new RegExp(cancelPattern, "i");
+        const PANEL_SELS = [
+          "dialog", "[role='dialog']",
+          "[class*='modal']", "[class*='popup']", "[class*='overlay']",
+          "[class*='filter']", "[class*='Filter']",
+        ];
+        for (const sel of PANEL_SELS) {
+          const panel = document.querySelector(sel);
+          if (!panel) continue;
+          const btns = Array.from(
+            panel.querySelectorAll<HTMLElement>('button, [role="button"], input[type="submit"]')
+          ).filter((el) => {
+            const s = window.getComputedStyle(el);
+            if (s.display === "none" || s.visibility === "hidden" || el.offsetParent === null) return false;
+            const label = (el.innerText || el.getAttribute("aria-label") || "").trim();
+            return label.length > 0 && !cancelRe.test(label);
+          });
+          if (btns.length === 0) continue;
+          const primary = btns.find((b) => /primary|confirm|action/i.test(b.className));
+          const target  = primary ?? btns[btns.length - 1];
+          target.click();
+          return (target.innerText || target.getAttribute("aria-label") || "").trim();
+        }
+        return null;
+      }, CANCEL_NAMES.source);
+
+      if (clicked) {
+        this.emit("navigating", `휴리스틱 버튼 클릭: "${clicked}"`, 38);
+        continueDone = true;
+      }
+    }
+
+    if (!continueDone) {
+      this.emit("navigating", "Continue 버튼 미발견 — Enter 키 시도", 38);
+      await this.page.keyboard.press("Enter");
+    }
+
+    await this.page.waitForTimeout(2_000);
   }
 
   // ── 메인 ─────────────────────────────────────────────────────────────────────
@@ -173,7 +392,7 @@ export class LhouseVeevaDashboardCrawler extends BaseCrawler {
     }
 
     // ── Step 3. 대시보드 URL 접속 ──────────────────────────────────────────────
-    this.emit("navigating", "대시보드 페이지 접속 중…", 30);
+    this.emit("navigating", "대시보드 페이지 접속 중…", 28);
     await this.page.setViewportSize({ width: 1600, height: 1000 });
 
     await this.page.goto(LhouseVeevaDashboardCrawler.DASHBOARD_URL, {
@@ -181,36 +400,67 @@ export class LhouseVeevaDashboardCrawler extends BaseCrawler {
       timeout:   60_000,
     });
 
-    // ── Step 4. 차트 6개 로딩 대기 ─────────────────────────────────────────────
-    this.emit("navigating", "대시보드 차트 로딩 대기 중…", 40);
+    await this.page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => {});
+    await this.page.waitForTimeout(3_000);
 
-    // networkidle 대기 (SPA 초기 렌더링)
+    // ── Step 3.5. 대시보드 프레임 탐지 ────────────────────────────────────────
+    this.emit("navigating", "대시보드 프레임 탐색 중…", 29);
+    const targetFrame = await this._findTargetFrame();
+    const isIframe    = targetFrame !== this.page.mainFrame();
+    this.emit(
+      "navigating",
+      isIframe ? `iframe 내 대시보드 감지: ${targetFrame.url().substring(0, 80)}` : "메인 프레임에서 대시보드 렌더링",
+      30,
+    );
+
+    // ── Step 3.6. 날짜 필터 설정 (최근 3개월) ─────────────────────────────────
+    const now = new Date();
+    const filterStart = new Date(now.getFullYear(), now.getMonth() - 3, 1);
+    const filterEnd   = new Date(now.getFullYear(), now.getMonth(),     0);
+
+    await this._applyDateFilter(
+      this.fmtDate(filterStart),
+      this.fmtDate(filterEnd),
+      targetFrame,
+    );
+
     await this.page.waitForLoadState("networkidle", { timeout: 60_000 }).catch(() => {});
     await this.page.waitForTimeout(3_000);
 
-    // SVG/Canvas 요소 6개 이상 출현할 때까지 폴링 (최대 2분)
+    // ── Step 4. 차트 6개 로딩 대기 ─────────────────────────────────────────────
+    this.emit("navigating", "대시보드 차트 로딩 대기 중…", 42);
+
     const CHART_TIMEOUT_MS = 120_000;
     const chartDeadline    = Date.now() + CHART_TIMEOUT_MS;
     let   svgCount         = 0;
+    let   prevSvgCount     = -1;
+    let   stableIterations = 0;
 
     while (Date.now() < chartDeadline) {
-      svgCount = await this.page.evaluate(() => {
-        const svgs    = document.querySelectorAll("svg").length;
-        const canvas  = document.querySelectorAll("canvas").length;
-        return svgs + canvas;
+      svgCount = await targetFrame.evaluate(() => {
+        const large = (sel: string) =>
+          Array.from(document.querySelectorAll<Element>(sel)).filter((el) => {
+            const r = el.getBoundingClientRect();
+            return r.width > 150 && r.height > 100;
+          }).length;
+        return large("svg:not(svg svg)") + large("canvas");
       });
 
       const elapsed = CHART_TIMEOUT_MS - (chartDeadline - Date.now());
-      const pct     = Math.min(75, 40 + Math.floor((elapsed / CHART_TIMEOUT_MS) * 35));
-      this.emit("navigating", `차트 요소 감지 중… (SVG/Canvas: ${svgCount}개)`, pct);
+      const pct     = Math.min(78, 42 + Math.floor((elapsed / CHART_TIMEOUT_MS) * 36));
+      this.emit("navigating", `차트 요소 감지 중… (대형 SVG/Canvas: ${svgCount}개)`, pct);
 
-      if (svgCount >= 6) break;
+      if (svgCount > 0 && svgCount === prevSvgCount) {
+        stableIterations++;
+        if (stableIterations >= 3) break;
+      } else {
+        stableIterations = 0;
+      }
+      prevSvgCount = svgCount;
       await this.page.waitForTimeout(2_000);
     }
 
     this.emit("navigating", `차트 ${svgCount}개 감지 — 렌더링 안정화 대기…`, 80);
-
-    // 차트 애니메이션 완료 대기 (추가 5초)
     await this.page.waitForTimeout(5_000);
 
     // ── Step 5. 전체 페이지 스크린샷 캡처 ────────────────────────────────────
@@ -222,14 +472,15 @@ export class LhouseVeevaDashboardCrawler extends BaseCrawler {
 
     await this.page.screenshot({ path: tempPath, fullPage: true, type: "png" });
 
-    // ── Step 6. 차트 카드 컨테이너 좌표 추출 (document 기준) ──────────────
+    // ── Step 6. 차트 카드 컨테이너 좌표 추출 (targetFrame 기준) ───────────
     this.emit("downloading", "차트 영역 좌표 계산 중…", 93);
 
-    const chartBounds = await this.page.evaluate(() => {
+    const iframeOffset = await this._getFrameOffset(targetFrame);
+
+    const chartBoundsRaw = await targetFrame.evaluate(() => {
       const scrollY = window.scrollY;
       const scrollX = window.scrollX;
 
-      // 아이콘·장식을 제외한 차트 크기 SVG/Canvas (150×100px 이상)
       const innerEls = Array.from(
         document.querySelectorAll<Element>("svg:not(svg svg), canvas")
       ).filter(el => {
@@ -239,9 +490,6 @@ export class LhouseVeevaDashboardCrawler extends BaseCrawler {
 
       if (innerEls.length === 0) return null;
 
-      // SVG/Canvas → 카드 컨테이너 탐색
-      // 1순위: Veeva 전용 클래스명으로 closest() 시도
-      // 2순위: 뷰포트 60% 이하인 범위 내 최대 조상 탐색
       const maxCardW = window.innerWidth * 0.6;
 
       function findCard(el: Element): Element {
@@ -257,7 +505,6 @@ export class LhouseVeevaDashboardCrawler extends BaseCrawler {
         for (let i = 0; i < 10 && node.parentElement; i++) {
           node = node.parentElement!;
           const r = node.getBoundingClientRect();
-          // 뷰포트 폭의 60% 초과하면 그리드/전체 컨테이너이므로 중단
           if (r.width > maxCardW) break;
           best = node;
         }
@@ -276,7 +523,7 @@ export class LhouseVeevaDashboardCrawler extends BaseCrawler {
         };
       });
 
-      const pad = 8; // 카드 테두리 바깥 소량 여백
+      const pad = 8;
       return {
         top:    Math.max(0, Math.round(Math.min(...rects.map(r => r.top))    - pad)),
         left:   Math.max(0, Math.round(Math.min(...rects.map(r => r.left))   - pad)),
@@ -285,16 +532,25 @@ export class LhouseVeevaDashboardCrawler extends BaseCrawler {
       };
     });
 
+    const chartBounds = chartBoundsRaw
+      ? {
+          top:    chartBoundsRaw.top    + iframeOffset.y,
+          left:   chartBoundsRaw.left   + iframeOffset.x,
+          bottom: chartBoundsRaw.bottom + iframeOffset.y,
+          right:  chartBoundsRaw.right  + iframeOffset.x,
+        }
+      : null;
+
     // ── Step 7. sharp 로 차트 영역만 크롭 ─────────────────────────────────
     if (chartBounds) {
       const meta  = await sharp(tempPath).metadata();
       const imgW  = meta.width  ?? 1600;
       const imgH  = meta.height ?? 1000;
 
-      const left   = Math.min(chartBounds.left,  imgW - 1);
-      const top    = Math.min(chartBounds.top,   imgH - 1);
-      const width  = Math.min(chartBounds.right  - chartBounds.left, imgW - left);
-      const height = Math.min(chartBounds.bottom - chartBounds.top,  imgH - top);
+      const left   = Math.max(0, Math.min(Math.floor(chartBounds.left), imgW - 1));
+      const top    = Math.max(0, Math.min(Math.floor(chartBounds.top),  imgH - 1));
+      const width  = Math.max(1, Math.min(Math.ceil(chartBounds.right  - chartBounds.left), imgW - left));
+      const height = Math.max(1, Math.min(Math.ceil(chartBounds.bottom - chartBounds.top),  imgH - top));
 
       await sharp(tempPath)
         .extract({ left, top, width, height })
@@ -302,7 +558,6 @@ export class LhouseVeevaDashboardCrawler extends BaseCrawler {
 
       this.emit("downloading", `차트 영역 크롭 완료 (${width}×${height}px)`, 98);
     } else {
-      // 차트 좌표 감지 실패 → 전체 이미지 그대로 사용
       fs.renameSync(tempPath, savedPath);
       this.emit("downloading", "차트 위치 미감지 — 전체 이미지 저장", 98);
     }

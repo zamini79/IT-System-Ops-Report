@@ -388,19 +388,35 @@ async function runDashboardInBackground(jobId: string, taskId: string): Promise<
 
         const fileSize = fs.statSync(destPath).size;
 
+        // 보고서 서비스가 .jpg 가 있으면 그걸 우선 사용하므로, 옛날에 수동 업로드된
+        // .jpg 가 남아있으면 새 캡처가 반영되지 않음 → 디스크의 .jpg 도 함께 삭제.
+        const oldJpgPath = path.join(uploadsDir, "Systemusage_LHOUSE.jpg");
+        try {
+          if (fs.existsSync(oldJpgPath)) {
+            fs.unlinkSync(oldJpgPath);
+            logger.info(`[CrawlService] Old jpg removed: ${oldJpgPath}`);
+          }
+        } catch (e) {
+          logger.warn(`[CrawlService] Old jpg 삭제 실패 (무시): ${(e as Error).message}`);
+        }
+
+        // .jpg / .png 모두 탐색 → 최신 1건을 PNG 로 덮어씀 (GCP/Medcomms 와 동일 패턴)
         const existing = await query<{ id: string }>(
-          "SELECT id FROM uploaded_files WHERE report_job_id = $1 AND original_name = $2",
-          [jobId, savedFilename]
+          `SELECT id FROM uploaded_files
+           WHERE report_job_id = $1
+             AND original_name IN ('Systemusage_LHOUSE.png', 'Systemusage_LHOUSE.jpg')
+           ORDER BY created_at DESC LIMIT 1`,
+          [jobId]
         );
         if (existing.length) {
           await query(
             `UPDATE uploaded_files
-             SET stored_path = $1, file_type = 'image/png', file_size = $2,
+             SET original_name = $1, stored_path = $2, file_type = 'image/png', file_size = $3,
                  analysis_result = '{}'::jsonb, created_at = NOW()
-             WHERE id = $3`,
-            [destPath, fileSize, existing[0].id]
+             WHERE id = $4`,
+            [savedFilename, destPath, fileSize, existing[0].id]
           );
-          logger.info(`[CrawlService] System Usage updated: ${destPath}`);
+          logger.info(`[CrawlService] System Usage replaced: ${destPath}`);
         } else {
           await query(
             `INSERT INTO uploaded_files

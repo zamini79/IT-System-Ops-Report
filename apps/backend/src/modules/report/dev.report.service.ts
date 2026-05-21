@@ -1406,17 +1406,31 @@ function buildDevReportHtml(
 
     return `
   <!-- ── MS 진행 현황 페이지 ── -->
-  <div class="page">
-    <div class="page-header">
-      <h2>4. Managed Service 진행 현황</h2>
-      <span class="pg">${titleDate}</span>
-    </div>
-    ${chartsRowHtml}
-    ${tablesHtml}
-    <div class="footer">
-      <span>SK Bioscience 개발본부 — 시스템 운영 현황</span>
-      <span>${titleDate}</span>
-    </div>
+  <div class="page ms-page">
+    <table class="ms-repeat-table">
+      <thead>
+        <tr><td>
+          <div class="page-header">
+            <h2>4. Managed Service 진행 현황</h2>
+            <span class="pg">${titleDate}</span>
+          </div>
+        </td></tr>
+      </thead>
+      <tbody>
+        <tr><td>
+          ${chartsRowHtml}
+          ${tablesHtml}
+        </td></tr>
+      </tbody>
+      <tfoot>
+        <tr><td>
+          <div class="footer-repeating">
+            <span>SK Bioscience 개발본부 — 시스템 운영 현황</span>
+            <span>${titleDate}</span>
+          </div>
+        </td></tr>
+      </tfoot>
+    </table>
   </div>`;
   })() : "";
 
@@ -1442,12 +1456,25 @@ function buildDevReportHtml(
 
     /* ── 공통 페이지 ── */
     .page { break-before:page; padding:36px 44px 28px; }
+    /* MS 진행 현황 페이지: 좌우 여백만 — 상/하는 thead/tfoot 가 담당 */
+    .ms-page { padding:0 44px; }
     .page-header {
       display:flex; align-items:flex-end; justify-content:space-between;
       border-bottom:2.5px solid #0f2d55; padding-bottom:10px; margin-bottom:14px;
     }
     .page-header h2  { font-size:18px; font-weight:700; color:#0f2d55; }
     .page-header .pg { font-size:11px; color:#9ca3af; }
+    /* MS 진행 현황: 페이지 오버플로우 시 page-header(thead) / footer(tfoot) 가 자동 반복 */
+    .ms-repeat-table { width:100%; border-collapse:collapse; }
+    .ms-repeat-table > thead { display: table-header-group; }
+    .ms-repeat-table > tfoot { display: table-footer-group; }
+    .ms-repeat-table > thead > tr > td { padding:36px 0 0 0; border:none; vertical-align:top; }
+    .ms-repeat-table > tbody > tr > td { padding:0; border:none; vertical-align:top; }
+    .ms-repeat-table > tfoot > tr > td { padding:24px 0 36px 0; border:none; vertical-align:bottom; }
+    .footer-repeating {
+      padding-top:12px; border-top:1px solid #e5e7eb;
+      font-size:10px; color:#d1d5db; display:flex; justify-content:space-between;
+    }
     .headline {
       font-size:11px; line-height:1.8; color:#1f2937;
       background:#f0f4f8; border-left:4px solid #0f2d55;
