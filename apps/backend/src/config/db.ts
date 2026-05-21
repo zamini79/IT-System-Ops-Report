@@ -81,6 +81,14 @@ export async function runMigrations(): Promise<void> {
                END IF;
              END $$;`,
     },
+    {
+      // L HOUSE 는 공장의 공식 이름이므로 '로컬하우스' 로 음역되어 시드된 과거 값을 교정.
+      // BIO/DEV 도 schema.sql 의 표준 명칭과 일치시킴.
+      name: "divisions.name_official",
+      sql:  `UPDATE divisions SET name = 'Bio연구본부'   WHERE code = 'BIO'    AND name <> 'Bio연구본부';
+             UPDATE divisions SET name = '개발본부'     WHERE code = 'DEV'    AND name <> '개발본부';
+             UPDATE divisions SET name = 'L HOUSE 공장' WHERE code = 'LHOUSE' AND name <> 'L HOUSE 공장';`,
+    },
   ];
 
   for (const m of migrations) {
