@@ -5,6 +5,8 @@ dist/
 *.log
 uploads/
 outputs/
+saved_reports/
+monthly_data/
 .DS_Store
 
 # Claude Code internal files

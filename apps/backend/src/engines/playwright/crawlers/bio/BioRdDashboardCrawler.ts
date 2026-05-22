@@ -69,13 +69,12 @@ export class BioRdDashboardCrawler extends BaseCrawler {
     return false;
   }
 
-  // ── 헬퍼: 날짜 포맷 (DD MMM YYYY, 예: "01 Feb 2026") ─────────────────────
+  // ── 헬퍼: 날짜 포맷 (M/D/YYYY, 예: "2/1/2026" — 0 padding 없음) ──────────
 
   private fmtDate(d: Date): string {
-    const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-    const dd = String(d.getDate()).padStart(2, "0");
-    return `${dd} ${MONTHS[d.getMonth()]} ${d.getFullYear()}`;
+    const m  = d.getMonth() + 1;
+    const dd = d.getDate();
+    return `${m}/${dd}/${d.getFullYear()}`;
   }
 
   private async _findTargetFrame(): Promise<Frame> {

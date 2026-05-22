@@ -24,6 +24,12 @@ import {
   getJobStatus,
   getPdfPath,
 } from "./report.service";
+import {
+  saveReportToHistory,
+  listSavedReports,
+  getSavedReport,
+  deleteSavedReport,
+} from "./history.service";
 import { generateLhouseReport } from "./lhouse.report.service";
 import { generateDevReport }    from "./dev.report.service";
 import { generateBioReport, generateBioLimsReport, generateBioElnReport } from "./bio.report.service";
@@ -230,6 +236,105 @@ reportRouter.get(
 
       const { items, total } = await listReportHistory({ division, page, limit });
       respond.paginated(res, items, total, page, limit);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// 보고서 History (월별 저장소) — 매달 발행된 보고서 보관 및 조회
+// ---------------------------------------------------------------------------
+
+// POST /api/report/saved  — outputs/ 의 최신 보고서를 History 에 저장 (덮어쓰기)
+reportRouter.post(
+  "/saved",
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { divisionCode, reportType, year, month, sourceJobId } = req.body as {
+        divisionCode?: string;
+        reportType?:   string;
+        year?:         number;
+        month?:        number;
+        sourceJobId?:  string | null;
+      };
+
+      if (!divisionCode || !ALLOWED_DIVISIONS.includes(divisionCode as DivisionCode))
+        throw new AppError(400, "올바른 divisionCode 가 필요합니다.");
+      if (!reportType)     throw new AppError(400, "reportType 이 필요합니다.");
+      if (!year || !month) throw new AppError(400, "year, month 가 필요합니다.");
+
+      const user  = (req as AuthRequest).user!;
+      const saved = await saveReportToHistory({
+        divisionCode,
+        reportType,
+        year:        Number(year),
+        month:       Number(month),
+        userId:      user.sub,
+        sourceJobId: sourceJobId ?? null,
+      });
+
+      respond.created(res, saved, "보고서가 History 에 저장되었습니다.");
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// GET /api/report/saved?division=&year=&month=  — 저장된 보고서 목록
+reportRouter.get(
+  "/saved",
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const divisionCode = req.query.division as string | undefined;
+      const year         = req.query.year  ? Number(req.query.year)  : undefined;
+      const month        = req.query.month ? Number(req.query.month) : undefined;
+
+      if (divisionCode && !ALLOWED_DIVISIONS.includes(divisionCode as DivisionCode))
+        throw new AppError(400, `올바르지 않은 division: ${divisionCode}`);
+
+      const items = await listSavedReports({ divisionCode, year, month });
+      respond.ok(res, items);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// GET /api/report/saved/:id/download  — 저장된 PDF 다운로드
+reportRouter.get(
+  "/saved/:id/download",
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { id } = req.params;
+      if (!UUID_RE.test(id)) throw new AppError(400, "id 는 UUID 형식이어야 합니다.");
+
+      const row = await getSavedReport(id);
+      if (!row) throw new AppError(404, "저장된 보고서를 찾을 수 없습니다.");
+
+      const fs = await import("fs");
+      if (!fs.existsSync(row.stored_path))
+        throw new AppError(404, `파일이 디스크에서 누락되었습니다: ${row.stored_path}`);
+
+      res.setHeader("Content-Type",        "application/pdf");
+      res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(row.filename)}`);
+      fs.createReadStream(row.stored_path).pipe(res);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// DELETE /api/report/saved/:id  — History 에서 제거 (디스크 파일도 삭제)
+reportRouter.delete(
+  "/saved/:id",
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { id } = req.params;
+      if (!UUID_RE.test(id)) throw new AppError(400, "id 는 UUID 형식이어야 합니다.");
+
+      await deleteSavedReport(id);
+      respond.noContent(res);
     } catch (err) {
       next(err);
     }

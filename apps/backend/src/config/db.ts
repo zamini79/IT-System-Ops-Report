@@ -89,6 +89,27 @@ export async function runMigrations(): Promise<void> {
              UPDATE divisions SET name = '개발본부'     WHERE code = 'DEV'    AND name <> '개발본부';
              UPDATE divisions SET name = 'L HOUSE 공장' WHERE code = 'LHOUSE' AND name <> 'L HOUSE 공장';`,
     },
+    {
+      // 월별 보고서 보관소 (History 페이지의 새 데이터 모델)
+      // (division_code, report_type, year, month) 별로 1건만 유지 — 재저장 시 덮어쓰기
+      name: "saved_reports.table",
+      sql:  `CREATE TABLE IF NOT EXISTS saved_reports (
+               id            UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+               division_code division_code NOT NULL,
+               report_type   VARCHAR(50)   NOT NULL,
+               year          INTEGER       NOT NULL CHECK (year >= 2000 AND year <= 3000),
+               month         INTEGER       NOT NULL CHECK (month >= 1 AND month <= 12),
+               source_job_id UUID          REFERENCES report_jobs(id) ON DELETE SET NULL,
+               filename      VARCHAR(255)  NOT NULL,
+               stored_path   TEXT          NOT NULL,
+               file_size     BIGINT        NOT NULL,
+               saved_by      UUID          REFERENCES users(id),
+               saved_at      TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+               CONSTRAINT uq_saved_reports_div_type_ym UNIQUE (division_code, report_type, year, month)
+             );
+             CREATE INDEX IF NOT EXISTS idx_saved_reports_ym  ON saved_reports(year DESC, month DESC);
+             CREATE INDEX IF NOT EXISTS idx_saved_reports_div ON saved_reports(division_code);`,
+    },
   ];
 
   for (const m of migrations) {

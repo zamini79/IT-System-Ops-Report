@@ -924,6 +924,10 @@ interface BioReportSection {
   endpoint:     string;
   /** 다운로드 파일명 */
   filename:     string;
+  /** History 저장용 report_type 키 */
+  reportType:   string;
+  /** History 모달에 표시할 라벨 */
+  reportLabel:  string;
   /** 업로드 파일 목록 (1개 이상) */
   files:        BioFileConfig[];
   /** 색상 테마 */
@@ -935,6 +939,8 @@ const BIO_REPORT_SECTIONS: BioReportSection[] = [
     sectionTitle: "1. Veeva System",
     endpoint:     "/report/generate-bio",
     filename:     "Bio연구본부 Veeva System Report.pdf",
+    reportType:   "bio_veeva",
+    reportLabel:  "Bio연구본부 Veeva System",
     color:        "border-blue-400 text-blue-700 bg-blue-50",
     files: [],
   },
@@ -942,6 +948,8 @@ const BIO_REPORT_SECTIONS: BioReportSection[] = [
     sectionTitle: "2. 임검분 LIMS",
     endpoint:     "/report/generate-bio-lims",
     filename:     "Bio연구본부 임검분 LIMS Report.pdf",
+    reportType:   "bio_lims",
+    reportLabel:  "Bio연구본부 임검분 LIMS",
     color:        "border-emerald-400 text-emerald-700 bg-emerald-50",
     files: [
       {
@@ -978,6 +986,8 @@ const BIO_REPORT_SECTIONS: BioReportSection[] = [
   {
     sectionTitle: "3. 전자연구노트(ELN)",
     endpoint:     "/report/generate-bio-eln",
+    reportType:   "bio_eln",
+    reportLabel:  "Bio연구본부 전자연구노트(ELN)",
     filename:     "Bio연구본부 전자연구노트(ELN) Report.pdf",
     color:        "border-purple-400 text-purple-700 bg-purple-50",
     files: [
@@ -1021,12 +1031,14 @@ function BioNamedUploadPanel({
   onUploadDone,
   fileList,
   onLog,
+  onRequestSave,
 }: {
-  jobId:        string;
-  divisionCode: string;
-  onUploadDone: () => void;
-  fileList:     UploadedFileRow[];
-  onLog?:       (systemName: string, msg: string, kind: LogEntry["kind"]) => void;
+  jobId:         string;
+  divisionCode:  string;
+  onUploadDone:  () => void;
+  fileList:      UploadedFileRow[];
+  onLog?:        (systemName: string, msg: string, kind: LogEntry["kind"]) => void;
+  onRequestSave: (reportType: string, label: string) => void;
 }) {
   const { success, error: toastError } = useToast();
 
@@ -1090,33 +1102,52 @@ function BioNamedUploadPanel({
               <div>
                 <h3 className="text-sm font-bold">{section.sectionTitle}</h3>
               </div>
-              {/* 보고서 생성 버튼 */}
-              <button
-                onClick={() => void handleGenerate(section)}
-                disabled={isGenerating}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all
-                  ${!isGenerating
-                    ? "bg-secondary text-white hover:bg-secondary-600 shadow-sm"
-                    : "bg-white/60 text-gray-400 cursor-not-allowed"}`}
-              >
-                {isGenerating ? (
-                  <>
-                    <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24">
-                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
-                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
-                    </svg>
-                    생성 중…
-                  </>
-                ) : (
-                  <>
-                    <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                        d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                    </svg>
-                    보고서 생성
-                  </>
-                )}
-              </button>
+              <div className="flex items-center gap-2">
+                {/* 보고서 생성 버튼 */}
+                <button
+                  onClick={() => void handleGenerate(section)}
+                  disabled={isGenerating}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all
+                    ${!isGenerating
+                      ? "bg-secondary text-white hover:bg-secondary-600 shadow-sm"
+                      : "bg-white/60 text-gray-400 cursor-not-allowed"}`}
+                >
+                  {isGenerating ? (
+                    <>
+                      <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+                      </svg>
+                      생성 중…
+                    </>
+                  ) : (
+                    <>
+                      <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                          d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                      </svg>
+                      보고서 생성
+                    </>
+                  )}
+                </button>
+
+                {/* 보고서 저장 버튼 */}
+                <button
+                  onClick={() => onRequestSave(section.reportType, section.reportLabel)}
+                  disabled={isGenerating}
+                  title="가장 최근에 생성된 PDF 를 선택한 월로 History 에 저장합니다."
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all
+                    ${!isGenerating
+                      ? "border border-secondary text-secondary bg-white hover:bg-secondary-50"
+                      : "bg-gray-100 text-gray-400 cursor-not-allowed border border-gray-200"}`}
+                >
+                  <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                      d="M5 13l4 4L19 7" />
+                  </svg>
+                  보고서 저장
+                </button>
+              </div>
             </div>
             {/* 업로드 드롭존 — files 배열의 각 파일마다 드롭존 렌더링 */}
             <div className="p-4 space-y-3">
@@ -1787,6 +1818,69 @@ export function DivisionReportPage({
     URL.revokeObjectURL(url);
   }
 
+  // ── 보고서 History 저장 모달 상태 (모든 본부 공용) ──────────────────────────
+  const [saveModalState, setSaveModalState] = useState<{
+    open:         boolean;
+    divisionCode: string;
+    reportType:   string;
+    label:        string;
+  }>({ open: false, divisionCode: "", reportType: "", label: "" });
+  const [saveModalYear,   setSaveModalYear]   = useState(() => prevMonth().y);
+  const [saveModalMonth,  setSaveModalMonth]  = useState(() => prevMonth().m);
+  const [savingToHistory, setSavingToHistory] = useState(false);
+
+  const openSaveModal = useCallback((divisionCode: string, reportType: string, label: string) => {
+    setSaveModalState({ open: true, divisionCode, reportType, label });
+  }, []);
+
+  const handleSaveToHistory = useCallback(async () => {
+    if (savingToHistory || !saveModalState.open) return;
+    const { divisionCode: divCode, reportType, label } = saveModalState;
+    const ym = `${saveModalYear}-${String(saveModalMonth).padStart(2, "0")}`;
+
+    // 1) 동일한 (division, reportType, year, month) 가 이미 저장되어 있는지 확인
+    setSavingToHistory(true);
+    try {
+      const check = await apiClient.get<{ success: boolean; data: Array<{ report_type: string }> }>(
+        `/report/saved?division=${divCode}&year=${saveModalYear}&month=${saveModalMonth}`
+      );
+      const exists = (check.data.data ?? []).some((r) => r.report_type === reportType);
+      if (exists) {
+        const proceed = window.confirm(
+          `${ym} ${label} 보고서가 이미 저장되어 있습니다. 덮어쓰시겠습니까?`
+        );
+        if (!proceed) {
+          setSavingToHistory(false);
+          return;
+        }
+      }
+
+      // 2) 저장 실행 (백엔드는 ON CONFLICT 로 덮어쓰기)
+      await apiClient.post("/report/saved", {
+        divisionCode: divCode,
+        reportType,
+        year:  saveModalYear,
+        month: saveModalMonth,
+      });
+      success(
+        exists
+          ? `${ym} ${label} 보고서가 덮어쓰기 저장되었습니다.`
+          : `${ym} ${label} 보고서가 History 에 저장되었습니다.`
+      );
+      addLocalLog("History", `${ym} ${label} ${exists ? "덮어쓰기 " : ""}저장 완료`, "success");
+      void queryClient.invalidateQueries({ queryKey: ["report-saved"] });
+      setSaveModalState((s) => ({ ...s, open: false }));
+    } catch (err: unknown) {
+      const msg =
+        (err as { response?: { data?: { error?: string } } })
+          ?.response?.data?.error ?? "History 저장에 실패했습니다.";
+      toastError(msg);
+      addLocalLog("History", `저장 실패: ${msg}`, "error");
+    } finally {
+      setSavingToHistory(false);
+    }
+  }, [savingToHistory, saveModalState, saveModalYear, saveModalMonth, success, toastError, addLocalLog, queryClient]);
+
   // ── LHOUSE 전용: 보고서 생성 (직접 다운로드) ─────────────────────────────────
   const [lhouseGenerating, setLhouseGenerating] = useState(false);
 
@@ -1878,56 +1972,92 @@ export function DivisionReportPage({
           )}
 
           {divisionCode === "LHOUSE" ? (
-            /* LHOUSE: 업로드된 파일로 보고서 생성 */
-            <button
-              onClick={() => void handleLhouseGenerate()}
-              disabled={!canGenerateLhousePdf || lhouseGenerating}
-              title={
-                !hasActivityFile    ? "Activity_LHOUSE.xlsx 를 업로드해야 합니다." :
-                !hasSystemusageFile ? "대시보드 캡처를 먼저 수행해야 합니다." :
-                ""
-              }
-              className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition-all
-                ${canGenerateLhousePdf && !lhouseGenerating
-                  ? "bg-secondary text-white hover:bg-secondary-600 shadow-sm"
-                  : "bg-gray-100 text-gray-400 cursor-not-allowed"}`}
-            >
-              {lhouseGenerating ? (
-                <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
-                </svg>
-              ) : (
+            /* LHOUSE: 업로드된 파일로 보고서 생성 + History 저장 */
+            <>
+              <button
+                onClick={() => void handleLhouseGenerate()}
+                disabled={!canGenerateLhousePdf || lhouseGenerating}
+                title={
+                  !hasActivityFile    ? "Activity_LHOUSE.xlsx 를 업로드해야 합니다." :
+                  !hasSystemusageFile ? "대시보드 캡처를 먼저 수행해야 합니다." :
+                  ""
+                }
+                className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition-all
+                  ${canGenerateLhousePdf && !lhouseGenerating
+                    ? "bg-secondary text-white hover:bg-secondary-600 shadow-sm"
+                    : "bg-gray-100 text-gray-400 cursor-not-allowed"}`}
+              >
+                {lhouseGenerating ? (
+                  <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+                  </svg>
+                ) : (
+                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                      d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                  </svg>
+                )}
+                {lhouseGenerating ? "생성 중…" : "보고서 생성"}
+              </button>
+
+              <button
+                onClick={() => openSaveModal("LHOUSE", "lhouse", "L HOUSE Veeva System")}
+                disabled={!canGenerateLhousePdf || lhouseGenerating}
+                title="가장 최근에 생성된 PDF 를 선택한 월로 History 에 저장합니다."
+                className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition-all
+                  ${canGenerateLhousePdf && !lhouseGenerating
+                    ? "border border-secondary text-secondary bg-white hover:bg-secondary-50"
+                    : "bg-gray-100 text-gray-400 cursor-not-allowed border border-gray-200"}`}
+              >
                 <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                    d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                    d="M5 13l4 4L19 7" />
                 </svg>
-              )}
-              {lhouseGenerating ? "생성 중…" : "보고서 생성"}
-            </button>
+                보고서 저장
+              </button>
+            </>
           ) : divisionCode === "DEV" ? (
-            /* DEV: 업로드된 파일로 보고서 생성 */
-            <button
-              onClick={() => void handleDevGenerate()}
-              disabled={devGenerating}
-              className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition-all
-                ${!devGenerating
-                  ? "bg-secondary text-white hover:bg-secondary-600 shadow-sm"
-                  : "bg-gray-100 text-gray-400 cursor-not-allowed"}`}
-            >
-              {devGenerating ? (
-                <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
-                </svg>
-              ) : (
+            /* DEV: 업로드된 파일로 보고서 생성 + History 저장 */
+            <>
+              <button
+                onClick={() => void handleDevGenerate()}
+                disabled={devGenerating}
+                className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition-all
+                  ${!devGenerating
+                    ? "bg-secondary text-white hover:bg-secondary-600 shadow-sm"
+                    : "bg-gray-100 text-gray-400 cursor-not-allowed"}`}
+              >
+                {devGenerating ? (
+                  <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+                  </svg>
+                ) : (
+                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                      d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                  </svg>
+                )}
+                {devGenerating ? "생성 중…" : "보고서 생성"}
+              </button>
+
+              <button
+                onClick={() => openSaveModal("DEV", "dev", "개발본부 시스템 운영 현황")}
+                disabled={devGenerating}
+                title="가장 최근에 생성된 PDF 를 선택한 월로 History 에 저장합니다."
+                className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition-all
+                  ${!devGenerating
+                    ? "border border-secondary text-secondary bg-white hover:bg-secondary-50"
+                    : "bg-gray-100 text-gray-400 cursor-not-allowed border border-gray-200"}`}
+              >
                 <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                    d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                    d="M5 13l4 4L19 7" />
                 </svg>
-              )}
-              {devGenerating ? "생성 중…" : "보고서 생성"}
-            </button>
+                보고서 저장
+              </button>
+            </>
           ) : null}
         </div>
       </div>
@@ -2036,6 +2166,7 @@ export function DivisionReportPage({
                 fileList={bioFileList}
                 onUploadDone={() => void refetchBioFiles()}
                 onLog={addLocalLog}
+                onRequestSave={(reportType, label) => openSaveModal("BIO", reportType, label)}
               />
             ) : (
               <FileDropzonePanel
@@ -2096,6 +2227,7 @@ export function DivisionReportPage({
                 fileList={bioFileList}
                 onUploadDone={() => void refetchBioFiles()}
                 onLog={addLocalLog}
+                onRequestSave={(reportType, label) => openSaveModal("BIO", reportType, label)}
               />
             ) : (
               <FileDropzonePanel
@@ -2223,6 +2355,77 @@ export function DivisionReportPage({
         systemLabel={previewSystem?.label ?? ""}
         task={previewCode ? (sse.taskMap[previewCode] ?? null) : null}
       />
+
+      {/* ── 6. 보고서 History 저장 모달 (모든 본부 공용) ── */}
+      {saveModalState.open && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
+          onClick={() => !savingToHistory && setSaveModalState((s) => ({ ...s, open: false }))}
+        >
+          <div
+            className="bg-white rounded-lg shadow-xl p-6 w-[400px] max-w-[90vw]"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 className="text-lg font-semibold text-gray-900 mb-1">보고서 History 저장</h3>
+            <p className="text-sm text-gray-500 mb-4">
+              <span className="font-medium text-gray-700">{saveModalState.label}</span> 의 최근 생성 PDF 가
+              선택한 월의 History 에 저장됩니다. 같은 월에 이미 저장된 항목이 있으면 덮어쓰기됩니다.
+            </p>
+
+            <div className="grid grid-cols-2 gap-3 mb-5">
+              <div>
+                <label className="block text-xs text-gray-600 mb-1">년</label>
+                <select
+                  value={saveModalYear}
+                  onChange={(e) => setSaveModalYear(Number(e.target.value))}
+                  disabled={savingToHistory}
+                  className="w-full px-3 py-2 border border-gray-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-secondary"
+                >
+                  {Array.from({ length: 5 }, (_, i) => new Date().getFullYear() - 2 + i).map((y) => (
+                    <option key={y} value={y}>{y}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs text-gray-600 mb-1">월</label>
+                <select
+                  value={saveModalMonth}
+                  onChange={(e) => setSaveModalMonth(Number(e.target.value))}
+                  disabled={savingToHistory}
+                  className="w-full px-3 py-2 border border-gray-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-secondary"
+                >
+                  {Array.from({ length: 12 }, (_, i) => i + 1).map((m) => (
+                    <option key={m} value={m}>{m}월</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => setSaveModalState((s) => ({ ...s, open: false }))}
+                disabled={savingToHistory}
+                className="px-4 py-2 text-sm text-gray-700 bg-gray-100 hover:bg-gray-200 rounded disabled:opacity-50"
+              >
+                취소
+              </button>
+              <button
+                onClick={() => void handleSaveToHistory()}
+                disabled={savingToHistory}
+                className="px-4 py-2 text-sm text-white bg-secondary hover:bg-secondary-600 rounded disabled:opacity-50 flex items-center gap-2"
+              >
+                {savingToHistory && (
+                  <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+                  </svg>
+                )}
+                저장
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </AppLayout>
   );
 }
