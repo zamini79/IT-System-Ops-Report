@@ -406,10 +406,27 @@ export class BioRdDashboardCrawler extends BaseCrawler {
     this.emit("navigating", "BIO R&D 대시보드 페이지 접속 중…", 28);
     await this.page.setViewportSize({ width: 1600, height: 1000 });
 
-    await this.page.goto(BioRdDashboardCrawler.DASHBOARD_URL, {
-      waitUntil: "domcontentloaded",
-      timeout:   60_000,
-    });
+    // Vault 선택 후 이미 sk-rd.veevavault.com/ui/ 에 와 있으면, 해시(#dashboards/...)만
+    // 다른 URL로의 goto는 same-document 이동이라 net::ERR_ABORTED 가 발생한다.
+    // 같은 문서면 in-page 해시 변경으로 라우팅하고, 다른 문서일 때만 goto 한다.
+    const targetUrl = BioRdDashboardCrawler.DASHBOARD_URL;
+    const sameDoc   =
+      this.page.url().split("#")[0] === targetUrl.split("#")[0];
+
+    if (sameDoc) {
+      await this.page.evaluate((u) => { window.location.href = u; }, targetUrl);
+      await this.page.waitForTimeout(2_000);
+    } else {
+      try {
+        await this.page.goto(targetUrl, {
+          waitUntil: "domcontentloaded",
+          timeout:   60_000,
+        });
+      } catch (e: any) {
+        // SPA 해시 네비게이션이 same-document 로 처리되어 ABORT 되는 경우는 무시
+        if (!String(e?.message ?? e).includes("ERR_ABORTED")) throw e;
+      }
+    }
 
     await this.page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => {});
     await this.page.waitForTimeout(3_000);
