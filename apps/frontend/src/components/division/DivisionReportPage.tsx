@@ -78,6 +78,19 @@ const ACCEPTED_MIME = {
 const MAX_SIZE_BYTES  = 50 * 1024 * 1024; // 50 MB
 const MAX_FILE_COUNT  = 10;
 
+/**
+ * 대시보드 캡처 시스템별 저장 이미지 파일명 후보.
+ * `${divisionCode}:${systemCode}` → 저장된 Systemusage 파일명(.png/.jpg).
+ * 캡처 성공 후 uploaded_files 에 저장되며, 파일 목록에서 찾아 "저장됨"으로 표시한다.
+ */
+const DASHBOARD_IMG_NAMES: Record<string, string[]> = {
+  "LHOUSE:VEEVA":    ["Systemusage_LHOUSE.png", "Systemusage_LHOUSE.jpg"],
+  "DEV:GCP_QUALITY": ["Systemusage_GCP.png", "Systemusage_GCP.jpg"],
+  "DEV:MEDCOMMS":    ["Systemusage_Medcomms.png", "Systemusage_Medcomms.jpg"],
+  "DEV:CTMS":        ["Systemusage_Clinical1.png", "Systemusage_Clinical1.jpg"],
+  "BIO:EDMS":        ["Systemusage_RD.png", "Systemusage_RD.jpg"],
+};
+
 // ── 유틸 ─────────────────────────────────────────────────────────────────────
 
 function fmtBytes(b: number): string {
@@ -198,6 +211,7 @@ function SystemCard({
   onDashboardCapture,
   dashboardCapturing,
   dashboardTask,
+  dashboardSavedFile,
 }: {
   config:       SystemConfig;
   task:         TaskState;
@@ -209,6 +223,8 @@ function SystemCard({
   onDashboardCapture?:  () => void;
   dashboardCapturing?:  boolean;
   dashboardTask?:       TaskState | null;
+  /** 이전에 캡처되어 저장된 대시보드 이미지 (파일 목록 기반, 새로고침 후에도 유지) */
+  dashboardSavedFile?:  { name: string; url: string; updatedAt: string } | null;
 }) {
   const icon = SYSTEM_ICONS[config.code] ?? DEFAULT_ICON;
 
@@ -319,23 +335,40 @@ function SystemCard({
         )}
       </div>
 
-      {/* 대시보드 캡처 결과 다운로드 */}
-      {dashboardTask?.status === "COMPLETED" && dashboardTask.filePaths.length > 0 && (
-        <div className="flex items-center justify-between pt-1 border-t border-amber-100 bg-amber-50/60 -mx-4 px-4 pb-1 rounded-b-xl mt-1">
-          <span className="text-[11px] text-amber-700 font-medium">대시보드 캡처 완료</span>
-          <a
-            href={toUploadUrl(dashboardTask.filePaths[0])}
-            download="Systemusage_LHOUSE.jpg"
-            className="text-[11px] text-amber-600 hover:text-amber-800 hover:underline font-semibold flex items-center gap-1"
-          >
-            <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-            </svg>
-            이미지 다운로드
-          </a>
-        </div>
-      )}
+      {/* 대시보드 캡처 결과 — 라이브 캡처 완료 또는 이전에 저장된 이미지(새로고침 후에도 유지) */}
+      {(() => {
+        const freshUrl =
+          dashboardTask?.status === "COMPLETED" && dashboardTask.filePaths.length > 0
+            ? toUploadUrl(dashboardTask.filePaths[0])
+            : null;
+        const url   = freshUrl ?? dashboardSavedFile?.url ?? null;
+        if (!url) return null;
+        const fname = dashboardSavedFile?.name ?? "Systemusage.png";
+        const label = freshUrl ? "대시보드 캡처 완료" : "대시보드 이미지 저장됨";
+        return (
+          <div className="flex items-center justify-between pt-1 border-t border-amber-100 bg-amber-50/60 -mx-4 px-4 pb-1 rounded-b-xl mt-1">
+            <span className="text-[11px] text-amber-700 font-medium">
+              {label}
+              {!freshUrl && dashboardSavedFile && (
+                <span className="text-amber-500 font-normal"> · {fmtDatetime(dashboardSavedFile.updatedAt)}</span>
+              )}
+            </span>
+            <a
+              href={url}
+              download={fname}
+              target="_blank"
+              rel="noreferrer"
+              className="text-[11px] text-amber-600 hover:text-amber-800 hover:underline font-semibold flex items-center gap-1"
+            >
+              <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                  d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+              </svg>
+              이미지 다운로드
+            </a>
+          </div>
+        );
+      })()}
       {dashboardTask?.status === "FAILED" && dashboardTask.error && (
         <p className="text-[11px] text-red-500 bg-red-50 rounded px-2 py-1 truncate mt-1" title={dashboardTask.error}>
           캡처 실패: {dashboardTask.error}
@@ -1886,6 +1919,25 @@ export function DivisionReportPage({
   );
   const canGenerateLhousePdf = hasActivityFile && hasSystemusageFile;
 
+  // 현재 사업부의 파일 목록에서, 시스템별 저장된 대시보드 이미지를 찾아 반환.
+  // (캡처 완료 후 새로고침/재방문해도 카드에 "저장됨"으로 계속 표시되도록)
+  const activeFileList: UploadedFileRow[] =
+    divisionCode === "LHOUSE" ? lhouseFileList :
+    divisionCode === "DEV"    ? devFileList :
+    divisionCode === "BIO"    ? bioFileList :
+    [];
+  const dashboardSavedFor = (
+    sysCode: string,
+  ): { name: string; url: string; updatedAt: string } | null => {
+    const names = DASHBOARD_IMG_NAMES[`${divisionCode}:${sysCode}`];
+    if (!names) return null;
+    for (const n of names) {
+      const row = activeFileList.find((f) => f.original_name === n);
+      if (row) return { name: n, url: `/uploads/${jobId}/uploads/${n}`, updatedAt: row.created_at };
+    }
+    return null;
+  };
+
   // ── 직접 다운로드 공통 헬퍼 ──────────────────────────────────────────────────
   function prevMonth() {
     const now = new Date();
@@ -2208,7 +2260,13 @@ export function DivisionReportPage({
                     updatedAt: null, screenshot: null, filePaths: [],
                   }}
                   onPreview={setPreviewCode}
-                  onCrawl={divisionCode === "DEV" ? () => startCrawl.mutate() : undefined}
+                  onCrawl={
+                    // GCP/Medcomms/CTMS 는 대시보드 캡처만 사용 — 시스템 조회 버튼 제거
+                    divisionCode === "DEV" &&
+                    !["GCP_QUALITY", "MEDCOMMS", "CTMS"].includes(sys.code)
+                      ? () => startCrawl.mutate()
+                      : undefined
+                  }
                   crawlActive={crawlActive || startCrawl.isPending}
                   onDashboardCapture={
                     (divisionCode === "LHOUSE" && sys.code === "VEEVA")         ? handleDashboardCapture :
@@ -2234,6 +2292,7 @@ export function DivisionReportPage({
                     (divisionCode === "BIO"    && sys.code === "EDMS")          ? (sse.taskMap["BIO_RD_DASHBOARD"]   ?? null) :
                     undefined
                   }
+                  dashboardSavedFile={dashboardSavedFor(sys.code)}
                 />
               ))}
             </div>
