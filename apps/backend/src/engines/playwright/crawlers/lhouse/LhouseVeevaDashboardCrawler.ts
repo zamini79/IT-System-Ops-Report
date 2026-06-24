@@ -167,61 +167,108 @@ export class LhouseVeevaDashboardCrawler extends BaseCrawler {
     this.emit("navigating", "필터 팝업 대기 중…", 35);
     await this.page.waitForTimeout(3_000);
 
-    const datesSet = await frame.evaluate(
-      ([start, end]: [string, string]): boolean => {
-        function isActuallyVisible(el: HTMLElement): boolean {
-          const s = window.getComputedStyle(el);
-          return (
-            s.display     !== "none"    &&
-            s.visibility  !== "hidden"  &&
-            s.opacity     !== "0"       &&
-            el.offsetParent !== null
-          );
-        }
+    // ── ② 날짜 입력 ──────────────────────────────────────────────────────
+    // 필터 팝업에는 날짜 범위 필터가 여러 개일 수 있고(각 필터마다 from/to 입력칸),
+    // "처음 2칸"만 채우면 첫 필터만 바뀌고 나머지는 기본값이 남는다. 모든 입력칸을
+    // (from=start, to=end) 짝으로 채운다. 입력칸은 네이티브 date input(YYYY-MM-DD)
+    // 이라 fill(ISO)가 가장 안정적이고, 실패 시 실제 키 입력으로 폴백한다.
+    // (JS 로 value 만 직접 주입하면 picker 내부 상태가 안 바뀌어 적용되지 않음)
+    const toIso = (s: string): string => {
+      let m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+      if (m) return `${m[1]}-${m[2].padStart(2, "0")}-${m[3].padStart(2, "0")}`;
+      m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+      if (m) return `${m[3]}-${m[1].padStart(2, "0")}-${m[2].padStart(2, "0")}`;
+      m = s.match(/^(\d{1,2})\s+([A-Za-z]{3,})\s+(\d{4})$/);
+      if (m) {
+        const MM = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"];
+        const mi = MM.indexOf(m[2].slice(0, 3).toLowerCase());
+        if (mi >= 0) return `${m[3]}-${String(mi + 1).padStart(2, "0")}-${m[1].padStart(2, "0")}`;
+      }
+      return s;
+    };
+    const isoStart = toIso(startStr);
+    const isoEnd   = toIso(endStr);
 
-        function setNativeValue(el: HTMLInputElement, value: string) {
-          const setter = Object.getOwnPropertyDescriptor(
-            window.HTMLInputElement.prototype, "value"
-          )?.set;
-          if (setter) setter.call(el, value);
-          else el.value = value;
-          el.dispatchEvent(new Event("input",  { bubbles: true }));
-          el.dispatchEvent(new Event("change", { bubbles: true }));
-        }
+    const inputCount = await frame.evaluate((): number => {
+      function isActuallyVisible(el: HTMLElement): boolean {
+        const s = window.getComputedStyle(el);
+        return (
+          s.display     !== "none"    &&
+          s.visibility  !== "hidden"  &&
+          s.opacity     !== "0"       &&
+          el.offsetParent !== null
+        );
+      }
+      function isDateLike(el: HTMLInputElement): boolean {
+        if (el.type === "date") return true;
+        const v = el.value ?? "";
+        const ph = el.placeholder ?? "";
+        return /\d{4}-\d{1,2}-\d{1,2}/.test(v) || /\d{1,2}\/\d{1,2}\/\d{2,4}/.test(v) ||
+               /\d{1,2}\s+[A-Za-z]{3,}\s+\d{4}/.test(v) || /yyyy|mm|dd/i.test(ph);
+      }
 
-        const PANEL_SELS = [
-          "dialog", "[role='dialog']",
-          "[class*='modal']", "[class*='popup']", "[class*='overlay']",
-          "[class*='filter']", "[class*='Filter']",
-        ];
+      const PANEL_SELS = [
+        "dialog", "[role='dialog']",
+        "[class*='modal']", "[class*='popup']", "[class*='overlay']",
+        "[class*='filter']", "[class*='Filter']",
+      ];
 
-        for (const sel of PANEL_SELS) {
-          const panel = document.querySelector(sel);
-          if (!panel) continue;
-          const inputs = Array.from(panel.querySelectorAll<HTMLInputElement>("input"))
-            .filter(el => isActuallyVisible(el));
-          if (inputs.length >= 2) {
-            setNativeValue(inputs[0], start);
-            setNativeValue(inputs[1], end);
-            return true;
-          }
-        }
-
+      let inputs: HTMLInputElement[] = [];
+      for (const sel of PANEL_SELS) {
+        const panel = document.querySelector(sel);
+        if (!panel) continue;
+        const found = Array.from(panel.querySelectorAll<HTMLInputElement>("input"))
+          .filter(el => isActuallyVisible(el) && !el.disabled && !el.readOnly && isDateLike(el));
+        if (found.length >= 2) { inputs = found; break; }
+      }
+      if (inputs.length < 2) {
         const allVisible = Array.from(document.querySelectorAll<HTMLInputElement>("input"))
-          .filter(el => isActuallyVisible(el));
-        if (allVisible.length === 2) {
-          setNativeValue(allVisible[0], start);
-          setNativeValue(allVisible[1], end);
-          return true;
+          .filter(el => isActuallyVisible(el) && !el.disabled && !el.readOnly && isDateLike(el));
+        if (allVisible.length >= 2) inputs = allVisible;
+      }
+      if (inputs.length < 2) return 0;
+
+      inputs.forEach((el, i) => el.setAttribute("data-omc-date-idx", String(i)));
+      return inputs.length;
+    });
+
+    if (inputCount >= 2) {
+      const fillOne = async (idx: number, iso: string, typed: string): Promise<void> => {
+        const loc = frame.locator(`[data-omc-date-idx="${idx}"]`).first();
+        const type = await loc.getAttribute("type").catch(() => null);
+        if (type === "date") {
+          await loc.fill(iso).catch(async () => {
+            await loc.click({ timeout: 4_000 }).catch(() => {});
+            await loc.pressSequentially(typed, { delay: 40 }).catch(() => {});
+          });
+        } else {
+          await loc.click({ timeout: 4_000 }).catch(() => {});
+          await loc.press("ControlOrMeta+a").catch(() => {});
+          await loc.press("Delete").catch(() => {});
+          await loc.fill("").catch(() => {});
+          await loc.pressSequentially(typed, { delay: 40 }).catch(async () => {
+            await loc.fill(typed).catch(() => {});
+          });
         }
+        await loc.press("Tab").catch(() => {});
+      };
 
-        return false;
-      },
-      [startStr, endStr] as [string, string],
-    );
+      for (let i = 0; i < inputCount; i++) {
+        const isStart = i % 2 === 0;
+        await fillOne(i, isStart ? isoStart : isoEnd, isStart ? startStr : endStr);
+      }
 
-    if (datesSet) {
-      this.emit("navigating", `날짜 입력 완료: ${startStr} ~ ${endStr}`, 37);
+      const values: string[] = [];
+      for (let i = 0; i < inputCount; i++) {
+        values.push(
+          await frame.locator(`[data-omc-date-idx="${i}"]`).first().inputValue().catch(() => ""),
+        );
+      }
+      this.emit(
+        "navigating",
+        `날짜 입력 완료 (${inputCount}칸): [${values.join(", ")}] (목표 ${isoStart} ~ ${isoEnd})`,
+        37,
+      );
     } else {
       this.emit("navigating", "날짜 입력 필드 미발견 — 날짜 미설정", 37);
     }
