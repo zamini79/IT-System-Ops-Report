@@ -615,6 +615,130 @@ async function runGcpDashboardInBackground(jobId: string, taskId: string): Promi
   jobEventBus.scheduleCleanup(jobId);
 }
 
+// ── DEV GCP Activity 리포트 Export 잡 ────────────────────────────────────────────
+// LHOUSE 시스템 조회와 동일하게, GCP Quality System 의 Activity (Task) Count 리포트를
+// Excel 로 export 해 uploads/Activity_GCP.xlsx 로 저장 + uploaded_files 자동 등록.
+
+const GCP_ACTIVITY_SYSTEM = "GCP_ACTIVITY";
+const GCP_ACTIVITY_DIV    = "DEV" as const;
+
+export async function startGcpActivityExport(params: {
+  jobId:  string;
+  userId: string;
+}): Promise<{ taskId: string }> {
+  const { jobId, userId } = params;
+
+  const divRows = await query<{ id: string }>(
+    "SELECT id FROM divisions WHERE code = $1",
+    [GCP_ACTIVITY_DIV]
+  );
+  if (!divRows.length) throw new AppError(400, "DEV 사업부를 찾을 수 없습니다.");
+  const divisionId = divRows[0].id;
+
+  await query(
+    `INSERT INTO report_jobs (id, division_id, status, started_at, created_by)
+     VALUES ($1, $2, 'RUNNING', NOW(), $3)
+     ON CONFLICT (id) DO UPDATE SET status = 'RUNNING', updated_at = NOW()`,
+    [jobId, divisionId, userId]
+  );
+
+  const crawlTaskResult = await query<{ id: string }>(
+    `INSERT INTO crawl_tasks (report_job_id, system_name, task_type, status)
+     VALUES ($1, $2, 'DOWNLOAD', 'PENDING')
+     ON CONFLICT (report_job_id, system_name) DO UPDATE
+       SET task_type = 'DOWNLOAD', status = 'PENDING', updated_at = NOW()
+     RETURNING id`,
+    [jobId, GCP_ACTIVITY_SYSTEM]
+  );
+  const taskId = crawlTaskResult[0].id;
+
+  void runGcpActivityInBackground(jobId, taskId);
+
+  logger.info(`[CrawlService] GCP Activity export started: job=${jobId}, task=${taskId}`);
+  return { taskId };
+}
+
+async function runGcpActivityInBackground(jobId: string, taskId: string): Promise<void> {
+  jobEventBus.emit(jobId, { type: "task_start", systemName: GCP_ACTIVITY_SYSTEM, total: 1 });
+
+  await query(
+    `UPDATE crawl_tasks SET status = 'RUNNING', updated_at = NOW() WHERE id = $1`,
+    [taskId]
+  ).catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
+
+  try {
+    const result = await CrawlerFactory.runSingle(
+      GCP_ACTIVITY_SYSTEM,
+      jobId,
+      (event) => {
+        if (event.percent !== undefined || event.message) {
+          jobEventBus.emit(jobId, {
+            type:       "progress",
+            systemName: GCP_ACTIVITY_SYSTEM,
+            percent:    event.percent,
+            message:    event.message,
+          });
+        }
+      }
+    );
+
+    // 크롤러가 이미 uploads/Activity_GCP.xlsx 로 저장함. 화면/보고서가 참조하는
+    // uploaded_files 에 등록해 "Activity (Task) Count - GCP Quality System" 슬롯에 반영.
+    const resultPath = result.files[0] ?? null;
+    if (resultPath && fs.existsSync(resultPath)) {
+      try {
+        const fileSize = fs.statSync(resultPath).size;
+        const mime     = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+        const existing = await query<{ id: string }>(
+          `SELECT id FROM uploaded_files
+           WHERE report_job_id = $1 AND original_name = 'Activity_GCP.xlsx'
+           ORDER BY created_at DESC LIMIT 1`,
+          [jobId]
+        );
+        if (existing.length) {
+          await query(
+            `UPDATE uploaded_files
+             SET stored_path = $1, file_type = $2, file_size = $3,
+                 analysis_result = '{}'::jsonb, created_at = NOW()
+             WHERE id = $4`,
+            [resultPath, mime, fileSize, existing[0].id]
+          );
+          logger.info(`[CrawlService] GCP Activity replaced: ${resultPath}`);
+        } else {
+          await query(
+            `INSERT INTO uploaded_files
+               (report_job_id, original_name, stored_path, file_type, file_size)
+             VALUES ($1, 'Activity_GCP.xlsx', $2, $3, $4)`,
+            [jobId, resultPath, mime, fileSize]
+          );
+          logger.info(`[CrawlService] GCP Activity saved: ${resultPath}`);
+        }
+      } catch (saveErr) {
+        logger.warn(`[CrawlService] GCP Activity 파일 등록 실패 (무시): ${(saveErr as Error).message}`);
+      }
+    }
+
+    await query(
+      `UPDATE crawl_tasks SET status = 'COMPLETED', result_path = $1, updated_at = NOW() WHERE id = $2`,
+      [resultPath, taskId]
+    ).catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
+
+    jobEventBus.emit(jobId, { type: "task_done", systemName: GCP_ACTIVITY_SYSTEM, filePaths: result.files });
+    logger.info(`[CrawlService] GCP Activity export done: ${resultPath}`);
+
+  } catch (err) {
+    const errMsg = (err as Error).message;
+    logger.error(`[CrawlService] GCP Activity export failed: ${errMsg}`);
+    await query(
+      `UPDATE crawl_tasks SET status = 'FAILED', error = $1, updated_at = NOW() WHERE id = $2`,
+      [errMsg, taskId]
+    ).catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
+    jobEventBus.emit(jobId, { type: "task_error", systemName: GCP_ACTIVITY_SYSTEM, error: errMsg });
+  }
+
+  jobEventBus.scheduleCleanup(jobId);
+}
+
 // ── DEV Medcomms 대시보드 캡처 잡 ────────────────────────────────────────────────
 
 const MEDCOMMS_DASHBOARD_SYSTEM = "MEDCOMMS_DASHBOARD";
@@ -1138,6 +1262,50 @@ async function runInBackground(
            WHERE report_job_id = $2 AND system_name = $3`,
           [resultPath, jobId, systemName]
         ).catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
+
+        // ── 다운로드 결과를 named 업로드 슬롯(uploaded_files)에 자동 등록 ────────
+        //   일반 크롤 플로우는 result_path 만 저장하므로, 화면의 업로드 슬롯과
+        //   보고서가 참조하는 uploaded_files 에 직접 등록해야 "Activity (Task) Count"
+        //   슬롯에 자동 반영된다. (크롤러가 이미 uploads/Activity_LHOUSE.xlsx 로 저장함)
+        const NAMED_SLOT: Record<string, { div: DivisionCode; file: string; mime: string }> = {
+          VEEVA: {
+            div:  "LHOUSE",
+            file: "Activity_LHOUSE.xlsx",
+            mime: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+          },
+        };
+        const named = NAMED_SLOT[systemName];
+        if (resultPath && named && named.div === divisionCode && fs.existsSync(resultPath)) {
+          try {
+            const fileSize = fs.statSync(resultPath).size;
+            const existing = await query<{ id: string }>(
+              `SELECT id FROM uploaded_files
+               WHERE report_job_id = $1 AND original_name = $2
+               ORDER BY created_at DESC LIMIT 1`,
+              [jobId, named.file]
+            );
+            if (existing.length) {
+              await query(
+                `UPDATE uploaded_files
+                 SET stored_path = $1, file_type = $2, file_size = $3,
+                     analysis_result = '{}'::jsonb, created_at = NOW()
+                 WHERE id = $4`,
+                [resultPath, named.mime, fileSize, existing[0].id]
+              );
+              logger.info(`[CrawlService] named 슬롯 갱신: ${named.file} ← ${resultPath}`);
+            } else {
+              await query(
+                `INSERT INTO uploaded_files
+                   (report_job_id, original_name, stored_path, file_type, file_size)
+                 VALUES ($1, $2, $3, $4, $5)`,
+                [jobId, named.file, resultPath, named.mime, fileSize]
+              );
+              logger.info(`[CrawlService] named 슬롯 등록: ${named.file} ← ${resultPath}`);
+            }
+          } catch (e) {
+            logger.warn(`[CrawlService] named 슬롯 등록 실패 (무시): ${(e as Error).message}`);
+          }
+        }
 
         // ── task_done 이벤트 ─────────────────────────────────────────────
         jobEventBus.emit(jobId, {

@@ -4,27 +4,28 @@ import { BaseCrawler }         from "../../BaseCrawler";
 import type { CrawlerContext } from "../../types";
 
 /**
- * L HOUSE — Veeva Vault 크롤러 (eQMS · eDMS · eLMS 통합)
+ * DEV — GCP Quality System Veeva Vault Activity 리포트 Export 크롤러
+ *   (LHOUSE LhouseVeevaCrawler 와 동일 흐름 — GCP Vault/리포트 설정으로 복제)
  *
  * 접속 URL : https://login.veevavault.com
- * 계정     : LHOUSE_VEEVA_USER / LHOUSE_VEEVA_PASS  (env)
+ * 계정     : DEV_GCP_VEEVA_USER / DEV_GCP_VEEVA_PASS  (없으면 LHOUSE 계정 fallback)
  *
  * 수집 흐름:
  *  1. 로그인 (2단계: 이메일 → 비밀번호)
- *  2. "Select a vault" 드롭다운 → "SKY QMS Production" 선택
+ *  2. "Select a vault" 드롭다운 → "SKY GCP Production" 선택
  *  3. 리포트 직접 URL 접속
- *     https://sk-qms.veevavault.com/ui/#reporting/viewer/0RP00000008Z001
- *  4. "Activity (Task) Count" 행 우측 … 버튼 → Export to Excel
+ *     https://sk-gcp.veevavault.com/ui/#reporting/viewer/0RP00000002D001
+ *  4. "Activity (Task) Count - GCP Quality System" 헤더 … 버튼 → Export to Excel
  *  5. Template 라디오 선택 → Export
  *  6. "Converting Data to Excel Format" 팝업 완료 대기
- *  7. 파일 다운로드 후 경로 반환
+ *  7. 파일 다운로드 → uploads/Activity_GCP.xlsx 로 저장
  */
-export class LhouseVeevaCrawler extends BaseCrawler {
+export class DevGcpActivityCrawler extends BaseCrawler {
   private static readonly LOGIN_URL   = "https://login.veevavault.com";
-  private static readonly REPORT_URL  = "https://sk-qms.veevavault.com/ui/#reporting/viewer/0RP00000008Z001";
+  private static readonly REPORT_URL  = "https://sk-gcp.veevavault.com/ui/#reporting/viewer/0RP00000002D001";
 
-  private readonly veevaUser = process.env.LHOUSE_VEEVA_USER ?? "apiadmin@sk.com";
-  private readonly veevaPass = process.env.LHOUSE_VEEVA_PASS ?? "12345QWert";
+  private readonly veevaUser = process.env.DEV_GCP_VEEVA_USER ?? process.env.LHOUSE_VEEVA_USER ?? "apiadmin@sk.com";
+  private readonly veevaPass = process.env.DEV_GCP_VEEVA_PASS ?? process.env.LHOUSE_VEEVA_PASS ?? "12345QWert";
 
   constructor(ctx: CrawlerContext) {
     super(ctx);
@@ -230,36 +231,59 @@ export class LhouseVeevaCrawler extends BaseCrawler {
   //   (↻ 새로고침 · ✎ 편집 다음의 마지막 아이콘) 직접 좌표 기반으로 클릭한다.
 
   private async _clickReportActionsMenu(titleText: string): Promise<boolean> {
-    // ① 헤더 우측 마지막(=…) 클릭 대상을 JS 로 식별해 data 속성으로 태깅
-    //    (Veeva 는 합성 dispatchEvent 클릭에 반응하지 않으므로, 클릭은 ②에서
-    //     Playwright 실제 클릭으로 수행한다 — 날짜 입력과 동일한 교훈)
-    const tagged = await this.page.evaluate((title) => {
-      const all = Array.from(document.querySelectorAll<HTMLElement>("*"));
-      const titleEl =
-        all.find((el) => el.childElementCount === 0 && el.textContent?.trim() === title) ??
-        all.find((el) => el.textContent?.trim() === title && el.offsetParent !== null);
-      if (!titleEl) return false;
+    // ⓪ 혹시 열려있는 다른 메뉴(계정 아바타 드롭다운 등)를 빈 영역 클릭으로 닫는다.
+    //    (한 번 잘못 열리면 보고서 헤더 우측을 가려 이후 시도가 모두 막힘)
+    await this.page.mouse.click(450, 320).catch(() => {});
+    await this.page.waitForTimeout(200);
 
+    // ① 제목 요소를 태깅하고 Playwright 로 hover → GCP 리포트 헤더는 hover 시
+    //    ↻ ✎ ⋯ 액션 아이콘이 나타나는 경우가 있어 hover 후 탐색한다.
+    const titleTagged = await this.page.evaluate((title) => {
+      const matchTitle = (s: string) => s === title || s.startsWith("Activity (Task) Count");
+      const all = Array.from(document.querySelectorAll<HTMLElement>("*"));
+      const el =
+        all.find((e) => e.childElementCount === 0 && matchTitle(e.textContent?.trim() ?? "") && e.offsetParent !== null) ??
+        all.find((e) => matchTitle(e.textContent?.trim() ?? "") && e.offsetParent !== null);
+      if (!el) return false;
+      document.querySelectorAll("[data-omc-title]").forEach((x) => x.removeAttribute("data-omc-title"));
+      el.setAttribute("data-omc-title", "1");
+      return true;
+    }, titleText).catch(() => false);
+    if (!titleTagged) return false;
+
+    await this.page.locator('[data-omc-title="1"]').first().hover({ timeout: 4_000 }).catch(() => {});
+    await this.page.waitForTimeout(500);
+
+    // ② 보고서 헤더 행(제목 세로중심 ±50px)에서 제목 오른쪽의 "…" 후보를 태깅.
+    //    ★ 상단 nav 바(아바타/카트/벨, top<100)와 계정 메뉴류는 반드시 제외한다.
+    const tagged = await this.page.evaluate(() => {
+      const titleEl = document.querySelector<HTMLElement>('[data-omc-title="1"]');
+      if (!titleEl) return false;
       const tRect   = titleEl.getBoundingClientRect();
       const titleCY = tRect.top + tRect.height / 2;
 
-      // 제목과 같은 행(세로 중심 ±60px) + 제목 오른쪽에 있는 클릭 가능 요소
+      const isAccountish = (el: HTMLElement) => {
+        const meta = ((el.getAttribute("aria-label") ?? "") + " " +
+                      (el.getAttribute("title") ?? "") + " " +
+                      (typeof el.className === "string" ? el.className : "")).toLowerCase();
+        return /account|user|profile|avatar|logout|notification|cart|벨|알림/.test(meta);
+      };
+
       const candidates = Array.from(document.querySelectorAll<HTMLElement>(
         "button, [role='button'], a, [aria-haspopup], [class*='action'], [class*='menu'], [class*='overflow'], svg"
       )).filter((el) => {
         if (el.offsetParent === null) return false;
         const r = el.getBoundingClientRect();
         if (r.width === 0 || r.height === 0) return false;
+        if (r.top < 100) return false;          // 상단 nav 바 제외 (아바타/카트/벨)
+        if (isAccountish(el)) return false;
         const cy = r.top + r.height / 2;
-        return Math.abs(cy - titleCY) < 60 && r.left >= tRect.right - 4;
+        return Math.abs(cy - titleCY) < 50 && r.left >= tRect.right - 4;
       });
       if (candidates.length === 0) return false;
 
-      // 가장 오른쪽 요소 = "…"
       candidates.sort((a, b) => b.getBoundingClientRect().left - a.getBoundingClientRect().left);
       let target: HTMLElement = candidates[0];
-
-      // svg 등 비-컨트롤이면 클릭 핸들러가 달린 조상(button/[role=button]/a)으로 승격
       let p: HTMLElement | null = target;
       for (let i = 0; i < 4 && p; i++) {
         const tag = p.tagName.toLowerCase();
@@ -270,11 +294,11 @@ export class LhouseVeevaCrawler extends BaseCrawler {
       document.querySelectorAll("[data-omc-actions]").forEach((e) => e.removeAttribute("data-omc-actions"));
       target.setAttribute("data-omc-actions", "1");
       return true;
-    }, titleText).catch(() => false);
+    }).catch(() => false);
 
     if (!tagged) return false;
 
-    // ② Playwright 실제 클릭
+    // ③ Playwright 실제 클릭
     const loc = this.page.locator('[data-omc-actions="1"]').first();
     try {
       await loc.click({ timeout: 5_000 });
@@ -288,8 +312,9 @@ export class LhouseVeevaCrawler extends BaseCrawler {
   /** 실패 진단용: 제목과 같은 헤더 행의 버튼들 정보를 덤프 */
   private async _dumpHeaderButtons(titleText: string): Promise<string> {
     return this.page.evaluate((title) => {
+      const matchTitle = (s: string) => s === title || s.startsWith("Activity (Task) Count");
       const all = Array.from(document.querySelectorAll<HTMLElement>("*"));
-      const titleEl = all.find((el) => el.textContent?.trim() === title && el.offsetParent !== null);
+      const titleEl = all.find((el) => matchTitle(el.textContent?.trim() ?? "") && el.offsetParent !== null);
       if (!titleEl) return "(제목 요소 미발견)";
       const tRect = titleEl.getBoundingClientRect();
       const cy    = tRect.top + tRect.height / 2;
@@ -349,7 +374,7 @@ export class LhouseVeevaCrawler extends BaseCrawler {
               let matchEl: HTMLElement | null = null;
               let matchIdx = 0;
               while ((node = walker.nextNode() as Text | null)) {
-                if (node.textContent?.includes("월간 현황 지표")) {
+                if (node.textContent?.includes("Activity (Task) Count")) {
                   const el = node.parentElement as HTMLElement;
                   if (el && el.offsetParent !== null) {
                     if (matchIdx === idx) { matchEl = el; break; }
@@ -588,7 +613,7 @@ export class LhouseVeevaCrawler extends BaseCrawler {
 
     // ── Step 1. 로그인 ───────────────────────────────────────────────────────────
     this.emit("login", "Veeva Vault 로그인 페이지 접속 중…", 3);
-    await this.page.goto(LhouseVeevaCrawler.LOGIN_URL, {
+    await this.page.goto(DevGcpActivityCrawler.LOGIN_URL, {
       waitUntil: "networkidle",
       timeout:   45_000,
     });
@@ -681,22 +706,29 @@ export class LhouseVeevaCrawler extends BaseCrawler {
 
     await this.page.waitForTimeout(1_000);
 
-    const skyOption = this.page.getByText("SKY QMS Production", { exact: false });
-    if (await skyOption.count() > 0 && await skyOption.first().isVisible().catch(() => false)) {
-      await skyOption.first().click();
-      this.emit("navigating", "SKY QMS Production 선택 완료", 25);
-      await this.page.waitForLoadState("networkidle").catch(() => {});
-    } else {
-      this.emit("navigating", "SKY QMS Production 옵션 미발견 — 계속 진행합니다.", 25);
+    const vaultNames = ["SKY GCP Production", "GCP Production", "GCP", "sk-gcp"];
+    let vaultSelected = false;
+    for (const name of vaultNames) {
+      const opt = this.page.getByText(name, { exact: false });
+      if (await opt.count() > 0 && await opt.first().isVisible().catch(() => false)) {
+        await opt.first().click();
+        this.emit("navigating", `${name} 선택 완료`, 25);
+        await this.page.waitForLoadState("networkidle").catch(() => {});
+        vaultSelected = true;
+        break;
+      }
+    }
+    if (!vaultSelected) {
+      this.emit("navigating", "GCP Vault 옵션 미발견 — 리포트 URL로 직접 접속합니다.", 25);
     }
 
     // ── Step 3. 리포트 URL 직접 접속 + 완전 로딩 대기 ──────────────────────────────
     this.emit("navigating", "리포트 페이지 접속 중…", 30);
 
-    // Vault(SKY QMS Production) 선택 후 이미 sk-qms.veevavault.com/ui/ 에 와 있으면,
+    // Vault(GCP) 선택 후 이미 sk-gcp.veevavault.com/ui/ 에 와 있으면,
     // 해시(#reporting/...)만 다른 URL로의 goto는 same-document 이동이라 net::ERR_ABORTED
     // 가 발생한다. 같은 문서면 in-page 해시 변경으로 라우팅하고, 다른 문서일 때만 goto 한다.
-    const targetUrl = LhouseVeevaCrawler.REPORT_URL;
+    const targetUrl = DevGcpActivityCrawler.REPORT_URL;
     const sameDoc   = this.page.url().split("#")[0] === targetUrl.split("#")[0];
 
     if (sameDoc) {
@@ -716,7 +748,7 @@ export class LhouseVeevaCrawler extends BaseCrawler {
     await this.page.waitForLoadState("domcontentloaded").catch(() => {});
 
     this.emit("navigating", "리포트 페이지 렌더링 대기 중…", 33);
-    await this._waitForReportReady("월간 현황 지표");
+    await this._waitForReportReady("Activity (Task) Count");
     await this._debugShot("report_loaded");
 
     // ── Step 4-5. … 메뉴 → Export to Excel (리포트 로딩 완료까지 재시도) ─────────
@@ -739,15 +771,10 @@ export class LhouseVeevaCrawler extends BaseCrawler {
     while (attempt < MAX_ATTEMPTS && !exportClicked) {
       attempt++;
 
-      // (a) "…"(More Actions) 메뉴 열기 — 헤더 우측 마지막 버튼 직접 클릭(우선),
-      //     실패 시 기존 휴리스틱(섹션 텍스트 인근 버튼) 폴백
+      // (a) "…"(More Actions) 메뉴 열기 — 보고서 헤더 우측 "…" 직접 클릭.
+      //     (구 _clickEllipsisOnRow 폴백은 페이지 우상단 아바타를 잘못 클릭하므로 미사용)
       this.emit("navigating", `… 메뉴 열기 (시도 ${attempt}/${MAX_ATTEMPTS})`, 50);
-      const opened = await this._clickReportActionsMenu("Activity (Task) Count");
-      if (!opened) {
-        try {
-          await this._clickEllipsisOnRow("월간 현황 지표 (월간 Task 실행 수)");
-        } catch { /* 다음 시도 */ }
-      }
+      await this._clickReportActionsMenu("Activity (Task) Count - GCP Quality System");
 
       await this.page.waitForTimeout(1_500);
       await this._debugShot(`menu_open_a${attempt}`);
@@ -764,8 +791,10 @@ export class LhouseVeevaCrawler extends BaseCrawler {
         break;
       }
 
-      // 실패 → 디버그샷 + 열린 메뉴 닫고 잠시 대기 후 재시도
+      // 실패 → 디버그샷 + 열린 메뉴(아바타 드롭다운 등) 빈 영역 클릭으로 닫고 재시도.
+      //   (Veeva 계정 메뉴는 Escape 로 안 닫혀 헤더를 계속 가리므로 outside-click 사용)
       await this._debugShot(`fail_a${attempt}`);
+      await this.page.mouse.click(450, 320).catch(() => {});
       await this.page.keyboard.press("Escape").catch(() => {});
       await this.page.waitForTimeout(4_000);
     }
@@ -850,10 +879,10 @@ export class LhouseVeevaCrawler extends BaseCrawler {
     this.emit("downloading", "파일 다운로드 대기 중…", 85);
     const download = await downloadPromise;
 
-    // 보고서(lhouse.report.service)는 UPLOAD_DIR/{jobId}/uploads/Activity_LHOUSE.xlsx
-    // 경로에서 이 파일을 직접 읽는다(수동 업로드와 동일 위치). downloadDir 은
-    // UPLOAD_DIR/{jobId} 이므로 반드시 그 하위 uploads/ 폴더에 저장해야 한다.
-    const filename   = "Activity_LHOUSE.xlsx";
+    // 보고서/화면은 UPLOAD_DIR/{jobId}/uploads/Activity_GCP.xlsx 경로의 파일을
+    // 사용한다(수동 업로드와 동일 위치). downloadDir 은 UPLOAD_DIR/{jobId} 이므로
+    // 반드시 그 하위 uploads/ 폴더에 저장해야 한다.
+    const filename   = "Activity_GCP.xlsx";
     const uploadsDir = path.join(this.downloadDir, "uploads");
     fs.mkdirSync(uploadsDir, { recursive: true });
     const savedPath  = path.join(uploadsDir, filename);

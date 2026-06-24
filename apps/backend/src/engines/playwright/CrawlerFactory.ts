@@ -33,6 +33,7 @@ import { LhouseVeevaDashboardCrawler }  from "./crawlers/lhouse/LhouseVeevaDashb
 
 // ── DEV 대시보드 전용 크롤러 ──────────────────────────────────────────────────
 import { DevGcpDashboardCrawler }       from "./crawlers/dev/DevGcpDashboardCrawler";
+import { DevGcpActivityCrawler }        from "./crawlers/dev/DevGcpActivityCrawler";
 import { DevMedcommsDashboardCrawler }  from "./crawlers/dev/DevMedcommsDashboardCrawler";
 import { DevClinicalDashboardCrawler }  from "./crawlers/dev/DevClinicalDashboardCrawler";
 
@@ -73,6 +74,7 @@ const SINGLE_REGISTRY: Record<string, CrawlerCtor> = {
   MEDCOMMS_DASHBOARD: DevMedcommsDashboardCrawler,
   CLINICAL_DASHBOARD: DevClinicalDashboardCrawler,
   BIO_RD_DASHBOARD:   BioRdDashboardCrawler,
+  GCP_ACTIVITY:       DevGcpActivityCrawler,
 };
 
 // ── 팩토리 ───────────────────────────────────────────────────────────────────

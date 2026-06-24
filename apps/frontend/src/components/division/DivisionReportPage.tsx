@@ -597,6 +597,7 @@ const LHOUSE_SLOTS: Array<{
 
 function SingleNamedDropzone({
   slot, label, savedAs, accept, hint, icon, iconColor, jobId, divisionCode, onUploadDone, serverFile, onLog,
+  onCrawl, crawlActive,
 }: {
   slot:         string;
   label:        string;
@@ -612,6 +613,9 @@ function SingleNamedDropzone({
   serverFile?:  UploadedFileRow | null;
   /** 진행 로그 콜백 (선택) */
   onLog?:       (systemName: string, msg: string, kind: LogEntry["kind"]) => void;
+  /** 선택: 헤더에 "시스템 조회" 버튼 표시 (해당 파일을 자동 수집하는 슬롯 전용) */
+  onCrawl?:     () => void;
+  crawlActive?: boolean;
 }) {
   const { success, error: toastError } = useToast();
   const [uploading,  setUploading]  = useState(false);
@@ -691,9 +695,40 @@ function SingleNamedDropzone({
           <h3 className="text-sm font-semibold text-gray-800">{label}</h3>
           <p className="text-xs text-gray-400">{hint}</p>
         </div>
-        {displayFile && (
-          <span className="text-xs text-green-600 font-medium">{fmtDatetime(displayFile.updatedAt)} 업로드</span>
-        )}
+        <div className="flex items-center gap-2 flex-shrink-0">
+          {displayFile && (
+            <span className="text-xs text-green-600 font-medium">{fmtDatetime(displayFile.updatedAt)} 업로드</span>
+          )}
+          {onCrawl && (
+            <button
+              onClick={onCrawl}
+              disabled={crawlActive}
+              title="Veeva 에 로그인하여 리포트를 자동 조회·다운로드합니다"
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all
+                ${crawlActive
+                  ? "bg-gray-100 text-gray-400 cursor-not-allowed"
+                  : "bg-primary text-white hover:bg-primary-600 shadow-sm"}`}
+            >
+              {crawlActive ? (
+                <>
+                  <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+                  </svg>
+                  조회 중
+                </>
+              ) : (
+                <>
+                  <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                      d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                  </svg>
+                  시스템 조회
+                </>
+              )}
+            </button>
+          )}
+        </div>
       </div>
 
       <div className="p-4 space-y-3">
@@ -777,12 +812,17 @@ function LhouseNamedUploadPanel({
   onUploadDone,
   fileList,
   onLog,
+  onCrawl,
+  crawlActive,
 }: {
   jobId:        string;
   divisionCode: string;
   onUploadDone: () => void;
   fileList:     UploadedFileRow[];
   onLog?:       (systemName: string, msg: string, kind: LogEntry["kind"]) => void;
+  /** "Activity (Task) Count" 슬롯 헤더의 시스템 조회 버튼 핸들러 */
+  onCrawl?:     () => void;
+  crawlActive?: boolean;
 }) {
   return (
     <section className="space-y-4">
@@ -795,6 +835,8 @@ function LhouseNamedUploadPanel({
           onUploadDone={onUploadDone}
           serverFile={fileList.find((f) => f.original_name === s.savedAs) ?? null}
           onLog={onLog}
+          onCrawl={s.slot === "activity" ? onCrawl : undefined}
+          crawlActive={crawlActive}
         />
       ))}
     </section>
@@ -843,12 +885,17 @@ function DevNamedUploadPanel({
   onUploadDone,
   fileList,
   onLog,
+  onCrawl,
+  crawlActive,
 }: {
   jobId:        string;
   divisionCode: string;
   onUploadDone: () => void;
   fileList:     UploadedFileRow[];
   onLog?:       (systemName: string, msg: string, kind: LogEntry["kind"]) => void;
+  /** "Activity (Task) Count - GCP Quality System" 슬롯 헤더의 시스템 조회 버튼 */
+  onCrawl?:     () => void;
+  crawlActive?: boolean;
 }) {
   return (
     <section className="space-y-4">
@@ -866,6 +913,8 @@ function DevNamedUploadPanel({
         onUploadDone={onUploadDone}
         serverFile={fileList.find((f) => f.original_name === "Activity_GCP.xlsx") ?? null}
         onLog={onLog}
+        onCrawl={onCrawl}
+        crawlActive={crawlActive}
       />
 
       {/* 시스템별 대시보드 이미지 (3개) */}
@@ -1490,6 +1539,10 @@ export function DivisionReportPage({
   const [gcpDashboardCapturing, setGcpDashboardCapturing] = useState(false);
   const [gcpDashboardActive,    setGcpDashboardActive]    = useState(false);
 
+  // ── DEV GCP 전용: Activity 리포트 조회(Export) 상태 ───────────────────────────
+  const [gcpActivityExporting, setGcpActivityExporting] = useState(false);
+  const [gcpActivityActive,    setGcpActivityActive]    = useState(false);
+
   // ── DEV Medcomms 전용: 대시보드 캡처 상태 ─────────────────────────────────────
   const [medcommsDashboardCapturing, setMedcommsDashboardCapturing] = useState(false);
   const [medcommsDashboardActive,    setMedcommsDashboardActive]    = useState(false);
@@ -1504,7 +1557,7 @@ export function DivisionReportPage({
 
   // ── SSE ──────────────────────────────────────────────────────────────────────
   const systemCodes = systems.map((s) => s.code);
-  const sse = useCrawlSSE(jobId, systemCodes, crawlActive || dashboardActive || gcpDashboardActive || medcommsDashboardActive || clinicalDashboardActive || bioRdDashboardActive);
+  const sse = useCrawlSSE(jobId, systemCodes, crawlActive || dashboardActive || gcpDashboardActive || gcpActivityActive || medcommsDashboardActive || clinicalDashboardActive || bioRdDashboardActive);
 
   // ── 로컬 진행 로그 (업로드·PDF생성 이벤트) ────────────────────────────────────
   const [localLogs, setLocalLogs] = useState<LogEntry[]>([]);
@@ -1546,6 +1599,14 @@ export function DivisionReportPage({
       toastError(msg);
     },
   });
+
+  // 시스템 조회(크롤) 완료·에러 시 crawlActive 해제 → "시스템 조회" 버튼의 '조회중' 상태 복구.
+  // (setCrawlActive(true) 후 리셋 지점이 없어 버튼이 계속 '조회중' 으로 남던 문제 수정)
+  useEffect(() => {
+    if (crawlActive && (sse.phase === "done" || sse.phase === "error")) {
+      setCrawlActive(false);
+    }
+  }, [sse.phase, crawlActive]);
 
   // ── LHOUSE 전용: Veeva 대시보드 캡처 ─────────────────────────────────────────
   const handleDashboardCapture = useCallback(async () => {
@@ -1605,6 +1666,29 @@ export function DivisionReportPage({
       setGcpDashboardActive(false);
     }
   }, [gcpDashboardCapturing, addLocalLog, jobId, user, toastError]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── DEV GCP 전용: Activity (Task) Count 리포트 조회(Export) ─────────────────────
+  const handleGcpActivityExport = useCallback(async () => {
+    if (gcpActivityExporting) return;
+    sse.resetTask("GCP_ACTIVITY");
+    setGcpActivityExporting(true);
+    setGcpActivityActive(true);
+    addLocalLog("GCP Activity", "GCP Activity 리포트 조회 시작 (로그인 중…)", "info");
+    try {
+      await apiClient.post("/crawl/gcp-activity", {
+        jobId,
+        userId: user?.id,
+      });
+    } catch (err: unknown) {
+      const msg =
+        (err as { response?: { data?: { error?: string } } })
+          ?.response?.data?.error ?? "GCP Activity 리포트 조회 요청에 실패했습니다.";
+      toastError(msg);
+      addLocalLog("GCP Activity", `조회 요청 실패: ${msg}`, "error");
+      setGcpActivityExporting(false);
+      setGcpActivityActive(false);
+    }
+  }, [gcpActivityExporting, addLocalLog, jobId, user, toastError]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── DEV Medcomms 전용: Medcomms 대시보드 캡처 ─────────────────────────────────
   const handleMedcommsDashboardCapture = useCallback(async () => {
@@ -1728,6 +1812,20 @@ export function DivisionReportPage({
       }
     }
   }, [sse.taskMap, gcpDashboardCapturing, addLocalLog, refetchDevFiles]);
+
+  // GCP_ACTIVITY 태스크 완료/실패 시 상태 해제 + 파일 목록 즉시 갱신 (버튼 '조회중' 복구)
+  useEffect(() => {
+    if (!gcpActivityExporting) return;
+    const actTask = sse.taskMap["GCP_ACTIVITY"];
+    if (actTask?.status === "COMPLETED" || actTask?.status === "FAILED") {
+      setGcpActivityExporting(false);
+      setGcpActivityActive(false);
+      if (actTask.status === "COMPLETED") {
+        addLocalLog("GCP Activity", "리포트 조회 완료 — Activity_GCP.xlsx 로 저장되었습니다.", "success");
+        void refetchDevFiles();
+      }
+    }
+  }, [sse.taskMap, gcpActivityExporting, addLocalLog, refetchDevFiles]);
 
   // MEDCOMMS_DASHBOARD 태스크 완료/실패 시 상태 해제 + 파일 목록 즉시 갱신
   useEffect(() => {
@@ -2110,7 +2208,7 @@ export function DivisionReportPage({
                     updatedAt: null, screenshot: null, filePaths: [],
                   }}
                   onPreview={setPreviewCode}
-                  onCrawl={divisionCode === "LHOUSE" || divisionCode === "DEV" ? () => startCrawl.mutate() : undefined}
+                  onCrawl={divisionCode === "DEV" ? () => startCrawl.mutate() : undefined}
                   crawlActive={crawlActive || startCrawl.isPending}
                   onDashboardCapture={
                     (divisionCode === "LHOUSE" && sys.code === "VEEVA")         ? handleDashboardCapture :
@@ -2150,6 +2248,8 @@ export function DivisionReportPage({
                 fileList={lhouseFileList}
                 onUploadDone={() => void refetchLhouseFiles()}
                 onLog={addLocalLog}
+                onCrawl={() => startCrawl.mutate()}
+                crawlActive={crawlActive || startCrawl.isPending}
               />
             ) : divisionCode === "DEV" ? (
               <DevNamedUploadPanel
@@ -2158,6 +2258,8 @@ export function DivisionReportPage({
                 fileList={devFileList}
                 onUploadDone={() => void refetchDevFiles()}
                 onLog={addLocalLog}
+                onCrawl={handleGcpActivityExport}
+                crawlActive={gcpActivityExporting}
               />
             ) : divisionCode === "BIO" ? (
               <BioNamedUploadPanel
@@ -2211,6 +2313,8 @@ export function DivisionReportPage({
                 fileList={lhouseFileList}
                 onUploadDone={() => void refetchLhouseFiles()}
                 onLog={addLocalLog}
+                onCrawl={() => startCrawl.mutate()}
+                crawlActive={crawlActive || startCrawl.isPending}
               />
             ) : divisionCode === "DEV" ? (
               <DevNamedUploadPanel
@@ -2219,6 +2323,8 @@ export function DivisionReportPage({
                 fileList={devFileList}
                 onUploadDone={() => void refetchDevFiles()}
                 onLog={addLocalLog}
+                onCrawl={handleGcpActivityExport}
+                crawlActive={gcpActivityExporting}
               />
             ) : divisionCode === "BIO" ? (
               <BioNamedUploadPanel

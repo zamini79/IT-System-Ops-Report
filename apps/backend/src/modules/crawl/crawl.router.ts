@@ -20,6 +20,7 @@ import {
   screenshotHandler,
   veevaDashboardHandler,
   gcpDashboardHandler,
+  gcpActivityHandler,
   medcommsDashboardHandler,
   clinicalDashboardHandler,
   bioRdDashboardHandler,
@@ -50,6 +51,12 @@ crawlRouter.post("/veeva-dashboard", veevaDashboardHandler);
 // GCP Quality System Veeva 대시보드 스크린샷 캡처 (DEV, SSE로 완료 알림)
 // ---------------------------------------------------------------------------
 crawlRouter.post("/gcp-dashboard", gcpDashboardHandler);
+
+// ---------------------------------------------------------------------------
+// POST /api/crawl/gcp-activity
+// GCP Quality System Activity (Task) Count 리포트 Excel export → Activity_GCP.xlsx
+// ---------------------------------------------------------------------------
+crawlRouter.post("/gcp-activity", gcpActivityHandler);
 
 // ---------------------------------------------------------------------------
 // POST /api/crawl/medcomms-dashboard
