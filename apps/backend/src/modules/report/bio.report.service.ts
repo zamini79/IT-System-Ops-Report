@@ -1427,6 +1427,10 @@ interface ElnReportData {
   latestMonth: string;
   /** chart2[lastName] = 건수 (최근 월만) */
   chart2:      Record<string, number>;
+  /** 3개월 내 LASTNAME(팀) 목록 (총합 내림차순) */
+  teams:        string[];
+  /** chart2Monthly[month][lastName] = 건수 (3개월 인사이트용) */
+  chart2Monthly: Record<string, Record<string, number>>;
 }
 
 /**
@@ -1515,8 +1519,27 @@ function readElnReportData(xlsxPath: string): ElnReportData {
     chart2[r.lastName] = (chart2[r.lastName] ?? 0) + 1;
   }
 
-  logger.info(`[BIO ELN] 월: ${months.join(", ")}, 과제: ${projects.length}개, 최근월 LASTNAME: ${Object.keys(chart2).length}개`);
-  return { months, projects, chart1, latestMonth, chart2 };
+  // 팀(LASTNAME)별 3개월 집계 (인사이트용)
+  const teamTotals: Record<string, number> = {};
+  for (const r of records) {
+    if (!months.includes(r.month) || !r.lastName) continue;
+    teamTotals[r.lastName] = (teamTotals[r.lastName] ?? 0) + 1;
+  }
+  const teams = Object.entries(teamTotals)
+    .sort((a, b) => b[1] - a[1])
+    .map(([k]) => k);
+  const chart2Monthly: Record<string, Record<string, number>> = {};
+  for (const m of months) {
+    chart2Monthly[m] = {};
+    for (const t of teams) chart2Monthly[m][t] = 0;
+  }
+  for (const r of records) {
+    if (!months.includes(r.month) || !r.lastName) continue;
+    chart2Monthly[r.month][r.lastName] = (chart2Monthly[r.month][r.lastName] ?? 0) + 1;
+  }
+
+  logger.info(`[BIO ELN] 월: ${months.join(", ")}, 과제: ${projects.length}개, 최근월 LASTNAME: ${Object.keys(chart2).length}개, 팀(3개월): ${teams.length}개`);
+  return { months, projects, chart1, latestMonth, chart2, teams, chart2Monthly };
 }
 
 // ─ Chart 1: 과제별 100% 누적 막대형 ─────────────────────────────────────────
@@ -1846,6 +1869,131 @@ function readElnServiceData(xlsxPath: string): { rows: ElnServiceRow[]; latestMo
   return { rows: result, latestMonth };
 }
 
+// ─ 인사이트 분석 (공통) ────────────────────────────────────────────────────────
+// 최근 3개월 시계열(month → key → 건수)을 분석해 변화점(급증/급감/지속 추세/집중도)을
+// 약 300자 분량의 한국어 문장으로 요약한다. (과제별·팀별 차트 공용)
+
+function analyzeMonthlyTrendInsight(
+  months: string[],
+  keys:   string[],
+  matrix: Record<string, Record<string, number>>,
+  unit:   string,
+): string[] {
+  if (months.length < 2 || keys.length === 0) {
+    return ["분석 가능한 월별 데이터가 충분하지 않아 변화 추이를 산출하지 못했습니다."];
+  }
+
+  const first  = months[0];
+  const last   = months[months.length - 1];
+  const mLabel = (m: string) => `${parseInt(m.slice(5, 7), 10)}월`;
+  const monthTotal = (m: string) => keys.reduce((s, k) => s + (matrix[m]?.[k] ?? 0), 0);
+
+  const totalFirst = monthTotal(first);
+  const totalLast  = monthTotal(last);
+  const pct   = totalFirst > 0 ? Math.round(((totalLast - totalFirst) / totalFirst) * 100) : 0;
+  const trend = totalLast > totalFirst ? "증가" : totalLast < totalFirst ? "감소" : "유지";
+
+  // key별 시계열 / 변화량 / 연속 추세
+  const stats = keys.map((k) => {
+    const series = months.map((m) => matrix[m]?.[k] ?? 0);
+    const head   = series[0];
+    const tail   = series[series.length - 1];
+    let inc = true, dec = true;
+    for (let i = 1; i < series.length; i++) {
+      if (!(series[i] > series[i - 1])) inc = false;
+      if (!(series[i] < series[i - 1])) dec = false;
+    }
+    return { code: k, head, tail, delta: tail - head, inc, dec };
+  });
+
+  const byDelta = [...stats].sort((a, b) => b.delta - a.delta);
+  const topInc  = byDelta[0];
+  const topDec  = byDelta[byDelta.length - 1];
+  const contInc = stats.filter((s) => s.inc && s.delta > 0).map((s) => s.code);
+  const contDec = stats.filter((s) => s.dec && s.delta < 0).map((s) => s.code);
+
+  // 최근 월 기준 상위 집중도
+  const lastRank = keys.map((k) => ({ k, v: matrix[last]?.[k] ?? 0 })).sort((a, b) => b.v - a.v);
+  const top3     = lastRank.slice(0, 3).filter((x) => x.v > 0);
+  const top3Sum  = top3.reduce((s, x) => s + x.v, 0);
+  const top3Pct  = totalLast > 0 ? Math.round((top3Sum / totalLast) * 100) : 0;
+
+  // 받침 유무에 따라 조사(이/가, 은/는)를 선택해 자연스러운 문장을 만든다.
+  const hasJong = (s: string): boolean => {
+    const c    = s.trim().slice(-1) || "";
+    const code = c.charCodeAt(0);
+    if (code >= 0xac00 && code <= 0xd7a3) return (code - 0xac00) % 28 !== 0; // 한글 음절
+    if (/[0-9]/.test(c)) return ![2, 4, 5, 9].includes(Number(c));          // 숫자 발음 받침
+    return true;                                                            // 영문 등은 받침 있음으로 간주
+  };
+  const iGa     = (s: string) => `${s}${hasJong(s) ? "이" : "가"}`;
+  const eunNeun = (s: string) => `${s}${hasJong(s) ? "은" : "는"}`;
+
+  // 각 원소 = 한 줄. 중간 줄은 연결어미로 잇고 마지막 줄만 종결형으로 끝낸다.
+  const lines: string[] = [];
+
+  // 1) 전체 추세
+  const overall = totalLast === totalFirst
+    ? `${totalFirst}건에서 ${totalLast}건으로 비슷한 수준을 유지했으며,`
+    : `${totalFirst}건에서 ${totalLast}건으로 약 ${Math.abs(pct)}% ${trend}했으며,`;
+  lines.push(`최근 3개월(${mLabel(first)}~${mLabel(last)}) ${unit}별 연구노트 생성 건수는 ${overall}`);
+
+  // 2) 급증 / 급감
+  const hasInc = !!(topInc && topInc.delta > 0);
+  const hasDec = !!(topDec && topDec.delta < 0 && topDec.code !== topInc?.code);
+  if (hasInc && hasDec) {
+    lines.push(
+      `그중 ${iGa(topInc!.code)} ${topInc!.head}→${topInc!.tail}건으로 가장 큰 폭으로 늘어난 반면, ` +
+      `${eunNeun(topDec!.code)} ${topDec!.head}→${topDec!.tail}건으로 가장 크게 줄었고,`
+    );
+  } else if (hasInc) {
+    lines.push(`그중 ${iGa(topInc!.code)} ${topInc!.head}→${topInc!.tail}건으로 가장 큰 폭으로 늘었고,`);
+  } else if (hasDec) {
+    lines.push(`그중 ${eunNeun(topDec!.code)} ${topDec!.head}→${topDec!.tail}건으로 가장 크게 줄었고,`);
+  }
+
+  // 3) 연속 추세
+  if (contInc.length > 0 && contDec.length > 0) {
+    lines.push(
+      `${contInc.slice(0, 3).join(", ")} 등은 3개월 연속 증가세가 이어진 반면 ` +
+      `${contDec.slice(0, 3).join(", ")} 등은 꾸준한 감소세를 보이는 등 ${unit}별 편차가 뚜렷했으며,`
+    );
+  } else if (contInc.length > 0) {
+    lines.push(`${contInc.slice(0, 3).join(", ")} 등은 3개월 연속 증가세가 이어졌으며,`);
+  } else if (contDec.length > 0) {
+    lines.push(`${contDec.slice(0, 3).join(", ")} 등은 꾸준한 감소세를 보였으며,`);
+  }
+
+  // 4) 집중도 (마무리 문장)
+  if (top3.length > 0) {
+    lines.push(
+      `최근 월 기준 상위 ${top3.length}개 ${iGa(unit)} 전체의 약 ${top3Pct}%를 차지해 ` +
+      `생성이 일부 ${unit}에 집중되는 경향을 보입니다.`
+    );
+  }
+
+  // 마지막 줄이 연결어미(쉼표)로 끝나면 종결형으로 자연스럽게 마무리한다.
+  if (lines.length > 0) {
+    const i = lines.length - 1;
+    lines[i] = lines[i]
+      .replace(/했으며,$/, "했습니다.")
+      .replace(/늘었고,$/, "늘었습니다.")
+      .replace(/줄었고,$/, "줄었습니다.")
+      .replace(/이어졌으며,$/, "이어졌습니다.")
+      .replace(/보였으며,$/, "보였습니다.");
+  }
+
+  return lines;
+}
+
+function analyzeElnChart1Insight(data: ElnReportData): string[] {
+  return analyzeMonthlyTrendInsight(data.months, data.projects, data.chart1, "과제");
+}
+
+function analyzeElnChart2Insight(data: ElnReportData): string[] {
+  return analyzeMonthlyTrendInsight(data.months, data.teams, data.chart2Monthly, "팀");
+}
+
 // ─ HTML 조립 ─────────────────────────────────────────────────────────────────
 
 function buildBioElnReportHtml(
@@ -1942,6 +2090,16 @@ function buildBioElnReportHtml(
       border:2px dashed #cbd5e1; border-radius:8px; padding:24px;
       text-align:center; color:#9ca3af; font-size:11px; background:#f8fafc;
     }
+    .insight-box {
+      margin-top:8px; padding:10px 14px; background:#f0fdf4;
+      border-left:3px solid #16a34a; border-radius:0 6px 6px 0;
+      font-size:13.5px; line-height:1.7; color:#374151;
+    }
+    .insight-box .insight-label {
+      font-weight:700; color:#15803d; font-size:13px; margin-bottom:6px;
+    }
+    .insight-box p { margin:0 0 5px; }
+    .insight-box p:last-child { margin-bottom:0; }
     /* IT서비스 표 */
     .svc-table {
       width:100%; border-collapse:collapse; font-size:9.5px; table-layout:fixed;
@@ -1989,12 +2147,32 @@ function buildBioElnReportHtml(
     <div class="chart-block">
       <div class="chart-title">과제별 연구노트 생성 현황</div>
       ${mkImg(chart1Base64, "과제별 연구노트 생성 현황")}
+      ${elnData ? `<div class="insight-box">
+        <div class="insight-label">데이터 인사이트 (최근 3개월 변화 분석)</div>
+        ${analyzeElnChart1Insight(elnData).map((l) => `<p>${escHtml(l)}</p>`).join("")}
+      </div>` : ""}
     </div>
 
-    <!-- Chart 2: 팀별 연구노트 생성 현황 -->
+    <div class="footer">
+      <span>SK Bioscience Bio연구본부 — 전자연구노트(ELN) 운영 현황</span>
+      <span>${titleDate}</span>
+    </div>
+  </div>
+
+  <!-- 3페이지: 팀별 연구노트 생성 현황 (별도 페이지) -->
+  <div class="page">
+    <div class="page-header">
+      <h2>${latestLabel} 팀별 연구노트 생성 현황</h2>
+      <span class="pg">${titleDate}</span>
+    </div>
+
     <div class="chart-block">
       <div class="chart-title">${latestLabel} 팀별 연구노트 생성 현황</div>
       ${mkImg(chart2Base64, "팀별 연구노트 생성 현황")}
+      ${elnData ? `<div class="insight-box">
+        <div class="insight-label">데이터 인사이트 (최근 3개월 변화 분석)</div>
+        ${analyzeElnChart2Insight(elnData).map((l) => `<p>${escHtml(l)}</p>`).join("")}
+      </div>` : ""}
     </div>
 
     <div class="footer">
