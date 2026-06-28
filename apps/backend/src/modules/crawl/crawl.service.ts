@@ -739,6 +739,130 @@ async function runGcpActivityInBackground(jobId: string, taskId: string): Promis
   jobEventBus.scheduleCleanup(jobId);
 }
 
+// ── DEV GCP 데이터 수집 잡 (3개 리포트 Excel export → uploads/ + uploaded_files) ──
+
+const GCP_DATA_SYSTEM = "GCP_DATA";
+const GCP_DATA_DIV    = "DEV" as const;
+const GCP_XLSX_MIME   = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+
+const GCP_REPORTS: { key: string; file: string; label: string }[] = [
+  { key: "GCP_PERFSTATS", file: "GCP_PerfStats.xlsx", label: "Performance Statistics" },
+  { key: "GCP_QUALITY",   file: "GCP_Quality.xlsx",   label: "Quality Events" },
+  { key: "GCP_TRAINING",  file: "GCP_Training.xlsx",   label: "Training" },
+];
+
+export async function startGcpDataCollection(params: {
+  jobId:  string;
+  userId: string;
+}): Promise<{ taskId: string }> {
+  const { jobId, userId } = params;
+
+  const divRows = await query<{ id: string }>(
+    "SELECT id FROM divisions WHERE code = $1", [GCP_DATA_DIV]
+  );
+  if (!divRows.length) throw new AppError(400, "DEV 사업부를 찾을 수 없습니다.");
+
+  await query(
+    `INSERT INTO report_jobs (id, division_id, status, started_at, created_by)
+     VALUES ($1, $2, 'RUNNING', NOW(), $3)
+     ON CONFLICT (id) DO UPDATE SET status = 'RUNNING', updated_at = NOW()`,
+    [jobId, divRows[0].id, userId]
+  );
+
+  const taskRows = await query<{ id: string }>(
+    `INSERT INTO crawl_tasks (report_job_id, system_name, task_type, status)
+     VALUES ($1, $2, 'DOWNLOAD', 'PENDING')
+     ON CONFLICT (report_job_id, system_name) DO UPDATE
+       SET task_type = 'DOWNLOAD', status = 'PENDING', updated_at = NOW()
+     RETURNING id`,
+    [jobId, GCP_DATA_SYSTEM]
+  );
+  const taskId = taskRows[0].id;
+
+  void runGcpDataInBackground(jobId, taskId);
+
+  logger.info(`[CrawlService] GCP 데이터 수집 시작: job=${jobId}, task=${taskId}`);
+  return { taskId };
+}
+
+async function registerGcpNamedFile(jobId: string, file: string): Promise<void> {
+  const uploadDir = process.env.UPLOAD_DIR ?? "uploads";
+  const filePath  = path.resolve(uploadDir, jobId, "uploads", file);
+  if (!fs.existsSync(filePath)) return;
+  const fileSize = fs.statSync(filePath).size;
+  const existing = await query<{ id: string }>(
+    `SELECT id FROM uploaded_files WHERE report_job_id = $1 AND original_name = $2
+     ORDER BY created_at DESC LIMIT 1`,
+    [jobId, file]
+  );
+  if (existing.length) {
+    await query(
+      `UPDATE uploaded_files
+       SET stored_path = $1, file_type = $2, file_size = $3, analysis_result = '{}'::jsonb, created_at = NOW()
+       WHERE id = $4`,
+      [filePath, GCP_XLSX_MIME, fileSize, existing[0].id]
+    );
+  } else {
+    await query(
+      `INSERT INTO uploaded_files (report_job_id, original_name, stored_path, file_type, file_size)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [jobId, file, filePath, GCP_XLSX_MIME, fileSize]
+    );
+  }
+  logger.info(`[CrawlService] GCP 데이터 등록: ${file} (${fileSize.toLocaleString()} bytes)`);
+}
+
+async function runGcpDataInBackground(jobId: string, taskId: string): Promise<void> {
+  jobEventBus.emit(jobId, { type: "task_start", systemName: GCP_DATA_SYSTEM, total: 1 });
+  await query(`UPDATE crawl_tasks SET status = 'RUNNING', updated_at = NOW() WHERE id = $1`, [taskId])
+    .catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
+
+  let okCount = 0;
+  const errors: string[] = [];
+
+  for (let i = 0; i < GCP_REPORTS.length; i++) {
+    const rep = GCP_REPORTS[i];
+    jobEventBus.emit(jobId, {
+      type:       "progress",
+      systemName: GCP_DATA_SYSTEM,
+      percent:    Math.round((i / GCP_REPORTS.length) * 100),
+      message:    `${rep.label} 수집 중… (${i + 1}/${GCP_REPORTS.length})`,
+    });
+    try {
+      await CrawlerFactory.runSingle(rep.key, jobId, (event) => {
+        if (event.percent !== undefined || event.message) {
+          jobEventBus.emit(jobId, {
+            type:       "progress",
+            systemName: GCP_DATA_SYSTEM,
+            message:    `[${rep.label}] ${event.message ?? ""}`,
+          });
+        }
+      });
+      await registerGcpNamedFile(jobId, rep.file);
+      okCount++;
+    } catch (err) {
+      const msg = (err as Error).message;
+      errors.push(`${rep.label}: ${msg}`);
+      logger.error(`[CrawlService] GCP ${rep.label} 실패: ${msg}`);
+    }
+  }
+
+  if (okCount > 0) {
+    await query(`UPDATE crawl_tasks SET status = 'COMPLETED', updated_at = NOW() WHERE id = $1`, [taskId])
+      .catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
+    jobEventBus.emit(jobId, { type: "task_done", systemName: GCP_DATA_SYSTEM, filePaths: [] });
+    logger.info(`[CrawlService] GCP 데이터 수집 완료: ${okCount}/${GCP_REPORTS.length}` +
+      (errors.length ? ` (실패: ${errors.join("; ")})` : ""));
+  } else {
+    const msg = errors.join("; ") || "수집 실패";
+    await query(`UPDATE crawl_tasks SET status = 'FAILED', error = $1, updated_at = NOW() WHERE id = $2`, [msg, taskId])
+      .catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
+    jobEventBus.emit(jobId, { type: "task_error", systemName: GCP_DATA_SYSTEM, error: msg });
+  }
+
+  jobEventBus.scheduleCleanup(jobId);
+}
+
 // ── DEV Medcomms 대시보드 캡처 잡 ────────────────────────────────────────────────
 
 const MEDCOMMS_DASHBOARD_SYSTEM = "MEDCOMMS_DASHBOARD";

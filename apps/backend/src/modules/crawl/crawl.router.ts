@@ -21,6 +21,7 @@ import {
   veevaDashboardHandler,
   gcpDashboardHandler,
   gcpActivityHandler,
+  gcpDataHandler,
   medcommsDashboardHandler,
   clinicalDashboardHandler,
   bioRdDashboardHandler,
@@ -57,6 +58,12 @@ crawlRouter.post("/gcp-dashboard", gcpDashboardHandler);
 // GCP Quality System Activity (Task) Count 리포트 Excel export → Activity_GCP.xlsx
 // ---------------------------------------------------------------------------
 crawlRouter.post("/gcp-activity", gcpActivityHandler);
+
+// ---------------------------------------------------------------------------
+// POST /api/crawl/gcp-data
+// GCP Quality System 보고서용 3개 리포트 Excel export (PerfStats/Quality/Training)
+// ---------------------------------------------------------------------------
+crawlRouter.post("/gcp-data", gcpDataHandler);
 
 // ---------------------------------------------------------------------------
 // POST /api/crawl/medcomms-dashboard

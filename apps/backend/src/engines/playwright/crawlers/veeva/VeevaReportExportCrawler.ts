@@ -1,0 +1,949 @@
+import fs                      from "fs";
+import path                    from "path";
+import { BaseCrawler }         from "../../BaseCrawler";
+import type { CrawlerContext } from "../../types";
+
+/**
+ * Veeva Vault 리포트 → Export to Excel 공용 베이스 크롤러
+ *   (LHOUSE/GCP Activity 등에서 검증된 흐름을 파라미터화)
+ *
+ * 서브클래스가 제공하는 설정:
+ *  - reportUrlTemplate : 리포트 뷰어 URL (필요 시 BETWEEN 날짜 자동 치환)
+ *  - vaultNames        : Vault 선택 후보 목록
+ *  - titleText         : "…" 메뉴 앵커용 리포트 제목 (없으면 "" → 헤더 밴드 기반 탐색)
+ *  - savedFilename     : uploads/ 하위 저장 파일명
+ *  - exportFormat      : "Template" | "Formatted" (Excel Export Options 라디오)
+ *  - injectDateRange   : true 면 URL 의 BETWEEN 날짜를 직전 3개월(−3월1일~−1월말일)로 치환
+ *
+ * 수집 흐름:
+ *  1. 로그인 → 2. Vault 선택 → 3. 리포트 URL 접속 → 4. "…" → Export to Excel
+ *  → 5. 포맷 라디오 선택 → Export → 6. 변환 대기 → 7. uploads/<savedFilename> 저장
+ */
+export abstract class VeevaReportExportCrawler extends BaseCrawler {
+  private static readonly LOGIN_URL = "https://login.veevavault.com";
+
+  // ── 서브클래스 설정 ──────────────────────────────────────────────────────────
+  protected abstract reportUrlTemplate: string;
+  protected abstract vaultNames:        string[];
+  protected abstract titleText:         string;
+  protected abstract savedFilename:     string;
+  protected exportFormat:   "Template" | "Formatted" = "Formatted";
+  protected injectDateRange = false;
+
+  protected readonly veevaUser = process.env.DEV_GCP_VEEVA_USER ?? process.env.LHOUSE_VEEVA_USER ?? "apiadmin@sk.com";
+  protected readonly veevaPass = process.env.DEV_GCP_VEEVA_PASS ?? process.env.LHOUSE_VEEVA_PASS ?? "12345QWert";
+
+  constructor(ctx: CrawlerContext) {
+    super(ctx);
+  }
+
+  /** "…" 메뉴 앵커/덤프용 제목 접두 (titleText 의 핵심 부분). 비어있으면 밴드 기반 탐색. */
+  protected get titlePrefix(): string {
+    return this.titleText.split(" - ")[0].trim();
+  }
+
+  /** BETWEEN 날짜를 직전 3개월(−3월 1일 ~ −1월 말일)로 치환한 리포트 URL */
+  protected buildReportUrl(): string {
+    if (!this.injectDateRange) return this.reportUrlTemplate;
+    const now   = new Date();
+    const start = new Date(now.getFullYear(), now.getMonth() - 3, 1); // −3월 1일
+    const end   = new Date(now.getFullYear(), now.getMonth(),     0); // −1월 말일
+    const fmt   = (d: Date) =>
+      `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    const s = fmt(start), e = fmt(end);
+    // BETWEEN=YYYY-MM-DD%3B%3BYYYY-MM-DD (또는 ;;) 형태를 모두 치환
+    return this.reportUrlTemplate.replace(
+      /\d{4}-\d{2}-\d{2}(%3B%3B|;;)\d{4}-\d{2}-\d{2}/g,
+      `${s}$1${e}`,
+    );
+  }
+
+  // ── 헬퍼: CSS 후보 폴링 ─────────────────────────────────────────────────────
+
+  private async waitForVisible(
+    candidates: string[],
+    timeoutMs = 15_000,
+    optional  = false,
+  ): Promise<string | null> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      for (const sel of candidates) {
+        try {
+          const el = await this.page.$(sel);
+          if (el && await el.isVisible()) return sel;
+        } catch { /* ignore */ }
+      }
+      await this.page.waitForTimeout(400);
+    }
+    if (optional) return null;
+    throw new Error(`요소를 찾을 수 없습니다: ${candidates.join(", ")}`);
+  }
+
+  // ── 헬퍼: 로그인 제출 버튼 클릭 ─────────────────────────────────────────────
+
+  private async clickSubmit(): Promise<boolean> {
+    for (const text of ["Next", "Continue", "Sign In", "Log In"]) {
+      const btn = this.page.getByRole("button", { name: text, exact: false });
+      if (await btn.count() > 0 && await btn.first().isVisible().catch(() => false)) {
+        await btn.first().click();
+        return true;
+      }
+      // <a> / div 등 비표준 요소 대응
+      const txt = this.page.getByText(text, { exact: true });
+      if (await txt.count() > 0 && await txt.first().isVisible().catch(() => false)) {
+        await txt.first().click();
+        return true;
+      }
+    }
+    for (const sel of ["button[type='submit']", "input[type='submit']"]) {
+      const el = await this.page.$(sel);
+      if (el && await el.isVisible().catch(() => false)) { await el.click(); return true; }
+    }
+    return false;
+  }
+
+  // ── 헬퍼: 리포트 페이지 완전 로딩 대기 ─────────────────────────────────────────
+
+  private async _waitForReportReady(anchorText: string): Promise<void> {
+    // Veeva Vault 리포트 뷰어는 데이터를 실행하는 동안 화면 상단에
+    // 'Running report "Activity (Task) Count"…' 형태의 팝업 배너를 표시합니다.
+    // 이 배너가 사라지면 리포트 로딩이 완료된 것입니다.
+    //
+    // 대기 전략:
+    //  1. 팝업 배너가 DOM에 나타날 때까지 최대 30초 대기 (나타나지 않으면 skip)
+    //  2. 팝업 배너가 DOM에서 사라질 때까지 최대 5분 대기
+    //  3. 대상 텍스트(anchorText)가 visible 요소에 나타날 때까지 폴링
+    //  4. 대상 텍스트 요소를 viewport 중앙으로 스크롤
+    //  5. 디버그 스크린샷 저장
+
+    const BANNER_POLL_MS  =  1_000;  // 폴링 간격
+    const LOADING_TIMEOUT = 300_000; // 배너 소멸 대기 (최대 5분)
+    const CONTENT_TIMEOUT =  60_000; // 콘텐츠 출현 대기
+
+    // "Running report …" 배너 가시성 판단.
+    //
+    // ※ 핵심: Veeva 배너는 position:fixed 요소이므로 offsetParent === null 이 됩니다.
+    //   offsetParent 체크를 사용하면 배너가 보여도 항상 false 를 반환하므로 사용 금지.
+    //   대신 getBoundingClientRect().height > 0 으로 실제 렌더링 여부를 확인합니다.
+    const isBannerVisible = async (): Promise<boolean> => {
+      // 방법 1: Playwright getByText — 내부적으로 getBoundingClientRect 기반 isVisible 사용
+      try {
+        const loc = this.page.getByText(/Running report/i);
+        const cnt = await loc.count();
+        if (cnt > 0) {
+          for (let i = 0; i < cnt; i++) {
+            if (await loc.nth(i).isVisible().catch(() => false)) return true;
+          }
+        }
+      } catch { /* ignore */ }
+
+      // 방법 2: evaluate — getBoundingClientRect 로 실제 렌더링 크기 확인
+      return this.page.evaluate(() => {
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+        let node: Text | null;
+        while ((node = walker.nextNode() as Text | null)) {
+          if (node.textContent?.includes("Running report")) {
+            const el = node.parentElement as HTMLElement | null;
+            if (!el) continue;
+            const rect = el.getBoundingClientRect();
+            // fixed 요소는 offsetParent=null 이지만 rect는 정상 값을 반환
+            if (rect.width > 0 && rect.height > 0) return true;
+          }
+        }
+        return false;
+      });
+    };
+
+    // 1) 배너가 나타날 때까지 최대 30초 대기
+    this.emit("navigating", "리포트 실행 배너 확인 중…", 34);
+    let bannerSeen = false;
+    const appearDeadline = Date.now() + 30_000;
+    while (Date.now() < appearDeadline) {
+      if (await isBannerVisible()) { bannerSeen = true; break; }
+      await this.page.waitForTimeout(BANNER_POLL_MS);
+    }
+
+    // 2) 배너가 보이면 → 사라질 때까지 폴링 (최대 5분)
+    if (bannerSeen) {
+      this.emit("navigating", "리포트 데이터 실행 중… (배너 소멸 대기, 최대 5분)", 35);
+      const disappearDeadline = Date.now() + LOADING_TIMEOUT;
+      while (Date.now() < disappearDeadline) {
+        if (!(await isBannerVisible())) break;
+        const elapsed = LOADING_TIMEOUT - (disappearDeadline - Date.now());
+        const pct     = Math.min(39, 35 + Math.floor((elapsed / LOADING_TIMEOUT) * 4));
+        this.emit("navigating", "리포트 데이터 로딩 중…", pct);
+        await this.page.waitForTimeout(BANNER_POLL_MS);
+      }
+      if (await isBannerVisible()) {
+        this.emit("navigating", "배너 소멸 대기 타임아웃 — 계속 진행합니다.", 39);
+      }
+    } else {
+      // 배너가 없으면(즉시 완료 또는 캐시됨) networkidle로 보완
+      this.emit("navigating", "배너 미감지 — networkidle 대기…", 35);
+      await this.page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => {});
+    }
+
+    await this.page.waitForTimeout(1_000); // DOM 안정화
+
+    // 3) anchorText가 visible 요소에 나타날 때까지 폴링 (최대 60초)
+    this.emit("navigating", `'${anchorText}' 콘텐츠 확인 중…`, 39);
+    const deadline = Date.now() + CONTENT_TIMEOUT;
+    while (Date.now() < deadline) {
+      const found = await this.page.evaluate((text) => {
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+        let node: Text | null;
+        while ((node = walker.nextNode() as Text | null)) {
+          if (node.textContent?.includes(text)) {
+            const el = node.parentElement;
+            if (el && el.offsetParent !== null) return true;
+          }
+        }
+        return false;
+      }, anchorText);
+      if (found) break;
+      await this.page.waitForTimeout(1_000);
+    }
+
+    // 4) 대상 텍스트 요소를 viewport 중앙으로 스크롤
+    this.emit("navigating", `'${anchorText}' 섹션을 화면 중앙으로 스크롤…`, 39);
+    await this.page.evaluate((text) => {
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+      let node: Text | null;
+      while ((node = walker.nextNode() as Text | null)) {
+        if (node.textContent?.includes(text)) {
+          const el = node.parentElement;
+          if (el && el.offsetParent !== null) {
+            el.scrollIntoView({ behavior: "instant", block: "center" });
+            return;
+          }
+        }
+      }
+    }, anchorText);
+    await this.page.waitForTimeout(800);
+
+    // 5) 디버그 스크린샷 (viewport만 — 현재 보이는 상태 확인용)
+    const shotPath = `${this.downloadDir}/debug_loaded_${Date.now()}.png`;
+    await this.page.screenshot({ path: shotPath, fullPage: false }).catch(() => {});
+    this.emit("navigating", `페이지 로딩 완료 (스크린샷: ${shotPath})`, 40);
+  }
+
+  // ── 헬퍼: "Running report …" 배너(=리포트 실행 중) 가시 여부 ───────────────────
+
+  private async _isReportRunning(): Promise<boolean> {
+    try {
+      const loc = this.page.getByText(/Running report/i);
+      const cnt = await loc.count();
+      for (let i = 0; i < cnt; i++) {
+        if (await loc.nth(i).isVisible().catch(() => false)) return true;
+      }
+    } catch { /* ignore */ }
+    return this.page.evaluate(() => {
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+      let node: Text | null;
+      while ((node = walker.nextNode() as Text | null)) {
+        if (node.textContent?.includes("Running report")) {
+          const el = node.parentElement as HTMLElement | null;
+          if (el) {
+            const r = el.getBoundingClientRect();
+            if (r.width > 0 && r.height > 0) return true;
+          }
+        }
+      }
+      return false;
+    }).catch(() => false);
+  }
+
+  // ── 헬퍼: 리포트 헤더의 "…"(More Actions) 메뉴 버튼 클릭 ──────────────────────
+  //   제목("Activity (Task) Count")과 같은 헤더 행에서 가장 오른쪽 버튼 = "…".
+  //   (↻ 새로고침 · ✎ 편집 다음의 마지막 아이콘) 직접 좌표 기반으로 클릭한다.
+
+  private async _clickReportActionsMenu(titleText: string): Promise<boolean> {
+    // ⓪ 혹시 열려있는 다른 메뉴(계정 아바타 드롭다운 등)를 빈 영역 클릭으로 닫는다.
+    //    (한 번 잘못 열리면 보고서 헤더 우측을 가려 이후 시도가 모두 막힘)
+    await this.page.mouse.click(450, 320).catch(() => {});
+    await this.page.waitForTimeout(200);
+
+    // ① 제목 요소를 태깅하고 Playwright 로 hover → GCP 리포트 헤더는 hover 시
+    //    ↻ ✎ ⋯ 액션 아이콘이 나타나는 경우가 있어 hover 후 탐색한다.
+    const titleTagged = await this.page.evaluate(({ prefix }) => {
+      const all = Array.from(document.querySelectorAll<HTMLElement>("*"));
+      const tag = (el: HTMLElement) => {
+        document.querySelectorAll("[data-omc-title]").forEach((x) => x.removeAttribute("data-omc-title"));
+        el.setAttribute("data-omc-title", "1");
+        return true;
+      };
+      // 1) 리포트 제목 접두로 매칭되는 leaf 요소 우선
+      if (prefix) {
+        const byTitle =
+          all.find((e) => e.childElementCount === 0 && (e.textContent?.trim() ?? "").startsWith(prefix) && e.offsetParent !== null) ??
+          all.find((e) => (e.textContent?.trim() ?? "").startsWith(prefix) && e.offsetParent !== null);
+        if (byTitle) return tag(byTitle);
+      }
+      // 2) 제목 미발견 → "« Back to reports"(모든 리포트 뷰어 공통)를 기준 행으로 사용
+      const back = all.find((e) =>
+        e.childElementCount === 0 && /Back to reports/i.test(e.textContent ?? "") && e.offsetParent !== null);
+      if (back) return tag(back);
+      return false;
+    }, { prefix: this.titlePrefix }).catch(() => false);
+    if (!titleTagged) return false;
+
+    await this.page.locator('[data-omc-title="1"]').first().hover({ timeout: 4_000 }).catch(() => {});
+    await this.page.waitForTimeout(500);
+
+    // ② 보고서 헤더 행(제목 세로중심 ±50px)에서 제목 오른쪽의 "…" 후보를 태깅.
+    //    ★ 상단 nav 바(아바타/카트/벨, top<100)와 계정 메뉴류는 반드시 제외한다.
+    const tagged = await this.page.evaluate(() => {
+      const titleEl = document.querySelector<HTMLElement>('[data-omc-title="1"]');
+      if (!titleEl) return false;
+      const tRect   = titleEl.getBoundingClientRect();
+      const titleCY = tRect.top + tRect.height / 2;
+
+      const isAccountish = (el: HTMLElement) => {
+        const meta = ((el.getAttribute("aria-label") ?? "") + " " +
+                      (el.getAttribute("title") ?? "") + " " +
+                      (typeof el.className === "string" ? el.className : "")).toLowerCase();
+        return /account|user|profile|avatar|logout|notification|cart|벨|알림/.test(meta);
+      };
+
+      const candidates = Array.from(document.querySelectorAll<HTMLElement>(
+        "button, [role='button'], a, [aria-haspopup], [class*='action'], [class*='menu'], [class*='overflow'], svg"
+      )).filter((el) => {
+        if (el.offsetParent === null) return false;
+        const r = el.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) return false;
+        if (r.top < 100) return false;          // 상단 nav 바 제외 (아바타/카트/벨)
+        if (isAccountish(el)) return false;
+        const cy = r.top + r.height / 2;
+        return Math.abs(cy - titleCY) < 70 && r.left >= tRect.right - 4;
+      });
+      if (candidates.length === 0) return false;
+
+      candidates.sort((a, b) => b.getBoundingClientRect().left - a.getBoundingClientRect().left);
+      let target: HTMLElement = candidates[0];
+      let p: HTMLElement | null = target;
+      for (let i = 0; i < 4 && p; i++) {
+        const tag = p.tagName.toLowerCase();
+        if (tag === "button" || p.getAttribute("role") === "button" || tag === "a") { target = p; break; }
+        p = p.parentElement;
+      }
+
+      document.querySelectorAll("[data-omc-actions]").forEach((e) => e.removeAttribute("data-omc-actions"));
+      target.setAttribute("data-omc-actions", "1");
+      return true;
+    }).catch(() => false);
+
+    if (!tagged) return false;
+
+    // ③ Playwright 실제 클릭
+    const loc = this.page.locator('[data-omc-actions="1"]').first();
+    try {
+      await loc.click({ timeout: 5_000 });
+      return true;
+    } catch {
+      try { await loc.click({ timeout: 3_000, force: true }); return true; }
+      catch { return false; }
+    }
+  }
+
+  /** 실패 진단용: 보고서 헤더 밴드(nav 아래 ~ 콘텐츠 위)의 클릭가능 요소 덤프 */
+  private async _dumpHeaderButtons(_titleText: string): Promise<string> {
+    return this.page.evaluate(() => {
+      const btns = Array.from(document.querySelectorAll<HTMLElement>(
+        "button, [role='button'], a, [aria-haspopup], [class*='action'], [class*='menu'], svg"
+      ))
+        .filter((el) => {
+          if (el.offsetParent === null) return false;
+          const r = el.getBoundingClientRect();
+          return r.width > 0 && r.top >= 100 && r.top <= 220 && r.left >= 700; // 헤더 밴드 우측
+        })
+        .map((el) => {
+          const r = el.getBoundingClientRect();
+          return `${el.tagName}@x${Math.round(r.left)},y${Math.round(r.top)} aria='${el.getAttribute("aria-label") ?? ""}' title='${el.getAttribute("title") ?? ""}' cls='${String(el.className ?? "").slice(0, 30)}'`;
+        });
+      return btns.join("  |  ") || "(헤더 버튼 없음)";
+    }).catch(() => "(덤프 실패)");
+  }
+
+  // ── 헬퍼: 특정 텍스트가 있는 섹션/위젯/행의 … 버튼 클릭 ──────────────────────
+
+  private async _clickEllipsisOnRow(sectionText: string): Promise<void> {
+    const BTN_SEL =
+      "button, [role='button'], a, " +
+      "[class*='ellipsis'], [class*='overflow'], [class*='more-action'], " +
+      "[class*='action-btn'], [class*='kebab'], [class*='dot-menu'], " +
+      "[aria-label*='more' i], [aria-label*='action' i], " +
+      "[title*='more' i], [title*='action' i], [title*='export' i]";
+
+    // ── 전략 0: 텍스트 요소 hover → 인근 버튼 감지 (가장 신뢰도 높음) ─────────────
+    //   Veeva Vault는 해당 섹션 위에 마우스를 올려야 … 버튼이 나타남
+    const candidates = [
+      this.page.getByText(sectionText, { exact: true }),
+      this.page.getByText(sectionText, { exact: false }),
+    ];
+    for (const loc of candidates) {
+      try {
+        const cnt = await loc.count();
+        if (cnt === 0) continue;
+        // 첫 번째 visible 요소를 찾아 hover
+        for (let i = 0; i < cnt; i++) {
+          const el = loc.nth(i);
+          if (!(await el.isVisible().catch(() => false))) continue;
+
+          // 1) 텍스트 요소 자체에 hover
+          await el.hover({ force: true }).catch(() => {});
+          await this.page.waitForTimeout(800);
+
+          // 2) 해당 요소 위치 기준 부모를 최대 10단계 올라가며 버튼 탐색
+          const clicked = await this.page.evaluate(
+            ({ btnSel, idx }) => {
+              // 텍스트 노드 기반으로 대상 요소 탐색
+              const walker = document.createTreeWalker(
+                document.body, NodeFilter.SHOW_TEXT, null
+              );
+              let node: Text | null;
+              let matchEl: HTMLElement | null = null;
+              let matchIdx = 0;
+              while ((node = walker.nextNode() as Text | null)) {
+                if (node.textContent?.includes("Activity (Task) Count")) {
+                  const el = node.parentElement as HTMLElement;
+                  if (el && el.offsetParent !== null) {
+                    if (matchIdx === idx) { matchEl = el; break; }
+                    matchIdx++;
+                  }
+                }
+              }
+              if (!matchEl) return false;
+
+              // hover 후 visible 버튼 탐색 (부모 최대 10단계)
+              let container: Element | null = matchEl;
+              for (let i = 0; i < 10 && container; i++) {
+                const btns = Array.from(container.querySelectorAll(btnSel))
+                  .filter((b) => (b as HTMLElement).offsetParent !== null &&
+                                 getComputedStyle(b as HTMLElement).visibility !== "hidden");
+                if (btns.length > 0) {
+                  (btns[btns.length - 1] as HTMLElement).click();
+                  return true;
+                }
+                container = container.parentElement;
+              }
+              return false;
+            },
+            { btnSel: BTN_SEL, idx: i }
+          );
+
+          if (clicked) return;
+        }
+      } catch { /* 다음 후보 */ }
+    }
+
+    // ── 전략 1: JS evaluate — hover 없이 DOM에서 직접 탐색 ────────────────────────
+    const titleElInfo = await this.page.evaluate((text) => {
+      const all = Array.from(document.querySelectorAll("*"));
+      const exact = all.find(
+        (el) => el.childElementCount === 0 && el.textContent?.trim() === text
+      );
+      if (exact) return (exact as HTMLElement).className + "||" + (exact as HTMLElement).tagName;
+      const partial = all.find((el) => el.textContent?.trim().startsWith(text));
+      if (partial) return (partial as HTMLElement).className + "||" + (partial as HTMLElement).tagName;
+      return null;
+    }, sectionText);
+
+    const jsClicked = await this.page.evaluate(
+      ({ text, btnSel }) => {
+        const all = Array.from(document.querySelectorAll("*"));
+        const titleNodes = all.filter(
+          (el) =>
+            (el.textContent?.trim() === text ||
+             el.textContent?.trim().startsWith(text)) &&
+            (el as HTMLElement).offsetParent !== null
+        );
+        for (const node of titleNodes) {
+          let container: Element | null = node.parentElement;
+          for (let i = 0; i < 8 && container; i++) {
+            const btns = Array.from(container.querySelectorAll(btnSel))
+              .filter((b) => (b as HTMLElement).offsetParent !== null);
+            if (btns.length > 0) {
+              (btns[btns.length - 1] as HTMLElement).click();
+              return true;
+            }
+            container = container.parentElement;
+          }
+        }
+        return false;
+      },
+      { text: sectionText, btnSel: BTN_SEL }
+    );
+    if (jsClicked) return;
+
+    // ── 전략 2: Playwright locator — 텍스트 포함 컨테이너 hover 후 버튼 탐색 ────────
+    const containerSels = [
+      `tr:has-text("${sectionText}")`,
+      `[role='row']:has-text("${sectionText}")`,
+      `li:has-text("${sectionText}")`,
+      `[class*='header']:has-text("${sectionText}")`,
+      `[class*='title']:has-text("${sectionText}")`,
+      `[class*='panel']:has-text("${sectionText}")`,
+      `[class*='widget']:has-text("${sectionText}")`,
+      `[class*='card']:has-text("${sectionText}")`,
+      `[class*='section']:has-text("${sectionText}")`,
+      `div:has-text("${sectionText}")`,
+    ];
+
+    for (const csel of containerSels) {
+      try {
+        const containers = this.page.locator(csel);
+        const cnt = await containers.count();
+        if (cnt === 0) continue;
+
+        // 가장 작은(leaf에 가까운) 컨테이너부터 탐색
+        for (let ci = cnt - 1; ci >= 0; ci--) {
+          const c = containers.nth(ci);
+          if (!(await c.isVisible().catch(() => false))) continue;
+          await c.hover({ force: true }).catch(() => {});
+          await this.page.waitForTimeout(600);
+
+          const btns = c.locator(BTN_SEL);
+          const bc = await btns.count();
+          if (bc > 0) {
+            await btns.nth(bc - 1).click();
+            return;
+          }
+        }
+      } catch { /* 다음 후보 */ }
+    }
+
+    // ── 전략 3: 스크린샷 저장 후 오류 ──────────────────────────────────────────
+    const debugPath = `${this.downloadDir}/debug_ellipsis_${Date.now()}.png`;
+    await this.page.screenshot({ path: debugPath, fullPage: true }).catch(() => {});
+    throw new Error(
+      `'${sectionText}' 섹션의 … 버튼을 찾을 수 없습니다.\n` +
+      `스크린샷: ${debugPath}\n` +
+      `titleEl 디버그: ${titleElInfo ?? "미발견"}`
+    );
+  }
+
+  // ── 헬퍼: 드롭다운에서 "Export to Excel" 클릭 ──────────────────────────────────
+
+  private async _clickExportToExcel(): Promise<boolean> {
+    // Veeva Vault 드롭다운은 body에 portal로 렌더링될 수 있으므로 전체 페이지 탐색
+    // 텍스트 변형: "Export to Excel" / "Export to Excel..." / "Excel로 내보내기" 등
+    const textVariants = [
+      /export to excel/i,
+      /export.*excel/i,
+      /excel.*export/i,
+    ];
+
+    for (const pattern of textVariants) {
+      const loc = this.page.getByText(pattern);
+      if (await loc.count() > 0 && await loc.first().isVisible().catch(() => false)) {
+        await loc.first().click();
+        return true;
+      }
+    }
+
+    // role='menuitem' 에서 탐색
+    const menuItems = this.page.getByRole("menuitem");
+    const itemCount = await menuItems.count();
+    for (let i = 0; i < itemCount; i++) {
+      const item = menuItems.nth(i);
+      const txt  = await item.textContent().catch(() => "");
+      if (/export.*excel/i.test(txt ?? "")) {
+        await item.click();
+        return true;
+      }
+    }
+
+    // option / li 에서 텍스트 탐색
+    const jsClicked = await this.page.evaluate(() => {
+      const els = Array.from(document.querySelectorAll(
+        "[role='menuitem'], [role='option'], li, a, button, [class*='menu-item'], [class*='dropdown-item']"
+      ));
+      for (const el of els) {
+        const txt = el.textContent?.toLowerCase() ?? "";
+        if (txt.includes("export") && txt.includes("excel")) {
+          (el as HTMLElement).click();
+          return true;
+        }
+      }
+      return false;
+    });
+
+    return jsClicked;
+  }
+
+  // ── 헬퍼: "Excel Export Options" 팝업의 Export 버튼 클릭 ───────────────────────
+  //   ("Export to Excel/Text/PDF" 메뉴 항목이 아닌, 정확히 "Export" 인 확정 버튼)
+
+  private async _clickExportButton(): Promise<boolean> {
+    // 1) role=button, 접근가능 이름이 정확히 "Export"
+    const byRole = this.page.getByRole("button", { name: /^\s*export\s*$/i });
+    const rc = await byRole.count();
+    for (let i = 0; i < rc; i++) {
+      const b = byRole.nth(i);
+      if (await b.isVisible().catch(() => false)) {
+        await b.click().catch(() => {});
+        return true;
+      }
+    }
+
+    // 2) evaluate — 보이는 요소 중 트림 텍스트가 정확히 "Export" 인 클릭 가능 요소
+    //    (다이얼로그/모달 내부를 우선 선택)
+    return this.page.evaluate(() => {
+      const visible = (el: HTMLElement) =>
+        el.offsetParent !== null && getComputedStyle(el).visibility !== "hidden";
+      const inDialog = (el: Element) =>
+        !!el.closest("dialog, [role='dialog'], [class*='modal'], [class*='dialog'], [class*='popup']");
+
+      const els = Array.from(document.querySelectorAll<HTMLElement>(
+        "button, [role='button'], a, input[type='button'], input[type='submit'], [class*='btn'], [class*='button']"
+      )).filter((el) => {
+        if (!visible(el)) return false;
+        const t = (el.tagName === "INPUT"
+          ? (el as HTMLInputElement).value
+          : el.textContent ?? "").trim();
+        return /^export$/i.test(t);
+      });
+      if (els.length === 0) return false;
+
+      els.sort((a, b) => Number(inDialog(b)) - Number(inDialog(a)));
+      const target = els[0];
+      target.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+      target.dispatchEvent(new PointerEvent("pointerup",   { bubbles: true }));
+      target.dispatchEvent(new MouseEvent("click",         { bubbles: true }));
+      return true;
+    }).catch(() => false);
+  }
+
+  // ── 헬퍼: 디버그 스크린샷(단계별 진행 상황 확인용) ───────────────────────────────
+
+  private async _debugShot(label: string): Promise<void> {
+    const p = `${this.downloadDir}/step_${label}_${Date.now()}.png`;
+    await this.page.screenshot({ path: p, fullPage: false }).catch(() => {});
+    this.emit("navigating", `[스크린샷] ${label} → ${p}`);
+  }
+
+  // ── 헬퍼: "Excel Export Options" 팝업이 열렸는지 확인 ─────────────────────────────
+
+  private async _isExportOptionsDialogOpen(): Promise<boolean> {
+    try {
+      const loc = this.page.getByText(/Excel Export Options/i);
+      if (await loc.count() > 0 && await loc.first().isVisible().catch(() => false)) return true;
+    } catch { /* ignore */ }
+    // 보조 판단: 옵션 라디오(Data Only · Formatted · Template) 가 동시에 보이면 다이얼로그로 간주
+    return this.page.evaluate(() => {
+      const txt = document.body.innerText || "";
+      return /Excel Export Options/i.test(txt) ||
+        (/Data Only/i.test(txt) && /Formatted/i.test(txt) && /Template/i.test(txt));
+    }).catch(() => false);
+  }
+
+  // ── 메인 ─────────────────────────────────────────────────────────────────────
+
+  protected async downloadReport(): Promise<string[]> {
+
+    // ── Step 1. 로그인 ───────────────────────────────────────────────────────────
+    this.emit("login", "Veeva Vault 로그인 페이지 접속 중…", 3);
+    await this.page.goto(VeevaReportExportCrawler.LOGIN_URL, {
+      waitUntil: "networkidle",
+      timeout:   45_000,
+    });
+
+    this.emit("login", "로그인 폼 확인 중…", 5);
+
+    // password 필드가 이미 보이면(재방문 단일 폼) 이메일 단계 skip
+    const pwAlready = await this.waitForVisible(
+      ["#password", "input[name='password']", "input[type='password']",
+       "input[autocomplete='current-password']"],
+      2_000, true,
+    );
+
+    if (!pwAlready) {
+      const emailSel = await this.waitForVisible(
+        ["#username", "input[name='username']", "input[type='email']",
+         "input[autocomplete='username']", "input[autocomplete='email']"],
+        15_000, true,
+      );
+      if (emailSel) {
+        this.emit("login", "이메일 입력 중…", 8);
+        await this.page.fill(emailSel, this.veevaUser);
+      }
+
+      this.emit("login", "다음 단계로 이동…", 10);
+      if (!await this.clickSubmit()) {
+        if (emailSel) await this.page.focus(emailSel);
+        await this.page.keyboard.press("Enter");
+      }
+
+      // 이메일 제출 후 Okta SSO 리다이렉트 완료 대기
+      await Promise.race([
+        this.page.waitForNavigation({ waitUntil: "networkidle", timeout: 30_000 }),
+        this.page.waitForTimeout(5_000),
+      ]).catch(() => {});
+      await this.page.waitForLoadState("domcontentloaded").catch(() => {});
+    }
+
+    this.emit("login", "비밀번호 입력 중…", 12);
+    const pwSel = await this.waitForVisible(
+      ["#password", "input[name='password']", "input[type='password']",
+       "input[autocomplete='current-password']"],
+      30_000, false,
+    );
+    await this.page.fill(pwSel!, this.veevaPass);
+
+    this.emit("login", "로그인 버튼 클릭…", 15);
+    await Promise.all([
+      this.page.waitForNavigation({ waitUntil: "networkidle", timeout: 45_000 })
+        .catch(() => this.page.waitForLoadState("networkidle", { timeout: 45_000 }).catch(() => {})),
+      this.clickSubmit().then((clicked) => {
+        if (!clicked) return this.page.keyboard.press("Enter");
+      }),
+    ]);
+
+    // 로그인 오류 확인
+    const errEl = await this.page.$(".login-error, [class*='error-msg']");
+    if (errEl) {
+      const msg = await errEl.innerText().catch(() => "");
+      if (msg.trim()) throw new Error(`로그인 오류: ${msg.trim()}`);
+    }
+    this.emit("login", "로그인 완료", 20);
+
+    // ── Step 2. Vault 선택 ───────────────────────────────────────────────────────
+    this.emit("navigating", "Vault 드롭다운 탐색 중…", 22);
+    await this.page.waitForTimeout(2_000);
+
+    const vaultSel = await this.waitForVisible(
+      [
+        "[data-testid='vault-selector']",
+        ".vault-selector",
+        "[aria-label*='vault' i]",
+        "[aria-label*='Select a vault' i]",
+        "#vaultSelector",
+        ".vv-vault-selector",
+      ],
+      10_000, true,
+    );
+
+    if (vaultSel) {
+      await this.page.click(vaultSel);
+    } else {
+      const btn = this.page.getByText("Select a vault", { exact: false });
+      if (await btn.count() > 0 && await btn.first().isVisible().catch(() => false)) {
+        await btn.first().click();
+      } else {
+        this.emit("navigating", "Vault 드롭다운 미발견 — 현재 Vault로 계속합니다.", 23);
+      }
+    }
+
+    await this.page.waitForTimeout(1_000);
+
+    const vaultNames = this.vaultNames;
+    let vaultSelected = false;
+    for (const name of vaultNames) {
+      const opt = this.page.getByText(name, { exact: false });
+      if (await opt.count() > 0 && await opt.first().isVisible().catch(() => false)) {
+        await opt.first().click();
+        this.emit("navigating", `${name} 선택 완료`, 25);
+        await this.page.waitForLoadState("networkidle").catch(() => {});
+        vaultSelected = true;
+        break;
+      }
+    }
+    if (!vaultSelected) {
+      this.emit("navigating", "GCP Vault 옵션 미발견 — 리포트 URL로 직접 접속합니다.", 25);
+    }
+
+    // ── Step 3. 리포트 URL 직접 접속 + 완전 로딩 대기 ──────────────────────────────
+    this.emit("navigating", "리포트 페이지 접속 중…", 30);
+
+    // Vault(GCP) 선택 후 이미 sk-gcp.veevavault.com/ui/ 에 와 있으면,
+    // 해시(#reporting/...)만 다른 URL로의 goto는 same-document 이동이라 net::ERR_ABORTED
+    // 가 발생한다. 같은 문서면 in-page 해시 변경으로 라우팅하고, 다른 문서일 때만 goto 한다.
+    const targetUrl = this.buildReportUrl();
+    const sameDoc   = this.page.url().split("#")[0] === targetUrl.split("#")[0];
+
+    if (sameDoc) {
+      await this.page.evaluate((u) => { window.location.href = u; }, targetUrl);
+      await this.page.waitForTimeout(2_000);
+    } else {
+      try {
+        await this.page.goto(targetUrl, {
+          waitUntil: "domcontentloaded", // SPA는 networkidle이 오래 걸리므로 DOM 기준으로 먼저
+          timeout:   60_000,
+        });
+      } catch (e: any) {
+        // SPA 해시 네비게이션이 same-document 로 처리되어 ABORT 되는 경우는 무시
+        if (!String(e?.message ?? e).includes("ERR_ABORTED")) throw e;
+      }
+    }
+    await this.page.waitForLoadState("domcontentloaded").catch(() => {});
+
+    this.emit("navigating", "리포트 페이지 렌더링 대기 중…", 33);
+    await this._waitForReportReady(this.titlePrefix || "Back to reports");
+    await this._debugShot("report_loaded");
+
+    // ── Step 4-5. … 메뉴 → Export to Excel (리포트 로딩 완료까지 재시도) ─────────
+    // 리포트가 아직 실행 중("Running report" 배너 / 표가 연하게 표시)이면 … 메뉴에
+    // Export to Excel 이 나타나지 않거나 메뉴가 열리지 않는다. 배너가 사라질 때까지
+    // 기다린 뒤 (… 메뉴 열기 → Export 클릭)을 최대 5분간 재시도한다.
+    this.emit("navigating", "… 메뉴 → Export to Excel 준비 중…", 45);
+
+    // 리포트 실행 배너가 떠 있으면 한 번만 최대 90초 대기 (배너가 끝내 안 사라져도 진행)
+    const bannerDeadline = Date.now() + 90_000;
+    while (Date.now() < bannerDeadline && (await this._isReportRunning())) {
+      this.emit("navigating", "리포트 로딩 대기 중…", 46);
+      await this.page.waitForTimeout(3_000);
+    }
+
+    const MAX_ATTEMPTS = 15;
+    let exportClicked = false;
+    let attempt = 0;
+
+    while (attempt < MAX_ATTEMPTS && !exportClicked) {
+      attempt++;
+
+      // (a) "…"(More Actions) 메뉴 열기 — 보고서 헤더 우측 "…" 직접 클릭.
+      //     (구 _clickEllipsisOnRow 폴백은 페이지 우상단 아바타를 잘못 클릭하므로 미사용)
+      this.emit("navigating", `… 메뉴 열기 (시도 ${attempt}/${MAX_ATTEMPTS})`, 50);
+      await this._clickReportActionsMenu(this.titleText);
+
+      await this.page.waitForTimeout(1_500);
+      await this._debugShot(`menu_open_a${attempt}`);
+
+      // (b) Export to Excel 클릭
+      this.emit("navigating", `Export to Excel 선택 중… (시도 ${attempt}/${MAX_ATTEMPTS})`, 55);
+      const clickedExcel = await this._clickExportToExcel();
+      await this.page.waitForTimeout(1_500);
+
+      // (c) "Excel Export Options" 다이얼로그가 실제로 열렸는지 확인해야 성공으로 간주
+      if (clickedExcel && (await this._isExportOptionsDialogOpen())) {
+        await this._debugShot(`exportoptions_a${attempt}`);
+        exportClicked = true;
+        break;
+      }
+
+      // 실패 → 디버그샷 + 열린 메뉴(아바타 드롭다운 등) 빈 영역 클릭으로 닫고 재시도.
+      //   (Veeva 계정 메뉴는 Escape 로 안 닫혀 헤더를 계속 가리므로 outside-click 사용)
+      await this._debugShot(`fail_a${attempt}`);
+      await this.page.mouse.click(450, 320).catch(() => {});
+      await this.page.keyboard.press("Escape").catch(() => {});
+      await this.page.waitForTimeout(4_000);
+    }
+
+    if (!exportClicked) {
+      const debugPath = `${this.downloadDir}/debug_menu_${Date.now()}.png`;
+      await this.page.screenshot({ path: debugPath, fullPage: false }).catch(() => {});
+      const headerBtns = await this._dumpHeaderButtons(this.titleText);
+      throw new Error(
+        `'Export to Excel' 메뉴 항목을 찾을 수 없습니다 (${attempt}회 시도). 스크린샷: ${debugPath}\n` +
+        `현재 URL: ${this.page.url()}\n` +
+        `헤더 버튼 후보: ${headerBtns}\n` +
+        `페이지 텍스트(일부): ${(await this.page.innerText("body").catch(() => "")).slice(0, 300)}`
+      );
+    }
+
+    await this.page.waitForTimeout(1_000);
+    this.emit("navigating", "Export to Excel 다이얼로그 열림", 60);
+    await this._debugShot("dialog_opened");
+
+    // ── Step 5. Export 포맷(Template|Formatted) 선택 → Export ────────────────────
+    // 기본 선택은 보통 Template 이라, Formatted 같은 비-기본 옵션은 "확실히" 선택되도록
+    // (클릭 → 선택 여부 검증 → 재시도)한다. (best-effort 로만 클릭하면 기본값으로 export됨)
+    const fmt = this.exportFormat;                    // "Template" | "Formatted"
+    this.emit("navigating", `${fmt} 옵션 선택 중…`, 65);
+
+    // 라벨 텍스트가 정확히 fmt 인 옵션의 선택 상태 확인
+    const isFmtSelected = (): Promise<boolean> =>
+      this.page.evaluate((label) => {
+        const norm = (s: string) => (s ?? "").trim().toLowerCase();
+        const nodes = Array.from(document.querySelectorAll<HTMLElement>(
+          "label, [role='radio'], [class*='radio'], [class*='option'], span, div, li"
+        ));
+        for (const n of nodes) {
+          if (norm(n.textContent ?? "") !== norm(label)) continue;
+          const input = (n.querySelector("input[type='radio']") as HTMLInputElement | null)
+            ?? ((n as HTMLLabelElement).control as HTMLInputElement | null ?? null);
+          if (input && input.type === "radio") return input.checked;
+          const ariaEl = n.getAttribute("role") === "radio" ? n : n.closest("[role='radio']");
+          if (ariaEl) return ariaEl.getAttribute("aria-checked") === "true";
+          if (/selected|checked|active/i.test(typeof n.className === "string" ? n.className : "")) return true;
+        }
+        return false;
+      }, fmt).catch(() => false);
+
+    // fmt 라벨 요소를 태깅 후 실제 Playwright 클릭 (합성 이벤트 미반응 대비)
+    const clickFmt = async (): Promise<void> => {
+      const tagged = await this.page.evaluate((label) => {
+        const norm = (s: string) => (s ?? "").trim().toLowerCase();
+        const cands = Array.from(document.querySelectorAll<HTMLElement>(
+          "label, [role='radio'], [class*='radio'], [class*='option'], span, div, li"
+        )).filter((el) => norm(el.textContent ?? "") === norm(label) && el.offsetParent !== null);
+        if (cands.length === 0) return false;
+        cands.sort((a, b) => (a.textContent?.length ?? 0) - (b.textContent?.length ?? 0));
+        document.querySelectorAll("[data-omc-fmt]").forEach((x) => x.removeAttribute("data-omc-fmt"));
+        cands[0].setAttribute("data-omc-fmt", "1");
+        return true;
+      }, fmt).catch(() => false);
+      if (tagged) {
+        await this.page.locator('[data-omc-fmt="1"]').first().click({ timeout: 4_000 }).catch(() => {});
+      } else {
+        await this.page.getByText(fmt, { exact: true }).first().click({ timeout: 4_000 }).catch(() => {});
+      }
+    };
+
+    let fmtOk = await isFmtSelected();
+    for (let i = 0; i < 5 && !fmtOk; i++) {
+      await clickFmt();
+      await this.page.waitForTimeout(500);
+      fmtOk = await isFmtSelected();
+    }
+    this.emit("navigating", fmtOk ? `${fmt} 선택 확인됨` : `${fmt} 선택 미확인 — 계속 진행`, 67);
+    await this._debugShot("format_selected");
+
+    this.emit("navigating", "Export 버튼 클릭…", 70);
+    let exportBtnClicked = false;
+    const exportBtnDeadline = Date.now() + 30_000; // 다이얼로그 렌더 대비 최대 30초 재시도
+    while (Date.now() < exportBtnDeadline && !exportBtnClicked) {
+      if (await this._clickExportButton()) { exportBtnClicked = true; break; }
+      await this.page.waitForTimeout(1_500);
+    }
+    if (!exportBtnClicked) {
+      const debugPath = `${this.downloadDir}/debug_exportbtn_${Date.now()}.png`;
+      await this.page.screenshot({ path: debugPath, fullPage: false }).catch(() => {});
+      throw new Error(
+        `'Excel Export Options' 팝업의 Export 버튼을 찾을 수 없습니다. 스크린샷: ${debugPath}\n` +
+        `페이지 텍스트(일부): ${(await this.page.innerText("body").catch(() => "")).slice(0, 300)}`
+      );
+    }
+
+    // ── Step 6. 다운로드 대기 + 변환 진행 표시 ──────────────────────────────────
+    // ★ 중요: 다운로드 이벤트는 "변환 완료 시점"(=팝업이 사라지는 순간)에 발생한다.
+    //   팝업이 사라진 뒤에 리스너를 걸면 그 이벤트를 놓쳐 타임아웃→재시도되므로,
+    //   변환 대기 "이전에" 다운로드 리스너(Promise)를 먼저 등록해 둔다.
+    this.emit("downloading", "Excel 변환 중… 완료될 때까지 대기합니다.", 75);
+    const downloadPromise = this.page.waitForEvent("download", { timeout: 600_000 }); // 최대 10분
+
+    await this.page.waitForTimeout(2_000);
+    await this._debugShot("converting");
+
+    // 변환 팝업이 사라질 때까지 대기(진행 표시용) — 실패해도 무시(실제 신호는 download)
+    await this.page.waitForSelector("text=Converting Data to Excel Format", {
+      state:   "detached",
+      timeout: 600_000,
+    }).catch(() => {});
+
+    // ── Step 7. 파일 다운로드 ────────────────────────────────────────────────────
+    this.emit("downloading", "파일 다운로드 대기 중…", 85);
+    const download = await downloadPromise;
+
+    // 보고서/화면은 UPLOAD_DIR/{jobId}/uploads/<savedFilename> 경로의 파일을 사용한다.
+    // downloadDir 은 UPLOAD_DIR/{jobId} 이므로 반드시 그 하위 uploads/ 폴더에 저장한다.
+    const filename   = this.savedFilename;
+    const uploadsDir = path.join(this.downloadDir, "uploads");
+    fs.mkdirSync(uploadsDir, { recursive: true });
+    const savedPath  = path.join(uploadsDir, filename);
+    await download.saveAs(savedPath);
+
+    this.emit("downloading", `다운로드 완료 → uploads/${filename}`, 95);
+    return [savedPath];
+  }
+}

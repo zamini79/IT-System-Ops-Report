@@ -1198,6 +1198,295 @@ ${scriptTag}
   }
 }
 
+// ── GCP 보고서용 월별 막대 차트 (PerfStats/Quality/Training Formatted export) ────
+// Formatted export 는 "Created Date (Month): YYYY Mon" 그룹 행에 월별 집계를 담는다:
+//   PerfStats : B=Active User 평균, D=Unique Login 평균, E=Doc Count 평균
+//   Quality   : E=월별 Quality Event 건수
+//   Training  : D=월별 건수
+
+const GCP_MONTH_ABBR: Record<string, number> = {
+  jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6,
+  jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12,
+};
+
+/** "Created Date (Month): YYYY Mon" 그룹 행에서 (YYYY-MM → 값) 추출 */
+function parseGcpMonthGroups(xlsxPath: string, valueColIndex: number): Record<string, number> {
+  const out: Record<string, number> = {};
+  try {
+    const wb   = XLSX.readFile(xlsxPath);
+    const rows = XLSX.utils.sheet_to_json<unknown[]>(
+      wb.Sheets[wb.SheetNames[0]], { header: 1, defval: "" }
+    ) as unknown[][];
+    for (const r of rows) {
+      const a = String(r[0] ?? "");
+      const m = a.match(/^Created Date \(Month\):\s*(\d{4})\s+([A-Za-z]{3})/);
+      if (!m) continue;                       // "All Created Date …" 등 제외
+      const mon = GCP_MONTH_ABBR[m[2].toLowerCase()];
+      if (!mon) continue;
+      out[`${m[1]}-${String(mon).padStart(2, "0")}`] = Number(r[valueColIndex]) || 0;
+    }
+  } catch (e) {
+    logger.warn(`[DEV Report] GCP 월별 파싱 실패 (${path.basename(xlsxPath)}): ${(e as Error).message}`);
+  }
+  return out;
+}
+
+/** 월별 막대 차트 PNG (값 라벨 표시) */
+async function renderGcpBarToPng(
+  labels: string[], values: number[], color: string, outputPng: string,
+): Promise<void> {
+  const chartJs   = loadChartJsScript();
+  const scriptTag = chartJs
+    ? `<script>${chartJs}</script>`
+    : `<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>`;
+  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+    *{margin:0;padding:0;box-sizing:border-box;} body{background:#fff;font-family:"Malgun Gothic",Arial,sans-serif;}
+    #c{width:440px;height:300px;background:#fff;}
+  </style></head><body><div id="c"><canvas id="ch" width="440" height="300"></canvas></div>
+  ${scriptTag}<script>(function(){
+    var ctx=document.getElementById('ch').getContext('2d');
+    if(!window.Chart){ctx.fillText('Chart.js load fail',10,30);return;}
+    var vals=${JSON.stringify(values)};
+    Chart.register({id:'vl',afterDatasetsDraw:function(chart){
+      var c=chart.ctx,meta=chart.getDatasetMeta(0);
+      meta.data.forEach(function(bar,i){c.save();c.fillStyle='#374151';c.font='bold 12px Arial';c.textAlign='center';c.textBaseline='bottom';c.fillText(Number(vals[i]).toLocaleString(),bar.x,bar.y-4);c.restore();});
+    }});
+    new Chart(ctx,{type:'bar',data:{labels:${JSON.stringify(labels)},datasets:[{data:vals,backgroundColor:'${color}',borderRadius:4,maxBarThickness:70}]},
+      options:{responsive:false,animation:false,layout:{padding:{top:24,bottom:4,left:4,right:4}},
+        scales:{y:{beginAtZero:true,grace:'15%',ticks:{font:{size:11}}},x:{ticks:{font:{size:13}}}},
+        plugins:{legend:{display:false},tooltip:{enabled:false}}}});
+  })();</script></body></html>`;
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.setViewportSize({ width: 440, height: 300 });
+    await page.setContent(html, { waitUntil: "networkidle", timeout: 30_000 });
+    await page.waitForTimeout(350);
+    await page.locator("#c").screenshot({ path: outputPng, type: "png" });
+  } finally {
+    await browser.close();
+  }
+}
+
+/** Quality 의 월 그룹 안 "Quality Event Type: <Type> (N)" 소계 → 월×타입 건수 */
+function parseGcpQualityByType(
+  xlsxPath: string,
+): { types: string[]; byMonth: Record<string, Record<string, number>> } {
+  const byMonth: Record<string, Record<string, number>> = {};
+  const types: string[] = [];
+  try {
+    const wb   = XLSX.readFile(xlsxPath);
+    const rows = XLSX.utils.sheet_to_json<unknown[]>(
+      wb.Sheets[wb.SheetNames[0]], { header: 1, defval: "" }
+    ) as unknown[][];
+    let cur: string | null = null;
+    for (const r of rows) {
+      const a = String(r[0] ?? "");
+      let m = a.match(/^Created Date \(Month\):\s*(\d{4})\s+([A-Za-z]{3})/);
+      if (m) {
+        const mon = GCP_MONTH_ABBR[m[2].toLowerCase()];
+        cur = mon ? `${m[1]}-${String(mon).padStart(2, "0")}` : null;
+        if (cur) byMonth[cur] = byMonth[cur] ?? {};
+        continue;
+      }
+      m = a.match(/^Quality Event Type:\s*(.+?)\s*(?:\(\d+\))?\s*$/);
+      if (m && cur) {
+        const t = m[1].trim();
+        if (!types.includes(t)) types.push(t);
+        byMonth[cur][t] = Number(r[4]) || 0;
+      }
+    }
+  } catch (e) {
+    logger.warn(`[DEV Report] GCP Quality 세분화 파싱 실패: ${(e as Error).message}`);
+  }
+  return { types, byMonth };
+}
+
+/** 다중 시리즈(그룹) 막대 차트 PNG — 범례 + 각 막대 값 라벨 */
+async function renderGcpGroupedBarToPng(
+  labels: string[],
+  series: { name: string; color: string; values: number[] }[],
+  outputPng: string,
+): Promise<void> {
+  const chartJs   = loadChartJsScript();
+  const scriptTag = chartJs
+    ? `<script>${chartJs}</script>`
+    : `<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>`;
+  const datasets = series.map((s) => ({
+    label: s.name, data: s.values, backgroundColor: s.color, borderRadius: 4, maxBarThickness: 46,
+  }));
+  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+    *{margin:0;padding:0;box-sizing:border-box;} body{background:#fff;font-family:"Malgun Gothic",Arial,sans-serif;}
+    #c{width:440px;height:300px;background:#fff;}
+  </style></head><body><div id="c"><canvas id="ch" width="440" height="300"></canvas></div>
+  ${scriptTag}<script>(function(){
+    var ctx=document.getElementById('ch').getContext('2d');
+    if(!window.Chart){ctx.fillText('Chart.js load fail',10,30);return;}
+    Chart.register({id:'vl',afterDatasetsDraw:function(chart){
+      var c=chart.ctx;
+      chart.data.datasets.forEach(function(ds,di){
+        var meta=chart.getDatasetMeta(di);
+        meta.data.forEach(function(bar,i){var v=ds.data[i]; if(!v)return; c.save();c.fillStyle='#374151';c.font='bold 11px Arial';c.textAlign='center';c.textBaseline='bottom';c.fillText(Number(v).toLocaleString(),bar.x,bar.y-3);c.restore();});
+      });
+    }});
+    new Chart(ctx,{type:'bar',data:{labels:${JSON.stringify(labels)},datasets:${JSON.stringify(datasets)}},
+      options:{responsive:false,animation:false,layout:{padding:{top:20,bottom:2,left:4,right:4}},
+        scales:{y:{beginAtZero:true,grace:'15%',ticks:{font:{size:11},precision:0}},x:{ticks:{font:{size:13}}}},
+        plugins:{legend:{display:true,position:'top',labels:{font:{size:11},boxWidth:12}},tooltip:{enabled:false}}}});
+  })();</script></body></html>`;
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.setViewportSize({ width: 440, height: 300 });
+    await page.setContent(html, { waitUntil: "networkidle", timeout: 30_000 });
+    await page.waitForTimeout(350);
+    await page.locator("#c").screenshot({ path: outputPng, type: "png" });
+  } finally {
+    await browser.close();
+  }
+}
+
+export interface GcpBarCharts {
+  docCount:    string | null;
+  activeUser:  string | null;
+  uniqueLogin: string | null;
+  quality:     string | null;
+  training:    string | null;
+  msgs: { doc: string; user: string; login: string; quality: string; training: string };
+  insight: string[];
+}
+
+/** GCP_PerfStats/Quality/Training.xlsx → 월별 막대 차트 5종 (없으면 null) */
+async function buildGcpBarCharts(uploadPath: string): Promise<GcpBarCharts | null> {
+  const perf  = path.join(uploadPath, "GCP_PerfStats.xlsx");
+  const qual  = path.join(uploadPath, "GCP_Quality.xlsx");
+  const train = path.join(uploadPath, "GCP_Training.xlsx");
+  if (!fs.existsSync(perf) && !fs.existsSync(qual) && !fs.existsSync(train)) return null;
+
+  const doc   = fs.existsSync(perf)  ? parseGcpMonthGroups(perf, 4)  : {}; // E Doc Count 평균
+  const user  = fs.existsSync(perf)  ? parseGcpMonthGroups(perf, 1)  : {}; // B Active User 평균
+  const login = fs.existsSync(perf)  ? parseGcpMonthGroups(perf, 3)  : {}; // D Unique Login 평균
+  const qty   = fs.existsSync(qual)  ? parseGcpMonthGroups(qual, 4)  : {}; // E Quality Event 건수
+  const trn   = fs.existsSync(train) ? parseGcpMonthGroups(train, 3) : {}; // D Training 건수
+
+  // 공통 월 축 = 전 시리즈 월 합집합 정렬 후 최근 3개월
+  const monthsSet = new Set<string>([
+    ...Object.keys(doc), ...Object.keys(user), ...Object.keys(login),
+    ...Object.keys(qty), ...Object.keys(trn),
+  ]);
+  const months = [...monthsSet].sort().slice(-3);
+  if (months.length === 0) return null;
+  const labels  = months.map((ym) => `${parseInt(ym.slice(5, 7), 10)}월`);
+  const series  = (m: Record<string, number>) => months.map((ym) => Math.round(m[ym] ?? 0));
+
+  const render = async (vals: number[], color: string, name: string): Promise<string | null> => {
+    if (vals.every((v) => v === 0)) return null;
+    try {
+      const p = path.join(uploadPath, `gcp_bar_${name}_${Date.now()}.png`);
+      await renderGcpBarToPng(labels, vals, color, p);
+      return fs.readFileSync(p).toString("base64");
+    } catch (e) {
+      logger.warn(`[DEV Report] GCP bar(${name}) 생성 실패: ${(e as Error).message}`);
+      return null;
+    }
+  };
+
+  const docV = series(doc), userV = series(user), loginV = series(login),
+        qtyV = series(qty), trnV = series(trn);
+
+  const docCount    = await render(docV,   "#4472C4", "doc");
+  const activeUser  = await render(userV,  "#5B9BD5", "user");
+  const uniqueLogin = await render(loginV, "#70AD47", "login");
+  const training    = await render(trnV,   "#FFC000", "training");
+
+  // 품질: 월별 × Quality Event Type(Deviation/Finding …) 세분화 — 그룹 막대
+  const qt = fs.existsSync(qual) ? parseGcpQualityByType(qual) : { types: [], byMonth: {} };
+  let quality: string | null = null;
+  if (qt.types.length > 0) {
+    const palette = ["#ED7D31", "#4472C4", "#70AD47", "#FFC000", "#A5A5A5"];
+    const qSeries = qt.types.map((t, i) => ({
+      name:   t,
+      color:  palette[i % palette.length],
+      values: months.map((ym) => Math.round(qt.byMonth[ym]?.[t] ?? 0)),
+    }));
+    if (qSeries.some((s) => s.values.some((v) => v > 0))) {
+      try {
+        const p = path.join(uploadPath, `gcp_bar_quality_${Date.now()}.png`);
+        await renderGcpGroupedBarToPng(labels, qSeries, p);
+        quality = fs.readFileSync(p).toString("base64");
+      } catch (e) {
+        logger.warn(`[DEV Report] GCP bar(quality) 생성 실패: ${(e as Error).message}`);
+      }
+    }
+  }
+
+  const last = (a: number[]) => a[a.length - 1] ?? 0;
+  const sum  = (a: number[]) => a.reduce((s, v) => s + v, 0);
+  const lm   = labels[labels.length - 1] ?? "";
+  const msgs = {
+    doc:      `${lm} 평균 약 <strong>${last(docV).toLocaleString()}</strong>건 문서 관리 중`,
+    user:     `${lm} 평균 등록 사용자 약 <strong>${last(userV).toLocaleString()}</strong>명`,
+    login:    `${lm} 일평균 접속 약 <strong>${last(loginV).toLocaleString()}</strong>명`,
+    quality:  `최근 3개월 품질 이벤트 총 <strong>${sum(qtyV).toLocaleString()}</strong>건`,
+    training: `최근 3개월 교육 실행 총 <strong>${sum(trnV).toLocaleString()}</strong>건`,
+  };
+
+  const insight = buildGcpInsightLines({ labels, months, docV, userV, loginV, qtyV, trnV, qt });
+
+  logger.info(`[DEV Report] GCP 막대차트 — 월:${months.join(",")} doc:${docV} user:${userV} login:${loginV} qty:${qtyV} trn:${trnV}`);
+  return { docCount, activeUser, uniqueLogin, quality, training, msgs, insight };
+}
+
+/** GCP 데이터 인사이트(ELN 컨셉) — 연결어미로 잇고 마지막만 종결형 */
+function buildGcpInsightLines(a: {
+  labels: string[]; months: string[];
+  docV: number[]; userV: number[]; loginV: number[]; qtyV: number[]; trnV: number[];
+  qt: { types: string[]; byMonth: Record<string, Record<string, number>> };
+}): string[] {
+  const { labels, months, docV, userV, loginV, qtyV, trnV, qt } = a;
+  const fmt   = (n: number) => Math.round(n).toLocaleString();
+  const first = (x: number[]) => x[0] ?? 0;
+  const last  = (x: number[]) => x[x.length - 1] ?? 0;
+  const sum   = (x: number[]) => x.reduce((s, v) => s + v, 0);
+  const nz    = (x: number[]) => { const f = x.filter((v) => v > 0); return f.length ? [Math.min(...f), Math.max(...f)] as const : [0, 0] as const; };
+  const tword = (x: number[]) => last(x) > first(x) ? "증가" : last(x) < first(x) ? "감소" : "유지";
+  const range = labels.length ? `${labels[0]}~${labels[labels.length - 1]}` : "";
+  const lines: string[] = [];
+
+  if (docV.some((v) => v > 0)) {
+    lines.push(`최근 3개월(${range}) 개발본부 GCP Quality System의 문서 수는 월평균 ${fmt(first(docV))}→${fmt(last(docV))}건으로 ${tword(docV)} 흐름을 보였으며,`);
+  }
+  const [uMin, uMax] = nz(userV);
+  const [lMin, lMax] = nz(loginV);
+  const uStr = uMin === uMax ? `약 ${fmt(uMax)}명` : `약 ${fmt(uMin)}~${fmt(uMax)}명`;
+  const lStr = lMin === lMax ? `약 ${fmt(lMax)}명` : `약 ${fmt(lMin)}~${fmt(lMax)}명`;
+  lines.push(`활성 사용자는 ${uStr}, 일일 평균 접속은 ${lStr} 수준을 유지했고,`);
+
+  const qTotal = sum(qtyV);
+  if (qTotal > 0) {
+    let maxI = 0; qtyV.forEach((v, i) => { if (v > qtyV[maxI]) maxI = i; });
+    const typeStr = qt.types
+      .map((t) => `${t} ${fmt(months.reduce((s, ym) => s + (qt.byMonth[ym]?.[t] ?? 0), 0))}건`)
+      .join("·");
+    const perMonth = labels.map((l, i) => `${l} ${qtyV[i]}건`).join(", ");
+    lines.push(`품질 이벤트는 ${perMonth}으로 ${labels[maxI] ?? ""}에 가장 많았고(전체 ${qTotal}건${typeStr ? `, ${typeStr}` : ""}),`);
+  }
+  if (trnV.some((v) => v > 0)) {
+    const months2 = labels.map((l, i) => ({ l, v: trnV[i] })).filter((x) => x.v > 0);
+    lines.push(`교육 실행은 ${months2.map((x) => `${x.l} ${fmt(x.v)}건`).join(", ")}으로 집계되었습니다.`);
+  }
+
+  // 마지막 줄이 연결어미로 끝나면 종결형으로 마무리
+  if (lines.length) {
+    const i = lines.length - 1;
+    lines[i] = lines[i]
+      .replace(/보였으며,$/, "보였습니다.")
+      .replace(/유지했고,$/, "유지했습니다.")
+      .replace(/많았고\(([^)]*)\),$/, "많았습니다($1).");
+  }
+  return lines;
+}
+
 // ── PDF HTML 빌드 ─────────────────────────────────────────────────────────────
 
 function buildDevReportHtml(
@@ -1211,6 +1500,7 @@ function buildDevReportHtml(
   msBarCharts?:      Map<string, string | null>,
   gcpStats?:         GcpStats | null,
   medcommsStats?:    MedcommsStats | null,
+  gcpBar?:           GcpBarCharts | null,        // GCP 보고서용 월별 막대 차트 5종
 ): string {
   const today      = new Date().toLocaleDateString("ko-KR", {
     year: "numeric", month: "long", day: "numeric",
@@ -1288,16 +1578,43 @@ function buildDevReportHtml(
       : "",
   };
 
-  const gcpCells = [
-    makeCell(1, GCP_CHART_TITLES[0], donutImg, gcpCellMsgs[1]),
-    ...gcpCharts.slice(1, 6).map((img, i) =>
-      makeCell(i + 2, GCP_CHART_TITLES[i + 1] ?? `차트 ${i + 2}`, img, gcpCellMsgs[i + 2] || undefined)
-    ),
+  // 새 차트 순서: 1 업무활용(도넛) · 2 문서관리 · 3 사용자등록 · 4 일일사용 · 5 품질관리 · 6 교육관리
+  const NEW_GCP_TITLES = [
+    "업무 활용 현황", "문서관리현황", "사용자 등록 현황",
+    "일일 사용 현황", "품질 관리 현황", "교육 관리 현황",
   ];
+  const bar = (b64: string | null | undefined) =>
+    b64 ? { base64: b64, mime: "image/png" as const } : null;
 
-  const gcpGrid = `<div class="usage-grid grid-3row-md">
+  const gcpCells = gcpBar
+    ? [
+        makeCell(1, NEW_GCP_TITLES[0], donutImg,              gcpCellMsgs[1]),
+        makeCell(2, NEW_GCP_TITLES[1], bar(gcpBar.docCount),    gcpBar.msgs.doc),
+        makeCell(3, NEW_GCP_TITLES[2], bar(gcpBar.activeUser),  gcpBar.msgs.user),
+        makeCell(4, NEW_GCP_TITLES[3], bar(gcpBar.uniqueLogin), gcpBar.msgs.login),
+        makeCell(5, NEW_GCP_TITLES[4], bar(gcpBar.quality),     gcpBar.msgs.quality),
+        makeCell(6, NEW_GCP_TITLES[5], bar(gcpBar.training),    gcpBar.msgs.training),
+      ]
+    : [
+        // GCP 데이터 미수집 시 기존 분할 이미지 방식으로 폴백
+        makeCell(1, GCP_CHART_TITLES[0], donutImg, gcpCellMsgs[1]),
+        ...gcpCharts.slice(1, 6).map((img, i) =>
+          makeCell(i + 2, GCP_CHART_TITLES[i + 1] ?? `차트 ${i + 2}`, img, gcpCellMsgs[i + 2] || undefined)
+        ),
+      ];
+
+  // 인사이트가 들어가면 한 페이지에 맞도록 행 높이를 줄인다(grid-3row-gcp).
+  const gcpGrid = `<div class="usage-grid ${gcpBar ? "grid-3row-gcp" : "grid-3row-md"}">
     ${gcpCells.join("\n")}
   </div>`;
+
+  // GCP 데이터 인사이트 (ELN 컨셉) — 그리드 하단
+  const gcpInsightHtml = (gcpBar && gcpBar.insight.length > 0)
+    ? `<div class="gcp-insight">
+        <div class="gcp-insight-label">데이터 인사이트 (최근 3개월 분석)</div>
+        ${gcpBar.insight.map((l) => `<p>${l}</p>`).join("")}
+      </div>`
+    : "";
 
   // ── Page 2: Medcomms 6개 그리드 ─────────────────────────────────────────────
   logger.info(`[HTML] buildDevReportHtml 진입 — medcommsStats.uniqueLogin=${medcommsStats?.uniqueLogin ?? "null"}`);
@@ -1493,6 +1810,20 @@ function buildDevReportHtml(
     .grid-3row    { grid-template-rows:repeat(3,230px); }
     .grid-3row-md { grid-template-rows:repeat(3,265px); }
     .grid-3row-lg { grid-template-rows:repeat(3,285px); }
+    /* GCP: 인사이트 포함 한 페이지 — 행 높이 축소 */
+    .grid-3row-gcp { grid-template-rows:repeat(3,210px); }
+
+    /* GCP 데이터 인사이트 (ELN 컨셉) */
+    .gcp-insight {
+      margin-top:10px; padding:9px 14px; background:#f0fdf4;
+      border-left:4px solid #16a34a; border-radius:0 4px 4px 0;
+      font-size:10.5px; line-height:1.65; color:#374151;
+    }
+    .gcp-insight .gcp-insight-label {
+      font-weight:700; color:#15803d; font-size:11px; margin-bottom:4px;
+    }
+    .gcp-insight p { margin:0 0 3px; }
+    .gcp-insight p:last-child { margin-bottom:0; }
 
     .usage-cell {
       border:1px solid #e5e7eb; border-radius:6px; overflow:hidden;
@@ -1593,6 +1924,7 @@ function buildDevReportHtml(
     </div>
     ${devHeadlineHtml}
     ${gcpGrid}
+    ${gcpInsightHtml}
     <div class="footer">
       <span>SK Bioscience 개발본부 — 시스템 운영 현황</span>
       <span>${titleDate}</span>
@@ -1822,11 +2154,20 @@ export async function generateDevReport(jobId: string): Promise<DevReportResult>
     msData = null;
   }
 
+  // 2.5) GCP 보고서용 월별 막대 차트 5종 (PerfStats/Quality/Training Formatted export)
+  let gcpBar: GcpBarCharts | null = null;
+  try {
+    gcpBar = await buildGcpBarCharts(uploadPath);
+    logger.info(`[DEV Report] GCP 막대차트: ${gcpBar ? "생성됨" : "데이터 없음(폴백)"}`);
+  } catch (e) {
+    logger.warn(`[DEV Report] GCP 막대차트 생성 실패 (무시): ${(e as Error).message}`);
+  }
+
   // 3) HTML → PDF 생성
   logger.info(`[DEV Report] ── buildDevReportHtml 호출 직전 ── medcommsStats=${JSON.stringify(medcommsStats)}`);
   const { year, month } = getLastMonth();
   const titleDate  = `${year}년 ${String(month).padStart(2, "0")}월`;
-  const html       = buildDevReportHtml(titleDate, gcpDonutBase64, gcpCounts, gcpCharts, medcommsCharts, ctmsCharts, msData, msBarCharts, gcpStats, medcommsStats);
+  const html       = buildDevReportHtml(titleDate, gcpDonutBase64, gcpCounts, gcpCharts, medcommsCharts, ctmsCharts, msData, msBarCharts, gcpStats, medcommsStats, gcpBar);
   const outputDir  = path.resolve(process.env.OUTPUT_DIR ?? "outputs");
   fs.mkdirSync(outputDir, { recursive: true });
 

@@ -212,6 +212,8 @@ function SystemCard({
   dashboardCapturing,
   dashboardTask,
   dashboardSavedFile,
+  onDataCollect,
+  dataCollecting,
 }: {
   config:       SystemConfig;
   task:         TaskState;
@@ -225,6 +227,9 @@ function SystemCard({
   dashboardTask?:       TaskState | null;
   /** 이전에 캡처되어 저장된 대시보드 이미지 (파일 목록 기반, 새로고침 후에도 유지) */
   dashboardSavedFile?:  { name: string; url: string; updatedAt: string } | null;
+  /** GCP 전용: 보고서용 리포트 3종 Excel 수집 버튼 */
+  onDataCollect?:       () => void;
+  dataCollecting?:      boolean;
 }) {
   const icon = SYSTEM_ICONS[config.code] ?? DEFAULT_ICON;
 
@@ -298,6 +303,35 @@ function SystemCard({
                       d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" />
                   </svg>
                   대시보드 캡처
+                </>
+              )}
+            </button>
+          )}
+          {onDataCollect && (
+            <button
+              onClick={onDataCollect}
+              disabled={dataCollecting}
+              title="GCP 보고서용 리포트 3종(문서/사용자/품질/교육 등)을 Excel 로 수집합니다"
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all border
+                ${dataCollecting
+                  ? "bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed"
+                  : "bg-sky-50 text-sky-700 border-sky-300 hover:bg-sky-100 shadow-sm"}`}
+            >
+              {dataCollecting ? (
+                <>
+                  <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+                  </svg>
+                  수집 중
+                </>
+              ) : (
+                <>
+                  <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                      d="M4 7v10c0 2 1.5 3 4 3h8c2.5 0 4-1 4-3V7c0-2-1.5-3-4-3H8c-2.5 0-4 1-4 3z M4 7c0 2 1.5 3 4 3h8c2.5 0 4-1 4-3" />
+                  </svg>
+                  GCP 데이터 수집
                 </>
               )}
             </button>
@@ -1576,6 +1610,10 @@ export function DivisionReportPage({
   const [gcpActivityExporting, setGcpActivityExporting] = useState(false);
   const [gcpActivityActive,    setGcpActivityActive]    = useState(false);
 
+  // ── DEV GCP 전용: 보고서 데이터 수집(3개 리포트 Excel) 상태 ────────────────────
+  const [gcpDataCollecting, setGcpDataCollecting] = useState(false);
+  const [gcpDataActive,     setGcpDataActive]     = useState(false);
+
   // ── DEV Medcomms 전용: 대시보드 캡처 상태 ─────────────────────────────────────
   const [medcommsDashboardCapturing, setMedcommsDashboardCapturing] = useState(false);
   const [medcommsDashboardActive,    setMedcommsDashboardActive]    = useState(false);
@@ -1590,7 +1628,7 @@ export function DivisionReportPage({
 
   // ── SSE ──────────────────────────────────────────────────────────────────────
   const systemCodes = systems.map((s) => s.code);
-  const sse = useCrawlSSE(jobId, systemCodes, crawlActive || dashboardActive || gcpDashboardActive || gcpActivityActive || medcommsDashboardActive || clinicalDashboardActive || bioRdDashboardActive);
+  const sse = useCrawlSSE(jobId, systemCodes, crawlActive || dashboardActive || gcpDashboardActive || gcpActivityActive || gcpDataActive || medcommsDashboardActive || clinicalDashboardActive || bioRdDashboardActive);
 
   // ── 로컬 진행 로그 (업로드·PDF생성 이벤트) ────────────────────────────────────
   const [localLogs, setLocalLogs] = useState<LogEntry[]>([]);
@@ -1722,6 +1760,29 @@ export function DivisionReportPage({
       setGcpActivityActive(false);
     }
   }, [gcpActivityExporting, addLocalLog, jobId, user, toastError]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── DEV GCP 전용: 보고서 데이터 수집 (3개 리포트 Excel export) ──────────────────
+  const handleGcpDataCollect = useCallback(async () => {
+    if (gcpDataCollecting) return;
+    sse.resetTask("GCP_DATA");
+    setGcpDataCollecting(true);
+    setGcpDataActive(true);
+    addLocalLog("GCP Data", "GCP 보고서 데이터 수집 시작 (3개 리포트 export…)", "info");
+    try {
+      await apiClient.post("/crawl/gcp-data", {
+        jobId,
+        userId: user?.id,
+      });
+    } catch (err: unknown) {
+      const msg =
+        (err as { response?: { data?: { error?: string } } })
+          ?.response?.data?.error ?? "GCP 데이터 수집 요청에 실패했습니다.";
+      toastError(msg);
+      addLocalLog("GCP Data", `수집 요청 실패: ${msg}`, "error");
+      setGcpDataCollecting(false);
+      setGcpDataActive(false);
+    }
+  }, [gcpDataCollecting, addLocalLog, jobId, user, toastError]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── DEV Medcomms 전용: Medcomms 대시보드 캡처 ─────────────────────────────────
   const handleMedcommsDashboardCapture = useCallback(async () => {
@@ -1859,6 +1920,22 @@ export function DivisionReportPage({
       }
     }
   }, [sse.taskMap, gcpActivityExporting, addLocalLog, refetchDevFiles]);
+
+  // GCP_DATA(보고서 데이터 수집) 완료/실패 시 상태 해제 + 파일 목록 즉시 갱신
+  useEffect(() => {
+    if (!gcpDataCollecting) return;
+    const dataTask = sse.taskMap["GCP_DATA"];
+    if (dataTask?.status === "COMPLETED" || dataTask?.status === "FAILED") {
+      setGcpDataCollecting(false);
+      setGcpDataActive(false);
+      if (dataTask.status === "COMPLETED") {
+        addLocalLog("GCP Data", "데이터 수집 완료 — GCP_PerfStats/Quality/Training.xlsx 저장됨.", "success");
+        void refetchDevFiles();
+      } else {
+        addLocalLog("GCP Data", `데이터 수집 실패: ${dataTask.error ?? ""}`, "error");
+      }
+    }
+  }, [sse.taskMap, gcpDataCollecting, addLocalLog, refetchDevFiles]);
 
   // MEDCOMMS_DASHBOARD 태스크 완료/실패 시 상태 해제 + 파일 목록 즉시 갱신
   useEffect(() => {
@@ -2293,6 +2370,12 @@ export function DivisionReportPage({
                     undefined
                   }
                   dashboardSavedFile={dashboardSavedFor(sys.code)}
+                  onDataCollect={
+                    (divisionCode === "DEV" && sys.code === "GCP_QUALITY") ? handleGcpDataCollect : undefined
+                  }
+                  dataCollecting={
+                    (divisionCode === "DEV" && sys.code === "GCP_QUALITY") ? gcpDataCollecting : undefined
+                  }
                 />
               ))}
             </div>
