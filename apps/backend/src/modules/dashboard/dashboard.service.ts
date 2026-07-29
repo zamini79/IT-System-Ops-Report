@@ -70,7 +70,7 @@ export async function refreshSnapshot(
 
   await query(
     `INSERT INTO dashboard_snapshots (division_code, captured_date, data, sources)
-     VALUES ($1, $2, $3::jsonb, $4::jsonb)
+     VALUES ($1, $2, $3::json, $4::json)
      ON CONFLICT (division_code, captured_date) DO UPDATE
        SET data = EXCLUDED.data, sources = EXCLUDED.sources, updated_at = NOW()`,
     [divisionCode, capturedDate, JSON.stringify(payload), JSON.stringify(built.sources)]
@@ -223,7 +223,7 @@ export async function finishCollectionRun(
 ): Promise<void> {
   await query(
     `UPDATE collection_runs
-     SET status = $1, finished_at = NOW(), detail = $2::jsonb
+     SET status = $1, finished_at = NOW(), detail = $2::json
      WHERE id = $3`,
     [status, JSON.stringify(detail ?? {}), runId]
   ).catch((e: Error) =>

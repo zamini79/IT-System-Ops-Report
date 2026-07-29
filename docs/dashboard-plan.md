@@ -198,6 +198,24 @@ Veeva **Performance Statistics** 리포트에는 두 종류의 행이 섞여 있
 → 상태를 직접 쓰지 말고 **현재 본부에 존재하는 키인지 확인해 파생값(`activeMetric`)으로** 쓴다.
    본부별 선택 상태를 새로 추가할 때도 같은 방식을 따를 것.
 
+## DB 이식성 (사내 AWS + MariaDB 이관 대비)
+
+대시보드 테이블은 **`JSON`**(≠`JSONB`)을 쓴다. 문서를 통째로 저장·조회할 뿐
+jsonb 연산자(`@>` 등)나 GIN 인덱스를 쓰지 않으므로 기능 차이가 없고, MariaDB 에는
+JSONB 대응 타입이 없어 그대로 옮길 수 없기 때문이다. (pg 드라이버는 json/jsonb 모두
+JS 객체로 파싱하므로 애플리케이션 코드는 동일하다.)
+
+- 적용 컬럼: `dashboard_snapshots.data` · `dashboard_snapshots.sources` · `collection_runs.detail`
+- 이미 JSONB 로 만들어진 DB 는 `dashboard.jsonb_to_json` 마이그레이션이 변환한다(멱등).
+- **새 컬럼을 추가할 때도 `JSON` 을 쓸 것.**
+
+### 아직 JSONB 인 컬럼 (변환 보류)
+
+`divisions.system_configs` · `uploaded_files.analysis_result` 는 **GIN 인덱스**가 걸려 있고
+(`USING GIN`), GIN 은 `json` 에 만들 수 없다. `mail_recipient_groups.emails` 는 인덱스는
+없으나 관련 코드가 `jsonb_build_object` 를 쓴다(`admin.router.ts`, `screenshot-config.service.ts`).
+→ MariaDB 이관 시 이 3개는 인덱스 전략·해당 기능 코드와 함께 별도로 다뤄야 한다.
+
 ## 유지 사항 (회귀 금지)
 
 - 기존 PDF 생성 3종(`/report/generate-dev|lhouse|bio`) 및 History 저장

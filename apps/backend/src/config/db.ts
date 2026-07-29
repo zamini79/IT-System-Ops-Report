@@ -115,12 +115,15 @@ export async function runMigrations(): Promise<void> {
       // data:    차트 시리즈·KPI·인사이트 JSON
       // sources: 소스 파일별 상태(수집/업로드 시각, 성공 여부)
       name: "dashboard_snapshots.table",
+      // JSON(≠JSONB) 사용: 문서를 통째로 저장·조회할 뿐 jsonb 연산자·GIN 인덱스를 쓰지 않는다.
+      //   향후 MariaDB 이관 시 JSONB 는 대응 타입이 없어 그대로 옮길 수 없으므로,
+      //   양쪽에서 통용되는 JSON 으로 둔다. (pg 드라이버는 json/jsonb 모두 객체로 파싱)
       sql:  `CREATE TABLE IF NOT EXISTS dashboard_snapshots (
                id            UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
                division_code division_code NOT NULL,
                captured_date DATE          NOT NULL,
-               data          JSONB         NOT NULL,
-               sources       JSONB         NOT NULL DEFAULT '{}'::jsonb,
+               data          JSON          NOT NULL,
+               sources       JSON          NOT NULL DEFAULT '{}'::json,
                created_at    TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
                updated_at    TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
                CONSTRAINT uq_dashboard_snap_div_date UNIQUE (division_code, captured_date)
@@ -138,10 +141,40 @@ export async function runMigrations(): Promise<void> {
                status        VARCHAR(20)   NOT NULL,
                started_at    TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
                finished_at   TIMESTAMPTZ,
-               detail        JSONB         NOT NULL DEFAULT '{}'::jsonb
+               detail        JSON          NOT NULL DEFAULT '{}'::json
              );
              CREATE INDEX IF NOT EXISTS idx_collection_runs_div_started
                ON collection_runs(division_code, started_at DESC);`,
+    },
+    {
+      // 먼저 JSONB 로 만들어진 대시보드 테이블을 JSON 으로 전환 (MariaDB 이관 대비).
+      //   CREATE TABLE IF NOT EXISTS 는 기존 테이블을 바꾸지 않으므로 ALTER 가 필요하다.
+      //   이미 json 이면 건너뛰어(부팅마다 테이블 재작성되지 않게) 멱등적으로 동작한다.
+      name: "dashboard.jsonb_to_json",
+      sql:  `DO $$
+             DECLARE
+               t RECORD;
+             BEGIN
+               FOR t IN
+                 SELECT table_name, column_name
+                 FROM information_schema.columns
+                 WHERE table_schema = 'public'
+                   AND data_type = 'jsonb'
+                   AND (table_name, column_name) IN (
+                     ('dashboard_snapshots', 'data'),
+                     ('dashboard_snapshots', 'sources'),
+                     ('collection_runs',     'detail')
+                   )
+               LOOP
+                 EXECUTE format('ALTER TABLE %I ALTER COLUMN %I DROP DEFAULT', t.table_name, t.column_name);
+                 EXECUTE format('ALTER TABLE %I ALTER COLUMN %I TYPE JSON USING %I::text::json',
+                                t.table_name, t.column_name, t.column_name);
+                 IF t.column_name <> 'data' THEN
+                   EXECUTE format('ALTER TABLE %I ALTER COLUMN %I SET DEFAULT ''{}''::json',
+                                  t.table_name, t.column_name);
+                 END IF;
+               END LOOP;
+             END $$;`,
     },
   ];
 
