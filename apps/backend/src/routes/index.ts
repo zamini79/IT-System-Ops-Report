@@ -6,6 +6,7 @@ import { crawlRouter }  from "../modules/crawl/crawl.router";
 import { fileRouter }   from "../modules/file/file.router";
 import { mailRouter }   from "../modules/mail/mail.router";
 import { adminRouter }  from "../modules/admin/admin.router";
+import { dashboardRouter } from "../modules/dashboard/dashboard.router";
 
 export const router = Router();
 
@@ -17,6 +18,7 @@ router.use("/report", authGuard, reportRouter);
 router.use("/crawl",  authGuard, crawlRouter);
 router.use("/file",   authGuard, fileRouter);
 router.use("/mail",   authGuard, mailRouter);
+router.use("/dashboard", authGuard, dashboardRouter);
 
 // ── 관리자 전용 (authGuard + adminGuard) ─────────────────────────────────────
 router.use("/admin",  authGuard, adminGuard, adminRouter);

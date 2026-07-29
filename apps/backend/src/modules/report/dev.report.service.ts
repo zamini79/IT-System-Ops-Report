@@ -83,7 +83,7 @@ interface MedcommsStats {
   timeInReview: number;  // chart 6 OCR — Time in Review (해당 월)
 }
 
-interface MsChartRow {
+export interface MsChartRow {
   month:     string;  // e.g. "2026-03"
   possible:  number;  // B열 = 가능 MS
   used:      number;  // C열 = 사용 MS
@@ -101,13 +101,13 @@ interface MsTableRow {
   status:    string;
 }
 
-interface DevMsGroupData {
+export interface DevMsGroupData {
   groupName:  string;
   chartRows:  MsChartRow[];
   tableRows:  MsTableRow[];
 }
 
-interface DevMsTimesheetData {
+export interface DevMsTimesheetData {
   groups:      DevMsGroupData[];
   latestMonth: string;
   colHeaders:  string[];
@@ -138,7 +138,7 @@ function formatMonthKorean(yyyymm: string): string {
 
 // ── Activity.xlsx 도넛 차트 데이터 구조 ──────────────────────────────────────
 
-interface CategoryCounts {
+export interface CategoryCounts {
   labels: string[];   // D2, D3, D4 값 (e.g. eQMS / eDMS / eLMS)
   values: number[];   // 직접 계산한 카운트
   total:  number;
@@ -181,7 +181,7 @@ function lookupApprox(
  * XML 직접 파싱 → LOOKUP 근사 매칭으로 eQMS / eDMS / eLMS 건수 집계.
  * (LHOUSE의 readCategorySheet 와 동일한 방식)
  */
-function readGcpCategorySheet(xlsxPath: string): CategoryCounts {
+export function readGcpCategorySheet(xlsxPath: string): CategoryCounts {
   logger.info(`[DEV Report] Category 집계 시작: ${xlsxPath}`);
 
   const wb = XLSX.readFile(xlsxPath);
@@ -1003,7 +1003,7 @@ async function extractMedcommsReviewStats(imagePath: string): Promise<{ recordCo
  * SKB_Quallity_MS_Timesheet.xlsx 에서
  * SKB Clinical / SKB GCP / Medcomms 3개 그룹 데이터를 추출합니다.
  */
-function readDevMsTimesheetData(xlsxPath: string): DevMsTimesheetData {
+export function readDevMsTimesheetData(xlsxPath: string): DevMsTimesheetData {
   const wb = XLSX.readFile(xlsxPath);
 
   const monthSheets = wb.SheetNames
@@ -1210,7 +1210,7 @@ const GCP_MONTH_ABBR: Record<string, number> = {
 };
 
 /** "Created Date (Month): YYYY Mon" 그룹 행에서 (YYYY-MM → 값) 추출 */
-function parseGcpMonthGroups(xlsxPath: string, valueColIndex: number): Record<string, number> {
+export function parseGcpMonthGroups(xlsxPath: string, valueColIndex: number): Record<string, number> {
   const out: Record<string, number> = {};
   try {
     const wb   = XLSX.readFile(xlsxPath);
@@ -1232,7 +1232,7 @@ function parseGcpMonthGroups(xlsxPath: string, valueColIndex: number): Record<st
 }
 
 /** 월별 막대 차트 PNG (값 라벨 표시) */
-async function renderGcpBarToPng(
+export async function renderGcpBarToPng(
   labels: string[], values: number[], color: string, outputPng: string,
 ): Promise<void> {
   const chartJs   = loadChartJsScript();
@@ -1269,7 +1269,7 @@ async function renderGcpBarToPng(
 }
 
 /** Quality 의 월 그룹 안 "Quality Event Type: <Type> (N)" 소계 → 월×타입 건수 */
-function parseGcpQualityByType(
+export function parseGcpQualityByType(
   xlsxPath: string,
 ): { types: string[]; byMonth: Record<string, Record<string, number>> } {
   const byMonth: Record<string, Record<string, number>> = {};
@@ -1303,22 +1303,28 @@ function parseGcpQualityByType(
 }
 
 /** 다중 시리즈(그룹) 막대 차트 PNG — 범례 + 각 막대 값 라벨 */
-async function renderGcpGroupedBarToPng(
+export async function renderGcpGroupedBarToPng(
   labels: string[],
-  series: { name: string; color: string; values: number[] }[],
+  series: { name: string; color: string; values: number[]; axis?: "y" | "y1" }[],
   outputPng: string,
+  width = 440, height = 300,
 ): Promise<void> {
   const chartJs   = loadChartJsScript();
   const scriptTag = chartJs
     ? `<script>${chartJs}</script>`
     : `<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>`;
+  const dualAxis = series.some((s) => s.axis === "y1");
   const datasets = series.map((s) => ({
-    label: s.name, data: s.values, backgroundColor: s.color, borderRadius: 4, maxBarThickness: 46,
+    label: s.name, data: s.values, backgroundColor: s.color,
+    borderRadius: 4, maxBarThickness: 46, yAxisID: s.axis ?? "y",
   }));
+  const scales = dualAxis
+    ? `{x:{ticks:{font:{size:13}}},y:{beginAtZero:true,grace:'15%',position:'left',ticks:{font:{size:11},precision:0}},y1:{beginAtZero:true,grace:'20%',position:'right',grid:{drawOnChartArea:false},ticks:{font:{size:11}}}}`
+    : `{x:{ticks:{font:{size:13}}},y:{beginAtZero:true,grace:'15%',ticks:{font:{size:11},precision:0}}}`;
   const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
     *{margin:0;padding:0;box-sizing:border-box;} body{background:#fff;font-family:"Malgun Gothic",Arial,sans-serif;}
-    #c{width:440px;height:300px;background:#fff;}
-  </style></head><body><div id="c"><canvas id="ch" width="440" height="300"></canvas></div>
+    #c{width:${width}px;height:${height}px;background:#fff;}
+  </style></head><body><div id="c"><canvas id="ch" width="${width}" height="${height}"></canvas></div>
   ${scriptTag}<script>(function(){
     var ctx=document.getElementById('ch').getContext('2d');
     if(!window.Chart){ctx.fillText('Chart.js load fail',10,30);return;}
@@ -1331,13 +1337,13 @@ async function renderGcpGroupedBarToPng(
     }});
     new Chart(ctx,{type:'bar',data:{labels:${JSON.stringify(labels)},datasets:${JSON.stringify(datasets)}},
       options:{responsive:false,animation:false,layout:{padding:{top:20,bottom:2,left:4,right:4}},
-        scales:{y:{beginAtZero:true,grace:'15%',ticks:{font:{size:11},precision:0}},x:{ticks:{font:{size:13}}}},
+        scales:${scales},
         plugins:{legend:{display:true,position:'top',labels:{font:{size:11},boxWidth:12}},tooltip:{enabled:false}}}});
   })();</script></body></html>`;
   const browser = await chromium.launch({ headless: true });
   try {
     const page = await browser.newPage();
-    await page.setViewportSize({ width: 440, height: 300 });
+    await page.setViewportSize({ width, height });
     await page.setContent(html, { waitUntil: "networkidle", timeout: 30_000 });
     await page.waitForTimeout(350);
     await page.locator("#c").screenshot({ path: outputPng, type: "png" });
@@ -1438,7 +1444,7 @@ async function buildGcpBarCharts(uploadPath: string): Promise<GcpBarCharts | nul
 }
 
 /** GCP 데이터 인사이트(ELN 컨셉) — 연결어미로 잇고 마지막만 종결형 */
-function buildGcpInsightLines(a: {
+export function buildGcpInsightLines(a: {
   labels: string[]; months: string[];
   docV: number[]; userV: number[]; loginV: number[]; qtyV: number[]; trnV: number[];
   qt: { types: string[]; byMonth: Record<string, Record<string, number>> };
@@ -1487,6 +1493,367 @@ function buildGcpInsightLines(a: {
   return lines;
 }
 
+// ── Medcomms 보고서용 차트 (DocType/PerfStats/Activity/Review Formatted export) ──
+
+/** "<prefix>: <category> (N)" 그룹 행 → 카테고리별 값 */
+export function parseGcpCategoryGroups(xlsxPath: string, prefix: string): { category: string; value: number }[] {
+  const out: { category: string; value: number }[] = [];
+  try {
+    const wb   = XLSX.readFile(xlsxPath);
+    const rows = XLSX.utils.sheet_to_json<unknown[]>(
+      wb.Sheets[wb.SheetNames[0]], { header: 1, defval: "" }
+    ) as unknown[][];
+    const re = new RegExp(`^${prefix}:\\s*(.+?)\\s*\\((\\d+)\\)\\s*$`);
+    for (const r of rows) {
+      const m = String(r[0] ?? "").match(re);
+      if (m) out.push({ category: m[1].trim(), value: Number(m[2]) || 0 });
+    }
+  } catch (e) {
+    logger.warn(`[DEV Report] 카테고리 파싱 실패 (${prefix}): ${(e as Error).message}`);
+  }
+  return out;
+}
+
+export interface MedcommsBarCharts {
+  docType:  string | null;  // 1 생성 문서 구분 (Type: 카테고리)
+  docMgmt:  string | null;  // 2 문서 관리 현황 (Doc Count 월평균)
+  activity: string | null;  // 3 업무 활용 현황 (Name: 카테고리)
+  review:   string | null;  // 4 월별 문서 리뷰 시간 (Doc Count + Time in Review)
+  user:     string | null;  // 5 사용자 현황 (Active User 월평균)
+  login:    string | null;  // 6 일일 사용 현황 (Unique Login 월평균)
+  msgs: { docType: string; docMgmt: string; activity: string; review: string; user: string; login: string };
+  insight: string[];
+}
+
+async function buildMedcommsBarCharts(uploadPath: string): Promise<MedcommsBarCharts | null> {
+  const docTypeF = path.join(uploadPath, "Medcomms_DocType.xlsx");
+  const perfF    = path.join(uploadPath, "Medcomms_PerfStats.xlsx");
+  const actF     = path.join(uploadPath, "Medcomms_Activity.xlsx");
+  const revF     = path.join(uploadPath, "Medcomms_Review.xlsx");
+  if (![docTypeF, perfF, actF, revF].some((f) => fs.existsSync(f))) return null;
+
+  const ym2label = (ym: string) => `${parseInt(ym.slice(5, 7), 10)}월`;
+  const round1   = (n: number) => Math.round(n * 10) / 10;
+
+  // PerfStats 월별 (B=Active User, C=Unique Login, D=Doc Count) 평균
+  const docMonth = fs.existsSync(perfF) ? parseGcpMonthGroups(perfF, 3) : {};
+  const usrMonth = fs.existsSync(perfF) ? parseGcpMonthGroups(perfF, 1) : {};
+  const logMonth = fs.existsSync(perfF) ? parseGcpMonthGroups(perfF, 2) : {};
+  const perfMonths = Object.keys(docMonth).sort().slice(-3);
+  const perfLabels = perfMonths.map(ym2label);
+
+  // Review 월별 (I=Document Count, F=Time in Review)
+  const revIm = fs.existsSync(revF) ? parseGcpMonthGroups(revF, 8) : {};
+  const revFm = fs.existsSync(revF) ? parseGcpMonthGroups(revF, 5) : {};
+  const revMonths = Object.keys(revIm).sort().slice(-3);
+  const revLabels = revMonths.map(ym2label);
+
+  // 카테고리 (생성 문서 구분 / 업무 활용)
+  const docCats = fs.existsSync(docTypeF) ? parseGcpCategoryGroups(docTypeF, "Type") : [];
+  const actCats = fs.existsSync(actF)     ? parseGcpCategoryGroups(actF, "Name")     : [];
+
+  const renderBar = async (labels: string[], vals: number[], color: string, name: string): Promise<string | null> => {
+    if (!labels.length || vals.every((v) => v === 0)) return null;
+    try {
+      const p = path.join(uploadPath, `mc_bar_${name}_${Date.now()}.png`);
+      await renderGcpBarToPng(labels, vals, color, p);
+      return fs.readFileSync(p).toString("base64");
+    } catch (e) {
+      logger.warn(`[DEV Report] Medcomms bar(${name}) 실패: ${(e as Error).message}`);
+      return null;
+    }
+  };
+
+  const docType  = await renderBar(docCats.map((c) => c.category), docCats.map((c) => c.value), "#4472C4", "doctype");
+  const activity = await renderBar(actCats.map((c) => c.category), actCats.map((c) => c.value), "#5B9BD5", "activity");
+  const docMgmt  = await renderBar(perfLabels, perfMonths.map((ym) => Math.round(docMonth[ym] ?? 0)), "#ED7D31", "docmgmt");
+  const user     = await renderBar(perfLabels, perfMonths.map((ym) => Math.round(usrMonth[ym] ?? 0)), "#70AD47", "user");
+  const login    = await renderBar(perfLabels, perfMonths.map((ym) => Math.round(logMonth[ym] ?? 0)), "#FFC000", "login");
+
+  // 월별 문서 리뷰 시간 — Document Count(좌축) + Time in Review(우축) 이중축 그룹 막대
+  let review: string | null = null;
+  if (revMonths.length) {
+    const iVals = revMonths.map((ym) => Math.round(revIm[ym] ?? 0));
+    const fVals = revMonths.map((ym) => round1(revFm[ym] ?? 0));
+    if (iVals.some((v) => v > 0) || fVals.some((v) => v > 0)) {
+      try {
+        const p = path.join(uploadPath, `mc_bar_review_${Date.now()}.png`);
+        await renderGcpGroupedBarToPng(revLabels, [
+          { name: "Document Count", color: "#4472C4", values: iVals, axis: "y" },
+          { name: "Time in Review(일)", color: "#ED7D31", values: fVals, axis: "y1" },
+        ], p);
+        review = fs.readFileSync(p).toString("base64");
+      } catch (e) {
+        logger.warn(`[DEV Report] Medcomms bar(review) 실패: ${(e as Error).message}`);
+      }
+    }
+  }
+
+  const sum  = (a: number[]) => a.reduce((s, v) => s + v, 0);
+  const last = <T,>(a: T[]) => a[a.length - 1];
+  const docTotal = sum(docCats.map((c) => c.value));
+  const actTotal = sum(actCats.map((c) => c.value));
+  const topCat   = (cs: { category: string; value: number }[]) =>
+    cs.length ? [...cs].sort((a, b) => b.value - a.value)[0] : null;
+  const dTop = topCat(docCats), aTop = topCat(actCats);
+  const lmP  = perfLabels[perfLabels.length - 1] ?? "";
+
+  const msgs = {
+    docType:  `최근 3개월 생성 문서 총 <strong>${docTotal.toLocaleString()}</strong>건` + (dTop ? ` (최다: ${dTop.category} ${dTop.value}건)` : ""),
+    docMgmt:  `${lmP} 평균 약 <strong>${(Math.round(docMonth[last(perfMonths)!] ?? 0)).toLocaleString()}</strong>건 문서 관리 중`,
+    activity: `최근 3개월 활동 총 <strong>${actTotal.toLocaleString()}</strong>건` + (aTop ? ` (최다: ${aTop.category} ${aTop.value}건)` : ""),
+    review:   `최근 3개월 리뷰 문서 <strong>${sum(revMonths.map((ym) => Math.round(revIm[ym] ?? 0))).toLocaleString()}</strong>건, 평균 리뷰 약 <strong>${round1(revFm[last(revMonths)!] ?? 0)}</strong>일`,
+    user:     `${lmP} 평균 등록 사용자 약 <strong>${(Math.round(usrMonth[last(perfMonths)!] ?? 0)).toLocaleString()}</strong>명`,
+    login:    `${lmP} 일평균 접속 약 <strong>${(Math.round(logMonth[last(perfMonths)!] ?? 0)).toLocaleString()}</strong>명`,
+  };
+
+  const insight = buildMedcommsInsightLines({
+    perfLabels, perfMonths, docMonth, usrMonth, logMonth,
+    revLabels, revMonths, revIm, revFm, docCats, actCats,
+  });
+
+  logger.info(`[DEV Report] Medcomms 차트 — perf월:${perfMonths.join(",")} doc:${perfMonths.map((m)=>Math.round(docMonth[m]??0))} 카테고리:${docCats.length}/${actCats.length}`);
+  return { docType, docMgmt, activity, review, user, login, msgs, insight };
+}
+
+/** Medcomms 데이터 인사이트(ELN 컨셉) */
+export function buildMedcommsInsightLines(a: {
+  perfLabels: string[]; perfMonths: string[];
+  docMonth: Record<string, number>; usrMonth: Record<string, number>; logMonth: Record<string, number>;
+  revLabels: string[]; revMonths: string[]; revIm: Record<string, number>; revFm: Record<string, number>;
+  docCats: { category: string; value: number }[]; actCats: { category: string; value: number }[];
+}): string[] {
+  const { perfLabels, perfMonths, docMonth, usrMonth, logMonth, revMonths, revIm, revFm, docCats, actCats } = a;
+  const fmt   = (n: number) => Math.round(n).toLocaleString();
+  const r1    = (n: number) => Math.round(n * 10) / 10;
+  const first = (a2: number[]) => a2[0] ?? 0;
+  const last  = (a2: number[]) => a2[a2.length - 1] ?? 0;
+  const sum   = (a2: number[]) => a2.reduce((s, v) => s + v, 0);
+  const tword = (a2: number[]) => last(a2) > first(a2) ? "증가" : last(a2) < first(a2) ? "감소" : "유지";
+  const top   = (cs: { category: string; value: number }[]) => cs.length ? [...cs].sort((x, y) => y.value - x.value)[0] : null;
+  const range = perfLabels.length ? `${perfLabels[0]}~${perfLabels[perfLabels.length - 1]}` : "";
+  const lines: string[] = [];
+
+  const docV = perfMonths.map((m) => docMonth[m] ?? 0);
+  if (docV.some((v) => v > 0)) {
+    lines.push(`최근 3개월(${range}) 개발본부 Medcomms 문서 수는 월평균 ${fmt(first(docV))}→${fmt(last(docV))}건으로 ${tword(docV)} 흐름을 보였으며,`);
+  }
+  const dTop = top(docCats), aTop = top(actCats);
+  if (dTop) {
+    lines.push(`생성 문서는 총 ${fmt(sum(docCats.map((c) => c.value)))}건 중 ${dTop.category}(${dTop.value}건)가 가장 많았고,`);
+  }
+  const usrV = perfMonths.map((m) => usrMonth[m] ?? 0);
+  const logV = perfMonths.map((m) => logMonth[m] ?? 0);
+  lines.push(`활성 사용자는 약 ${fmt(last(usrV))}명, 일일 평균 접속은 약 ${fmt(last(logV))}명 수준을 유지했고,`);
+
+  if (revMonths.length) {
+    const iV = revMonths.map((m) => revIm[m] ?? 0);
+    const fLast = r1(revFm[revMonths[revMonths.length - 1]] ?? 0);
+    lines.push(`문서 리뷰는 ${revMonths.map((m, i) => `${perfLabels[i] ?? `${parseInt(m.slice(5,7),10)}월`} ${iV[i]}건`).join(", ")}으로 처리되었고 평균 리뷰 기간은 약 ${fLast}일이며,`);
+  }
+  if (aTop) {
+    lines.push(`업무 활동은 총 ${fmt(sum(actCats.map((c) => c.value)))}건으로 ${aTop.category}(${aTop.value}건)에 가장 집중되었습니다.`);
+  }
+
+  if (lines.length) {
+    const i = lines.length - 1;
+    lines[i] = lines[i]
+      .replace(/보였으며,$/, "보였습니다.")
+      .replace(/많았고,$/, "많았습니다.")
+      .replace(/유지했고,$/, "유지했습니다.")
+      .replace(/약 ([\d.]+)일이며,$/, "약 $1일이었습니다.");
+  }
+  return lines;
+}
+
+// ── CTMS/eTMF 보고서용 차트 (PerfStats/Study Formatted export) ──────────────────
+
+/** Study 파일: "Study: <product> (N)" 안의 "Organization: <org> (M)" → 제품×조직 */
+export function parseGcpStudyByOrg(
+  xlsxPath: string,
+): { studies: { name: string; total: number; orgs: Record<string, number> }[] } {
+  const studies: { name: string; total: number; orgs: Record<string, number> }[] = [];
+  try {
+    const wb   = XLSX.readFile(xlsxPath);
+    const rows = XLSX.utils.sheet_to_json<unknown[]>(
+      wb.Sheets[wb.SheetNames[0]], { header: 1, defval: "" }
+    ) as unknown[][];
+    let cur: { name: string; total: number; orgs: Record<string, number> } | null = null;
+    for (const r of rows) {
+      const a = String(r[0] ?? "");
+      let m = a.match(/^Study:\s*(.+?)\s*\((\d+)\)\s*$/);
+      if (m) { cur = { name: m[1].trim(), total: Number(m[2]) || 0, orgs: {} }; studies.push(cur); continue; }
+      m = a.match(/^Organization:\s*(.+?)\s*\((\d+)\)\s*$/);
+      if (m && cur) cur.orgs[m[1].trim()] = Number(m[2]) || 0;
+    }
+  } catch (e) {
+    logger.warn(`[DEV Report] Study 파싱 실패: ${(e as Error).message}`);
+  }
+  return { studies };
+}
+
+/** 누적(stacked) 막대 차트 PNG — 범례(하단) + 막대 상단에 총합 라벨 */
+async function renderGcpStackedBarToPng(
+  labels: string[],
+  series: { name: string; color: string; values: number[] }[],
+  totals: number[],
+  outputPng: string,
+  width = 1400, height = 400,
+): Promise<void> {
+  const chartJs   = loadChartJsScript();
+  const scriptTag = chartJs
+    ? `<script>${chartJs}</script>`
+    : `<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>`;
+  const datasets = series.map((s) => ({ label: s.name, data: s.values, backgroundColor: s.color, maxBarThickness: 80 }));
+  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+    *{margin:0;padding:0;box-sizing:border-box;} body{background:#fff;font-family:"Malgun Gothic",Arial,sans-serif;}
+    #c{width:${width}px;height:${height}px;background:#fff;}
+  </style></head><body><div id="c"><canvas id="ch" width="${width}" height="${height}"></canvas></div>
+  ${scriptTag}<script>(function(){
+    var ctx=document.getElementById('ch').getContext('2d');
+    if(!window.Chart){ctx.fillText('Chart.js load fail',10,30);return;}
+    var totals=${JSON.stringify(totals)};
+    Chart.register({id:'tot',afterDatasetsDraw:function(chart){
+      var c=chart.ctx; var last=chart.data.datasets.length-1;
+      var meta=chart.getDatasetMeta(last);
+      meta.data.forEach(function(bar,i){var t=totals[i]; if(!t)return; c.save();c.fillStyle='#374151';c.font='bold 11px Arial';c.textAlign='center';c.textBaseline='bottom';c.fillText(Number(t).toLocaleString(),bar.x,bar.y-3);c.restore();});
+    }});
+    new Chart(ctx,{type:'bar',data:{labels:${JSON.stringify(labels)},datasets:${JSON.stringify(datasets)}},
+      options:{responsive:false,animation:false,layout:{padding:{top:20,bottom:2,left:4,right:4}},
+        scales:{x:{stacked:true,ticks:{font:{size:10},maxRotation:30,minRotation:0}},y:{stacked:true,beginAtZero:true,grace:'12%',ticks:{font:{size:10},precision:0}}},
+        plugins:{legend:{display:true,position:'bottom',labels:{font:{size:10},boxWidth:10,padding:6}},tooltip:{enabled:false}}}});
+  })();</script></body></html>`;
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.setViewportSize({ width, height });
+    await page.setContent(html, { waitUntil: "networkidle", timeout: 30_000 });
+    await page.waitForTimeout(350);
+    await page.locator("#c").screenshot({ path: outputPng, type: "png" });
+  } finally {
+    await browser.close();
+  }
+}
+
+export interface CtmsBarCharts {
+  user:  string | null;  // 1 사용자 현황 (Active User 월평균)
+  login: string | null;  // 2 일일 사용자 현황 (Unique Login 월평균)
+  study: string | null;  // 3 Study별 사용자 현황 (제품×조직 누적)
+  msgs:  { user: string; login: string; study: string };
+  insight: string[];
+}
+
+async function buildCtmsBarCharts(uploadPath: string): Promise<CtmsBarCharts | null> {
+  const perfF  = path.join(uploadPath, "Clinical_PerfStats.xlsx");
+  const studyF = path.join(uploadPath, "Clinical_Study.xlsx");
+  if (!fs.existsSync(perfF) && !fs.existsSync(studyF)) return null;
+
+  const ym2label = (ym: string) => `${parseInt(ym.slice(5, 7), 10)}월`;
+  // PerfStats: B(1)=Active User, D(3)=Unique Login (Clinical 은 C=Attachment 이므로 D 사용)
+  const usrMonth = fs.existsSync(perfF) ? parseGcpMonthGroups(perfF, 1) : {};
+  const logMonth = fs.existsSync(perfF) ? parseGcpMonthGroups(perfF, 3) : {};
+  const perfMonths = Object.keys(usrMonth).sort().slice(-3);
+  const perfLabels = perfMonths.map(ym2label);
+
+  const renderBar = async (labels: string[], vals: number[], color: string, name: string): Promise<string | null> => {
+    if (!labels.length || vals.every((v) => v === 0)) return null;
+    try {
+      const p = path.join(uploadPath, `ctms_bar_${name}_${Date.now()}.png`);
+      await renderGcpBarToPng(labels, vals, color, p);
+      return fs.readFileSync(p).toString("base64");
+    } catch (e) { logger.warn(`[DEV Report] CTMS bar(${name}) 실패: ${(e as Error).message}`); return null; }
+  };
+
+  const usrV  = perfMonths.map((ym) => Math.round(usrMonth[ym] ?? 0));
+  const logV  = perfMonths.map((ym) => Math.round(logMonth[ym] ?? 0));
+  const user  = await renderBar(perfLabels, usrV, "#4472C4", "user");
+  const login = await renderBar(perfLabels, logV, "#70AD47", "login");
+
+  // Study별 사용자 — 제품(Study) × 조직(Organization) 그룹(나란히) 막대 (상위 7개 조직 + 기타)
+  let study: string | null = null;
+  let studyData: { studies: { name: string; total: number; orgs: Record<string, number> }[] } = { studies: [] };
+  if (fs.existsSync(studyF)) {
+    studyData = parseGcpStudyByOrg(studyF);
+    const studies = [...studyData.studies].sort((a, b) => b.total - a.total);
+    if (studies.length) {
+      const orgTotals: Record<string, number> = {};
+      studies.forEach((s) => Object.entries(s.orgs).forEach(([o, v]) => { orgTotals[o] = (orgTotals[o] ?? 0) + v; }));
+      const topOrgs = Object.entries(orgTotals).sort((a, b) => b[1] - a[1]).slice(0, 7).map(([o]) => o);
+      const palette = ["#4472C4", "#ED7D31", "#70AD47", "#FFC000", "#5B9BD5", "#A5A5A5", "#264478", "#9E480E"];
+      const labels = studies.map((s) => s.name);
+      const series = topOrgs.map((o, i) => ({
+        name: o, color: palette[i % palette.length],
+        values: studies.map((s) => s.orgs[o] ?? 0),
+      }));
+      // 기타(나머지 조직 합)
+      const etc = studies.map((s) =>
+        Object.entries(s.orgs).filter(([o]) => !topOrgs.includes(o)).reduce((sum, [, v]) => sum + v, 0));
+      if (etc.some((v) => v > 0)) series.push({ name: "기타", color: "#C9C9C9", values: etc });
+      try {
+        const p = path.join(uploadPath, `ctms_bar_study_${Date.now()}.png`);
+        // 누적 대신 조직을 나란히 배치 — Study 수에 비례해 가로 폭 확장
+        const gw = Math.min(2600, Math.max(1400, labels.length * series.length * 26 + 240));
+        await renderGcpGroupedBarToPng(labels, series, p, gw, 460);
+        study = fs.readFileSync(p).toString("base64");
+      } catch (e) { logger.warn(`[DEV Report] CTMS study 차트 실패: ${(e as Error).message}`); }
+    }
+  }
+
+  const lm = perfLabels[perfLabels.length - 1] ?? "";
+  const studyTotal = studyData.studies.reduce((s, x) => s + x.total, 0);
+  const msgs = {
+    user:  `${lm} 평균 등록 사용자 약 <strong>${(usrV[usrV.length - 1] ?? 0).toLocaleString()}</strong>명`,
+    login: `${lm} 일평균 접속 약 <strong>${(logV[logV.length - 1] ?? 0).toLocaleString()}</strong>명`,
+    study: `${studyData.studies.length}개 Study, 총 <strong>${studyTotal.toLocaleString()}</strong>명 (조직별 분포)`,
+  };
+
+  const insight = buildCtmsInsightLines({ perfLabels, perfMonths, usrMonth, logMonth, studies: studyData.studies });
+  logger.info(`[DEV Report] CTMS 차트 — perf월:${perfMonths.join(",")} user:${usrV} login:${logV} studies:${studyData.studies.length}`);
+  return { user, login, study, msgs, insight };
+}
+
+/** CTMS 데이터 인사이트(ELN 컨셉) */
+export function buildCtmsInsightLines(a: {
+  perfLabels: string[]; perfMonths: string[];
+  usrMonth: Record<string, number>; logMonth: Record<string, number>;
+  studies: { name: string; total: number; orgs: Record<string, number> }[];
+}): string[] {
+  const { perfLabels, perfMonths, usrMonth, logMonth, studies } = a;
+  const fmt = (n: number) => Math.round(n).toLocaleString();
+  const first = (x: number[]) => x[0] ?? 0;
+  const last  = (x: number[]) => x[x.length - 1] ?? 0;
+  const tword = (x: number[]) => last(x) > first(x) ? "증가" : last(x) < first(x) ? "감소" : "유지";
+  const range = perfLabels.length ? `${perfLabels[0]}~${perfLabels[perfLabels.length - 1]}` : "";
+  const lines: string[] = [];
+
+  const usrV = perfMonths.map((m) => usrMonth[m] ?? 0);
+  const logV = perfMonths.map((m) => logMonth[m] ?? 0);
+  if (usrV.some((v) => v > 0)) {
+    lines.push(`최근 3개월(${range}) 개발본부 CTMS/eTMF 활성 사용자는 월평균 ${fmt(first(usrV))}→${fmt(last(usrV))}명으로 ${tword(usrV)} 흐름을 보였으며,`);
+  }
+  lines.push(`일일 평균 접속은 약 ${fmt(last(logV))}명 수준을 유지했고,`);
+
+  if (studies.length) {
+    const sorted = [...studies].sort((x, y) => y.total - x.total);
+    const total = sorted.reduce((s, x) => s + x.total, 0);
+    const topS = sorted[0];
+    const topOrgName = topS ? Object.entries(topS.orgs).sort((x, y) => y[1] - x[1])[0]?.[0] : "";
+    lines.push(`전체 ${studies.length}개 Study에 총 ${fmt(total)}명이 참여 중이며 ${topS?.name}(${fmt(topS?.total ?? 0)}명)이 가장 규모가 크고,`);
+    if (topS && topOrgName) {
+      lines.push(`해당 Study는 ${topOrgName} 등 기관 중심으로 등록되어 Study별·기관별 편차가 뚜렷합니다.`);
+    }
+  }
+
+  if (lines.length) {
+    const i = lines.length - 1;
+    lines[i] = lines[i]
+      .replace(/보였으며,$/, "보였습니다.")
+      .replace(/유지했고,$/, "유지했습니다.")
+      .replace(/가장 규모가 크고,$/, "가장 규모가 큽니다.");
+  }
+  return lines;
+}
+
 // ── PDF HTML 빌드 ─────────────────────────────────────────────────────────────
 
 function buildDevReportHtml(
@@ -1501,6 +1868,8 @@ function buildDevReportHtml(
   gcpStats?:         GcpStats | null,
   medcommsStats?:    MedcommsStats | null,
   gcpBar?:           GcpBarCharts | null,        // GCP 보고서용 월별 막대 차트 5종
+  medcommsBar?:      MedcommsBarCharts | null,   // Medcomms 보고서용 차트 6종
+  ctmsBar?:          CtmsBarCharts | null,       // CTMS/eTMF 보고서용 차트 3종
 ): string {
   const today      = new Date().toLocaleDateString("ko-KR", {
     year: "numeric", month: "long", day: "numeric",
@@ -1618,40 +1987,75 @@ function buildDevReportHtml(
 
   // ── Page 2: Medcomms 6개 그리드 ─────────────────────────────────────────────
   logger.info(`[HTML] buildDevReportHtml 진입 — medcommsStats.uniqueLogin=${medcommsStats?.uniqueLogin ?? "null"}`);
-  const medcommsGrid = `<div class="usage-grid grid-3row-lg">
-    ${medcommsCharts.slice(0, 6).map((img, i) => makeCell(i + 1, MEDCOMMS_CHART_TITLES[i] ?? `차트 ${i + 1}`, img)).join("\n")}
-  </div>`;
+  // 새 순서: 1 생성문서구분 · 2 문서관리 · 3 업무활용 · 4 월별문서리뷰시간 · 5 사용자 · 6 일일사용
+  const MEDCOMMS_NEW_TITLES = [
+    "Medcomms 생성 문서 구분", "Medcomms 문서 관리 현황", "Medcomms 업무 활용 현황",
+    "Medcomms 월별 문서 리뷰 시간", "Medcomms 사용자 현황", "Medcomms 일일 사용 현황",
+  ];
+  const mbar = (b64: string | null | undefined) =>
+    b64 ? { base64: b64, mime: "image/png" as const } : null;
+
+  const medcommsGrid = medcommsBar
+    ? `<div class="usage-grid grid-3row-gcp">
+        ${makeCell(1, MEDCOMMS_NEW_TITLES[0], mbar(medcommsBar.docType),  medcommsBar.msgs.docType)}
+        ${makeCell(2, MEDCOMMS_NEW_TITLES[1], mbar(medcommsBar.docMgmt),  medcommsBar.msgs.docMgmt)}
+        ${makeCell(3, MEDCOMMS_NEW_TITLES[2], mbar(medcommsBar.activity), medcommsBar.msgs.activity)}
+        ${makeCell(4, MEDCOMMS_NEW_TITLES[3], mbar(medcommsBar.review),   medcommsBar.msgs.review)}
+        ${makeCell(5, MEDCOMMS_NEW_TITLES[4], mbar(medcommsBar.user),     medcommsBar.msgs.user)}
+        ${makeCell(6, MEDCOMMS_NEW_TITLES[5], mbar(medcommsBar.login),    medcommsBar.msgs.login)}
+      </div>`
+    : `<div class="usage-grid grid-3row-lg">
+        ${medcommsCharts.slice(0, 6).map((img, i) => makeCell(i + 1, MEDCOMMS_CHART_TITLES[i] ?? `차트 ${i + 1}`, img)).join("\n")}
+      </div>`;
+
+  const medcommsInsightHtml = (medcommsBar && medcommsBar.insight.length > 0)
+    ? `<div class="gcp-insight">
+        <div class="gcp-insight-label">데이터 인사이트 (최근 3개월 분석)</div>
+        ${medcommsBar.insight.map((l) => `<p>${l}</p>`).join("")}
+      </div>`
+    : "";
 
   // ── Page 3: CTMS 2+1 레이아웃 ───────────────────────────────────────────────
-  // charts[0] = Clinical1 좌측 절반, charts[1] = Clinical1 우측 절반
-  // charts[2] = Clinical2 전체 (하단 전폭)
-  const ctmsGrid = (() => {
-    const c1 = ctmsCharts[0] ?? null;
-    const c2 = ctmsCharts[1] ?? null;
-    const c3 = ctmsCharts[2] ?? null;
+  const CTMS_NEW_TITLES = [
+    "CTMS, eTMF 사용자 현황", "CTMS, eTMF 일일 사용자 현황", "CTMS, eTMF - Study별 사용자 현황",
+  ];
+  const cbar = (b64: string | null | undefined) =>
+    b64 ? { base64: b64, mime: "image/png" as const } : null;
 
-    const imgHtml = (img: { base64: string; mime: string } | null, title: string) =>
-      img
-        ? `<img src="data:${img.mime};base64,${img.base64}" alt="${escHtml(title)}" style="width:100%;height:100%;object-fit:contain;object-position:center;display:block;" />`
-        : `<div style="display:flex;align-items:center;justify-content:center;color:#9ca3af;font-size:11px;height:100%;">차트 미업로드</div>`;
+  const ctmsGrid = ctmsBar
+    ? `<div class="ctms-grid">
+        ${makeCell(1, CTMS_NEW_TITLES[0], cbar(ctmsBar.user),  ctmsBar.msgs.user)}
+        ${makeCell(2, CTMS_NEW_TITLES[1], cbar(ctmsBar.login), ctmsBar.msgs.login)}
+        <div class="usage-cell ctms-wide">
+          <div class="cell-title"><span class="cell-no">3</span>${escHtml(CTMS_NEW_TITLES[2])}</div>
+          <div class="cell-msg">${ctmsBar.msgs.study}</div>
+          <div class="img-wrap" style="padding:4px;">${
+            ctmsBar.study
+              ? `<img src="data:image/png;base64,${ctmsBar.study}" alt="${escHtml(CTMS_NEW_TITLES[2])}" style="width:100%;height:auto;display:block;" />`
+              : `<div style="display:flex;align-items:center;justify-content:center;color:#9ca3af;font-size:11px;height:100%;">차트 미업로드</div>`
+          }</div>
+        </div>
+      </div>`
+    : (() => {
+        // CTMS 데이터 미수집 시 기존 분할 이미지(2+1) 폴백
+        const c1 = ctmsCharts[0] ?? null, c2 = ctmsCharts[1] ?? null, c3 = ctmsCharts[2] ?? null;
+        const imgHtml = (img: { base64: string; mime: string } | null, title: string) =>
+          img
+            ? `<img src="data:${img.mime};base64,${img.base64}" alt="${escHtml(title)}" style="width:100%;height:100%;object-fit:contain;object-position:center;display:block;" />`
+            : `<div style="display:flex;align-items:center;justify-content:center;color:#9ca3af;font-size:11px;height:100%;">차트 미업로드</div>`;
+        return `<div class="ctms-grid">
+          <div class="usage-cell"><div class="cell-title"><span class="cell-no">1</span>${escHtml(CTMS_CHART_TITLES[0])}</div><div class="img-wrap">${imgHtml(c1, CTMS_CHART_TITLES[0])}</div></div>
+          <div class="usage-cell"><div class="cell-title"><span class="cell-no">2</span>${escHtml(CTMS_CHART_TITLES[1])}</div><div class="img-wrap">${imgHtml(c2, CTMS_CHART_TITLES[1])}</div></div>
+          <div class="usage-cell ctms-wide"><div class="cell-title"><span class="cell-no">3</span>${escHtml(CTMS_CHART_TITLES[2])}</div><div class="img-wrap" style="padding:4px;">${imgHtml(c3, CTMS_CHART_TITLES[2])}</div></div>
+        </div>`;
+      })();
 
-    return `<div class="ctms-grid">
-      <!-- 좌우 2개 (Clinical1 분할) -->
-      <div class="usage-cell">
-        <div class="cell-title"><span class="cell-no">1</span>${escHtml(CTMS_CHART_TITLES[0])}</div>
-        <div class="img-wrap">${imgHtml(c1, CTMS_CHART_TITLES[0])}</div>
-      </div>
-      <div class="usage-cell">
-        <div class="cell-title"><span class="cell-no">2</span>${escHtml(CTMS_CHART_TITLES[1])}</div>
-        <div class="img-wrap">${imgHtml(c2, CTMS_CHART_TITLES[1])}</div>
-      </div>
-      <!-- 하단 전폭 (Clinical2) -->
-      <div class="usage-cell ctms-wide">
-        <div class="cell-title"><span class="cell-no">3</span>${escHtml(CTMS_CHART_TITLES[2])}</div>
-        <div class="img-wrap" style="padding:4px;">${imgHtml(c3, CTMS_CHART_TITLES[2])}</div>
-      </div>
-    </div>`;
-  })();
+  const ctmsInsightHtml = (ctmsBar && ctmsBar.insight.length > 0)
+    ? `<div class="gcp-insight">
+        <div class="gcp-insight-label">데이터 인사이트 (최근 3개월 분석)</div>
+        ${ctmsBar.insight.map((l) => `<p>${l}</p>`).join("")}
+      </div>`
+    : "";
 
   // ── Page 4: MS 진행 현황 ──────────────────────────────────────────────────────
   const msPageHtml = msData ? (() => {
@@ -1863,9 +2267,12 @@ function buildDevReportHtml(
     /* ── CTMS 2+1 레이아웃 ── */
     .ctms-grid {
       display:grid; grid-template-columns:1fr 1fr;
-      grid-template-rows:290px 220px; gap:8px;
+      grid-template-rows:290px auto; gap:8px;
     }
     .ctms-wide { grid-column:1 / -1; }
+    /* Study별 차트는 가로 전폭 — 화면 너비에 맞춰 높이 자동 */
+    .ctms-wide .img-wrap { overflow:visible; align-items:stretch; }
+    .ctms-wide .img-wrap img { width:100%; height:auto; }
 
     /* ── MS 진행 현황 ── */
     .ms-section { margin-bottom:16px; }
@@ -1938,6 +2345,7 @@ function buildDevReportHtml(
       <span class="pg">${titleDate}</span>
     </div>
     ${medcommsGrid}
+    ${medcommsInsightHtml}
     <div class="footer">
       <span>SK Bioscience 개발본부 — 시스템 운영 현황</span>
       <span>${titleDate}</span>
@@ -1951,6 +2359,7 @@ function buildDevReportHtml(
       <span class="pg">${titleDate}</span>
     </div>
     ${ctmsGrid}
+    ${ctmsInsightHtml}
     <div class="footer">
       <span>SK Bioscience 개발본부 — 시스템 운영 현황</span>
       <span>${titleDate}</span>
@@ -2163,11 +2572,29 @@ export async function generateDevReport(jobId: string): Promise<DevReportResult>
     logger.warn(`[DEV Report] GCP 막대차트 생성 실패 (무시): ${(e as Error).message}`);
   }
 
+  // 2.6) Medcomms 보고서용 차트 6종 (DocType/PerfStats/Activity/Review Formatted export)
+  let medcommsBar: MedcommsBarCharts | null = null;
+  try {
+    medcommsBar = await buildMedcommsBarCharts(uploadPath);
+    logger.info(`[DEV Report] Medcomms 차트: ${medcommsBar ? "생성됨" : "데이터 없음(폴백)"}`);
+  } catch (e) {
+    logger.warn(`[DEV Report] Medcomms 차트 생성 실패 (무시): ${(e as Error).message}`);
+  }
+
+  // 2.7) CTMS/eTMF 보고서용 차트 3종 (PerfStats/Study Formatted export)
+  let ctmsBar: CtmsBarCharts | null = null;
+  try {
+    ctmsBar = await buildCtmsBarCharts(uploadPath);
+    logger.info(`[DEV Report] CTMS 차트: ${ctmsBar ? "생성됨" : "데이터 없음(폴백)"}`);
+  } catch (e) {
+    logger.warn(`[DEV Report] CTMS 차트 생성 실패 (무시): ${(e as Error).message}`);
+  }
+
   // 3) HTML → PDF 생성
   logger.info(`[DEV Report] ── buildDevReportHtml 호출 직전 ── medcommsStats=${JSON.stringify(medcommsStats)}`);
   const { year, month } = getLastMonth();
   const titleDate  = `${year}년 ${String(month).padStart(2, "0")}월`;
-  const html       = buildDevReportHtml(titleDate, gcpDonutBase64, gcpCounts, gcpCharts, medcommsCharts, ctmsCharts, msData, msBarCharts, gcpStats, medcommsStats, gcpBar);
+  const html       = buildDevReportHtml(titleDate, gcpDonutBase64, gcpCounts, gcpCharts, medcommsCharts, ctmsCharts, msData, msBarCharts, gcpStats, medcommsStats, gcpBar, medcommsBar, ctmsBar);
   const outputDir  = path.resolve(process.env.OUTPUT_DIR ?? "outputs");
   fs.mkdirSync(outputDir, { recursive: true });
 

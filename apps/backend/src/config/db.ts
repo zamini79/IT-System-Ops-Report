@@ -110,6 +110,39 @@ export async function runMigrations(): Promise<void> {
              CREATE INDEX IF NOT EXISTS idx_saved_reports_ym  ON saved_reports(year DESC, month DESC);
              CREATE INDEX IF NOT EXISTS idx_saved_reports_div ON saved_reports(division_code);`,
     },
+    {
+      // 운영 현황 대시보드 — 본부 × 날짜 별 지표 스냅샷 1건 (매일 자동 수집 후 upsert).
+      // data:    차트 시리즈·KPI·인사이트 JSON
+      // sources: 소스 파일별 상태(수집/업로드 시각, 성공 여부)
+      name: "dashboard_snapshots.table",
+      sql:  `CREATE TABLE IF NOT EXISTS dashboard_snapshots (
+               id            UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
+               division_code division_code NOT NULL,
+               captured_date DATE          NOT NULL,
+               data          JSONB         NOT NULL,
+               sources       JSONB         NOT NULL DEFAULT '{}'::jsonb,
+               created_at    TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+               updated_at    TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+               CONSTRAINT uq_dashboard_snap_div_date UNIQUE (division_code, captured_date)
+             );
+             CREATE INDEX IF NOT EXISTS idx_dashboard_snap_div_date
+               ON dashboard_snapshots(division_code, captured_date DESC);`,
+    },
+    {
+      // 자동/수동 수집 실행 이력 — 대시보드에 "마지막 성공 수집" 및 실패 항목 표시용
+      name: "collection_runs.table",
+      sql:  `CREATE TABLE IF NOT EXISTS collection_runs (
+               id            UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
+               division_code division_code NOT NULL,
+               trigger       VARCHAR(20)   NOT NULL,
+               status        VARCHAR(20)   NOT NULL,
+               started_at    TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+               finished_at   TIMESTAMPTZ,
+               detail        JSONB         NOT NULL DEFAULT '{}'::jsonb
+             );
+             CREATE INDEX IF NOT EXISTS idx_collection_runs_div_started
+               ON collection_runs(division_code, started_at DESC);`,
+    },
   ];
 
   for (const m of migrations) {

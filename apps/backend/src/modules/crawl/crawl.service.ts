@@ -296,325 +296,6 @@ async function runScreenshotInBackground(params: {
   jobEventBus.scheduleCleanup(jobId);
 }
 
-// ── Veeva 대시보드 캡처 잡 ──────────────────────────────────────────────────────
-
-const VEEVA_DASHBOARD_SYSTEM = "VEEVA_DASHBOARD";
-const VEEVA_DASHBOARD_DIV    = "LHOUSE" as const;
-
-/**
- * Veeva 대시보드 스크린샷 캡처를 시작합니다 (임시 기능).
- *
- * 1. divisions 에서 LHOUSE division_id 조회
- * 2. report_jobs upsert
- * 3. crawl_tasks 레코드 생성 (PENDING)
- * 4. runDashboardInBackground() 로 비동기 실행
- */
-export async function startDashboardCapture(params: {
-  jobId:  string;
-  userId: string;
-}): Promise<{ taskId: string }> {
-  const { jobId, userId } = params;
-
-  const divRows = await query<{ id: string }>(
-    "SELECT id FROM divisions WHERE code = $1",
-    [VEEVA_DASHBOARD_DIV]
-  );
-  if (!divRows.length) throw new AppError(400, "LHOUSE 사업부를 찾을 수 없습니다.");
-  const divisionId = divRows[0].id;
-
-  await query(
-    `INSERT INTO report_jobs (id, division_id, status, started_at, created_by)
-     VALUES ($1, $2, 'RUNNING', NOW(), $3)
-     ON CONFLICT (id) DO UPDATE SET status = 'RUNNING', updated_at = NOW()`,
-    [jobId, divisionId, userId]
-  );
-
-  const crawlTaskResult = await query<{ id: string }>(
-    `INSERT INTO crawl_tasks (report_job_id, system_name, task_type, status)
-     VALUES ($1, $2, 'DOWNLOAD', 'PENDING')
-     ON CONFLICT (report_job_id, system_name) DO UPDATE
-       SET task_type = 'DOWNLOAD', status = 'PENDING', updated_at = NOW()
-     RETURNING id`,
-    [jobId, VEEVA_DASHBOARD_SYSTEM]
-  );
-  const taskId = crawlTaskResult[0].id;
-
-  void runDashboardInBackground(jobId, taskId);
-
-  logger.info(`[CrawlService] Dashboard capture started: job=${jobId}, task=${taskId}`);
-  return { taskId };
-}
-
-async function runDashboardInBackground(jobId: string, taskId: string): Promise<void> {
-  jobEventBus.emit(jobId, {
-    type:       "task_start",
-    systemName: VEEVA_DASHBOARD_SYSTEM,
-    total:      1,
-  });
-
-  await query(
-    `UPDATE crawl_tasks SET status = 'RUNNING', updated_at = NOW() WHERE id = $1`,
-    [taskId]
-  ).catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
-
-  try {
-    const result = await CrawlerFactory.runSingle(
-      VEEVA_DASHBOARD_SYSTEM,
-      jobId,
-      (event) => {
-        if (event.percent !== undefined || event.message) {
-          jobEventBus.emit(jobId, {
-            type:       "progress",
-            systemName: VEEVA_DASHBOARD_SYSTEM,
-            percent:    event.percent,
-            message:    event.message,
-          });
-        }
-      }
-    );
-
-    const resultPath = result.files[0] ?? null;
-
-    // ── System Usage (DX) 슬롯에 자동 등록 ──────────────────────────────────
-    if (resultPath) {
-      try {
-        const uploadDir  = process.env.UPLOAD_DIR ?? "uploads";
-        const uploadsDir = path.resolve(uploadDir, jobId, "uploads");
-        fs.mkdirSync(uploadsDir, { recursive: true });
-
-        const savedFilename = "Systemusage_LHOUSE.png";
-        const destPath      = path.join(uploadsDir, savedFilename);
-        fs.copyFileSync(resultPath, destPath);
-
-        const fileSize = fs.statSync(destPath).size;
-
-        // 보고서 서비스가 .jpg 가 있으면 그걸 우선 사용하므로, 옛날에 수동 업로드된
-        // .jpg 가 남아있으면 새 캡처가 반영되지 않음 → 디스크의 .jpg 도 함께 삭제.
-        const oldJpgPath = path.join(uploadsDir, "Systemusage_LHOUSE.jpg");
-        try {
-          if (fs.existsSync(oldJpgPath)) {
-            fs.unlinkSync(oldJpgPath);
-            logger.info(`[CrawlService] Old jpg removed: ${oldJpgPath}`);
-          }
-        } catch (e) {
-          logger.warn(`[CrawlService] Old jpg 삭제 실패 (무시): ${(e as Error).message}`);
-        }
-
-        // .jpg / .png 모두 탐색 → 최신 1건을 PNG 로 덮어씀 (GCP/Medcomms 와 동일 패턴)
-        const existing = await query<{ id: string }>(
-          `SELECT id FROM uploaded_files
-           WHERE report_job_id = $1
-             AND original_name IN ('Systemusage_LHOUSE.png', 'Systemusage_LHOUSE.jpg')
-           ORDER BY created_at DESC LIMIT 1`,
-          [jobId]
-        );
-        if (existing.length) {
-          await query(
-            `UPDATE uploaded_files
-             SET original_name = $1, stored_path = $2, file_type = 'image/png', file_size = $3,
-                 analysis_result = '{}'::jsonb, created_at = NOW()
-             WHERE id = $4`,
-            [savedFilename, destPath, fileSize, existing[0].id]
-          );
-          logger.info(`[CrawlService] System Usage replaced: ${destPath}`);
-        } else {
-          await query(
-            `INSERT INTO uploaded_files
-               (report_job_id, original_name, stored_path, file_type, file_size)
-             VALUES ($1, $2, $3, 'image/png', $4)`,
-            [jobId, savedFilename, destPath, fileSize]
-          );
-          logger.info(`[CrawlService] System Usage saved: ${destPath}`);
-        }
-      } catch (saveErr) {
-        logger.warn(
-          `[CrawlService] System Usage 파일 등록 실패 (무시): ${(saveErr as Error).message}`
-        );
-      }
-    }
-
-    await query(
-      `UPDATE crawl_tasks SET status = 'COMPLETED', result_path = $1, updated_at = NOW() WHERE id = $2`,
-      [resultPath, taskId]
-    ).catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
-
-    jobEventBus.emit(jobId, {
-      type:       "task_done",
-      systemName: VEEVA_DASHBOARD_SYSTEM,
-      filePaths:  result.files,
-    });
-
-    logger.info(`[CrawlService] Dashboard capture done: ${resultPath}`);
-
-  } catch (err) {
-    const errMsg = (err as Error).message;
-    logger.error(`[CrawlService] Dashboard capture failed: ${errMsg}`);
-
-    await query(
-      `UPDATE crawl_tasks SET status = 'FAILED', error = $1, updated_at = NOW() WHERE id = $2`,
-      [errMsg, taskId]
-    ).catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
-
-    jobEventBus.emit(jobId, {
-      type:       "task_error",
-      systemName: VEEVA_DASHBOARD_SYSTEM,
-      error:      errMsg,
-    });
-  }
-
-  // 단일 태스크 잡 — all_done 미발행 (병렬 캡처 시 다른 잡의 SSE 스트림이 끊기는 것 방지)
-  jobEventBus.scheduleCleanup(jobId);
-}
-
-// ── DEV GCP 대시보드 캡처 잡 ─────────────────────────────────────────────────────
-
-const GCP_DASHBOARD_SYSTEM = "GCP_DASHBOARD";
-const GCP_DASHBOARD_DIV    = "DEV" as const;
-
-export async function startGcpDashboardCapture(params: {
-  jobId:  string;
-  userId: string;
-}): Promise<{ taskId: string }> {
-  const { jobId, userId } = params;
-
-  const divRows = await query<{ id: string }>(
-    "SELECT id FROM divisions WHERE code = $1",
-    [GCP_DASHBOARD_DIV]
-  );
-  if (!divRows.length) throw new AppError(400, "DEV 사업부를 찾을 수 없습니다.");
-  const divisionId = divRows[0].id;
-
-  await query(
-    `INSERT INTO report_jobs (id, division_id, status, started_at, created_by)
-     VALUES ($1, $2, 'RUNNING', NOW(), $3)
-     ON CONFLICT (id) DO UPDATE SET status = 'RUNNING', updated_at = NOW()`,
-    [jobId, divisionId, userId]
-  );
-
-  const crawlTaskResult = await query<{ id: string }>(
-    `INSERT INTO crawl_tasks (report_job_id, system_name, task_type, status)
-     VALUES ($1, $2, 'DOWNLOAD', 'PENDING')
-     ON CONFLICT (report_job_id, system_name) DO UPDATE
-       SET task_type = 'DOWNLOAD', status = 'PENDING', updated_at = NOW()
-     RETURNING id`,
-    [jobId, GCP_DASHBOARD_SYSTEM]
-  );
-  const taskId = crawlTaskResult[0].id;
-
-  void runGcpDashboardInBackground(jobId, taskId);
-
-  logger.info(`[CrawlService] GCP Dashboard capture started: job=${jobId}, task=${taskId}`);
-  return { taskId };
-}
-
-async function runGcpDashboardInBackground(jobId: string, taskId: string): Promise<void> {
-  jobEventBus.emit(jobId, {
-    type:       "task_start",
-    systemName: GCP_DASHBOARD_SYSTEM,
-    total:      1,
-  });
-
-  await query(
-    `UPDATE crawl_tasks SET status = 'RUNNING', updated_at = NOW() WHERE id = $1`,
-    [taskId]
-  ).catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
-
-  try {
-    const result = await CrawlerFactory.runSingle(
-      GCP_DASHBOARD_SYSTEM,
-      jobId,
-      (event) => {
-        if (event.percent !== undefined || event.message) {
-          jobEventBus.emit(jobId, {
-            type:       "progress",
-            systemName: GCP_DASHBOARD_SYSTEM,
-            percent:    event.percent,
-            message:    event.message,
-          });
-        }
-      }
-    );
-
-    const resultPath = result.files[0] ?? null;
-
-    if (resultPath) {
-      try {
-        const uploadDir  = process.env.UPLOAD_DIR ?? "uploads";
-        const uploadsDir = path.resolve(uploadDir, jobId, "uploads");
-        fs.mkdirSync(uploadsDir, { recursive: true });
-
-        const savedFilename = "Systemusage_GCP.png";
-        const destPath      = path.join(uploadsDir, savedFilename);
-        fs.copyFileSync(resultPath, destPath);
-
-        const fileSize = fs.statSync(destPath).size;
-
-        // .jpg(수동 업로드) / .png(이전 캡처) 모두 탐색 → 가장 최신 1건을 PNG로 덮어씀
-        const existing = await query<{ id: string }>(
-          `SELECT id FROM uploaded_files
-           WHERE report_job_id = $1
-             AND original_name IN ('Systemusage_GCP.png', 'Systemusage_GCP.jpg')
-           ORDER BY created_at DESC LIMIT 1`,
-          [jobId]
-        );
-        if (existing.length) {
-          await query(
-            `UPDATE uploaded_files
-             SET original_name = $1, stored_path = $2, file_type = 'image/png', file_size = $3,
-                 analysis_result = '{}'::jsonb, created_at = NOW()
-             WHERE id = $4`,
-            [savedFilename, destPath, fileSize, existing[0].id]
-          );
-          logger.info(`[CrawlService] GCP System Usage replaced: ${destPath}`);
-        } else {
-          await query(
-            `INSERT INTO uploaded_files
-               (report_job_id, original_name, stored_path, file_type, file_size)
-             VALUES ($1, $2, $3, 'image/png', $4)`,
-            [jobId, savedFilename, destPath, fileSize]
-          );
-          logger.info(`[CrawlService] GCP System Usage saved: ${destPath}`);
-        }
-      } catch (saveErr) {
-        logger.warn(
-          `[CrawlService] GCP System Usage 파일 등록 실패 (무시): ${(saveErr as Error).message}`
-        );
-      }
-    }
-
-    await query(
-      `UPDATE crawl_tasks SET status = 'COMPLETED', result_path = $1, updated_at = NOW() WHERE id = $2`,
-      [resultPath, taskId]
-    ).catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
-
-    jobEventBus.emit(jobId, {
-      type:       "task_done",
-      systemName: GCP_DASHBOARD_SYSTEM,
-      filePaths:  result.files,
-    });
-
-    logger.info(`[CrawlService] GCP Dashboard capture done: ${resultPath}`);
-
-  } catch (err) {
-    const errMsg = (err as Error).message;
-    logger.error(`[CrawlService] GCP Dashboard capture failed: ${errMsg}`);
-
-    await query(
-      `UPDATE crawl_tasks SET status = 'FAILED', error = $1, updated_at = NOW() WHERE id = $2`,
-      [errMsg, taskId]
-    ).catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
-
-    jobEventBus.emit(jobId, {
-      type:       "task_error",
-      systemName: GCP_DASHBOARD_SYSTEM,
-      error:      errMsg,
-    });
-  }
-
-  // 단일 태스크 잡 — all_done 미발행 (병렬 캡처 시 다른 잡의 SSE 스트림이 끊기는 것 방지)
-  jobEventBus.scheduleCleanup(jobId);
-}
-
 // ── DEV GCP Activity 리포트 Export 잡 ────────────────────────────────────────────
 // LHOUSE 시스템 조회와 동일하게, GCP Quality System 의 Activity (Task) Count 리포트를
 // Excel 로 export 해 uploads/Activity_GCP.xlsx 로 저장 + uploaded_files 자동 등록.
@@ -658,7 +339,8 @@ export async function startGcpActivityExport(params: {
   return { taskId };
 }
 
-async function runGcpActivityInBackground(jobId: string, taskId: string): Promise<void> {
+async function runGcpActivityInBackground(jobId: string, taskId: string): Promise<boolean> {
+  let succeeded = false;
   jobEventBus.emit(jobId, { type: "task_start", systemName: GCP_ACTIVITY_SYSTEM, total: 1 });
 
   await query(
@@ -725,6 +407,7 @@ async function runGcpActivityInBackground(jobId: string, taskId: string): Promis
 
     jobEventBus.emit(jobId, { type: "task_done", systemName: GCP_ACTIVITY_SYSTEM, filePaths: result.files });
     logger.info(`[CrawlService] GCP Activity export done: ${resultPath}`);
+    succeeded = true;
 
   } catch (err) {
     const errMsg = (err as Error).message;
@@ -737,6 +420,7 @@ async function runGcpActivityInBackground(jobId: string, taskId: string): Promis
   }
 
   jobEventBus.scheduleCleanup(jobId);
+  return succeeded;
 }
 
 // ── DEV GCP 데이터 수집 잡 (3개 리포트 Excel export → uploads/ + uploaded_files) ──
@@ -812,7 +496,7 @@ async function registerGcpNamedFile(jobId: string, file: string): Promise<void> 
   logger.info(`[CrawlService] GCP 데이터 등록: ${file} (${fileSize.toLocaleString()} bytes)`);
 }
 
-async function runGcpDataInBackground(jobId: string, taskId: string): Promise<void> {
+async function runGcpDataInBackground(jobId: string, taskId: string): Promise<boolean> {
   jobEventBus.emit(jobId, { type: "task_start", systemName: GCP_DATA_SYSTEM, total: 1 });
   await query(`UPDATE crawl_tasks SET status = 'RUNNING', updated_at = NOW() WHERE id = $1`, [taskId])
     .catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
@@ -861,269 +545,737 @@ async function runGcpDataInBackground(jobId: string, taskId: string): Promise<vo
   }
 
   jobEventBus.scheduleCleanup(jobId);
+  return okCount > 0;
 }
 
-// ── DEV Medcomms 대시보드 캡처 잡 ────────────────────────────────────────────────
+// ── L HOUSE Veeva 데이터 수집 잡 (PerfStats/Quality xlsx + Training json → uploads/ + uploaded_files) ──
 
-const MEDCOMMS_DASHBOARD_SYSTEM = "MEDCOMMS_DASHBOARD";
-const MEDCOMMS_DASHBOARD_DIV    = "DEV" as const;
+const LHOUSE_DATA_SYSTEM = "LHOUSE_DATA";
+const LHOUSE_DATA_DIV    = "LHOUSE" as const;
+const LHOUSE_JSON_MIME   = "application/json";
 
-export async function startMedcommsDashboardCapture(params: {
+const LHOUSE_REPORTS: { key: string; file: string; label: string }[] = [
+  { key: "LHOUSE_PERFSTATS", file: "LHOUSE_PerfStats.xlsx", label: "Performance Statistics" },
+  { key: "LHOUSE_QUALITY",   file: "LHOUSE_Quality.xlsx",   label: "Quality Events" },
+  { key: "LHOUSE_TRAINING",  file: "LHOUSE_Training.json",  label: "Training" },
+];
+
+export async function startLhouseDataCollection(params: {
   jobId:  string;
   userId: string;
 }): Promise<{ taskId: string }> {
   const { jobId, userId } = params;
 
   const divRows = await query<{ id: string }>(
-    "SELECT id FROM divisions WHERE code = $1",
-    [MEDCOMMS_DASHBOARD_DIV]
+    "SELECT id FROM divisions WHERE code = $1", [LHOUSE_DATA_DIV]
   );
-  if (!divRows.length) throw new AppError(400, "DEV 사업부를 찾을 수 없습니다.");
-  const divisionId = divRows[0].id;
+  if (!divRows.length) throw new AppError(400, "LHOUSE 사업부를 찾을 수 없습니다.");
 
   await query(
     `INSERT INTO report_jobs (id, division_id, status, started_at, created_by)
      VALUES ($1, $2, 'RUNNING', NOW(), $3)
      ON CONFLICT (id) DO UPDATE SET status = 'RUNNING', updated_at = NOW()`,
-    [jobId, divisionId, userId]
+    [jobId, divRows[0].id, userId]
   );
 
-  const crawlTaskResult = await query<{ id: string }>(
+  const taskRows = await query<{ id: string }>(
     `INSERT INTO crawl_tasks (report_job_id, system_name, task_type, status)
      VALUES ($1, $2, 'DOWNLOAD', 'PENDING')
      ON CONFLICT (report_job_id, system_name) DO UPDATE
        SET task_type = 'DOWNLOAD', status = 'PENDING', updated_at = NOW()
      RETURNING id`,
-    [jobId, MEDCOMMS_DASHBOARD_SYSTEM]
+    [jobId, LHOUSE_DATA_SYSTEM]
   );
-  const taskId = crawlTaskResult[0].id;
+  const taskId = taskRows[0].id;
 
-  void runMedcommsDashboardInBackground(jobId, taskId);
+  void runLhouseDataInBackground(jobId, taskId);
 
-  logger.info(`[CrawlService] Medcomms Dashboard capture started: job=${jobId}, task=${taskId}`);
+  logger.info(`[CrawlService] LHOUSE 데이터 수집 시작: job=${jobId}, task=${taskId}`);
   return { taskId };
 }
 
-async function runMedcommsDashboardInBackground(jobId: string, taskId: string): Promise<void> {
-  jobEventBus.emit(jobId, {
-    type:       "task_start",
-    systemName: MEDCOMMS_DASHBOARD_SYSTEM,
-    total:      1,
-  });
+async function registerLhouseNamedFile(jobId: string, file: string): Promise<void> {
+  const uploadDir = process.env.UPLOAD_DIR ?? "uploads";
+  const filePath  = path.resolve(uploadDir, jobId, "uploads", file);
+  if (!fs.existsSync(filePath)) return;
+  const fileSize = fs.statSync(filePath).size;
+  const mime     = file.endsWith(".json") ? LHOUSE_JSON_MIME : GCP_XLSX_MIME;
+  const existing = await query<{ id: string }>(
+    `SELECT id FROM uploaded_files WHERE report_job_id = $1 AND original_name = $2
+     ORDER BY created_at DESC LIMIT 1`,
+    [jobId, file]
+  );
+  if (existing.length) {
+    await query(
+      `UPDATE uploaded_files
+       SET stored_path = $1, file_type = $2, file_size = $3, analysis_result = '{}'::jsonb, created_at = NOW()
+       WHERE id = $4`,
+      [filePath, mime, fileSize, existing[0].id]
+    );
+  } else {
+    await query(
+      `INSERT INTO uploaded_files (report_job_id, original_name, stored_path, file_type, file_size)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [jobId, file, filePath, mime, fileSize]
+    );
+  }
+  logger.info(`[CrawlService] LHOUSE 데이터 등록: ${file} (${fileSize.toLocaleString()} bytes)`);
+}
 
-  await query(
-    `UPDATE crawl_tasks SET status = 'RUNNING', updated_at = NOW() WHERE id = $1`,
-    [taskId]
-  ).catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
+async function runLhouseDataInBackground(jobId: string, taskId: string): Promise<boolean> {
+  jobEventBus.emit(jobId, { type: "task_start", systemName: LHOUSE_DATA_SYSTEM, total: 1 });
+  await query(`UPDATE crawl_tasks SET status = 'RUNNING', updated_at = NOW() WHERE id = $1`, [taskId])
+    .catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
 
-  try {
-    const result = await CrawlerFactory.runSingle(
-      MEDCOMMS_DASHBOARD_SYSTEM,
-      jobId,
-      (event) => {
+  let okCount = 0;
+  const errors: string[] = [];
+
+  for (let i = 0; i < LHOUSE_REPORTS.length; i++) {
+    const rep = LHOUSE_REPORTS[i];
+    jobEventBus.emit(jobId, {
+      type:       "progress",
+      systemName: LHOUSE_DATA_SYSTEM,
+      percent:    Math.round((i / LHOUSE_REPORTS.length) * 100),
+      message:    `${rep.label} 수집 중… (${i + 1}/${LHOUSE_REPORTS.length})`,
+    });
+    try {
+      await CrawlerFactory.runSingle(rep.key, jobId, (event) => {
         if (event.percent !== undefined || event.message) {
           jobEventBus.emit(jobId, {
             type:       "progress",
-            systemName: MEDCOMMS_DASHBOARD_SYSTEM,
-            percent:    event.percent,
-            message:    event.message,
+            systemName: LHOUSE_DATA_SYSTEM,
+            message:    `[${rep.label}] ${event.message ?? ""}`,
           });
         }
-      }
-    );
-
-    const resultPath = result.files[0] ?? null;
-
-    if (resultPath) {
-      try {
-        const uploadDir  = process.env.UPLOAD_DIR ?? "uploads";
-        const uploadsDir = path.resolve(uploadDir, jobId, "uploads");
-        fs.mkdirSync(uploadsDir, { recursive: true });
-
-        const savedFilename = "Systemusage_Medcomms.png";
-        const destPath      = path.join(uploadsDir, savedFilename);
-        fs.copyFileSync(resultPath, destPath);
-
-        const fileSize = fs.statSync(destPath).size;
-
-        // .jpg(수동 업로드) / .png(이전 캡처) 모두 탐색 → 가장 최신 1건을 PNG로 덮어씀
-        const existing = await query<{ id: string }>(
-          `SELECT id FROM uploaded_files
-           WHERE report_job_id = $1
-             AND original_name IN ('Systemusage_Medcomms.png', 'Systemusage_Medcomms.jpg')
-           ORDER BY created_at DESC LIMIT 1`,
-          [jobId]
-        );
-        if (existing.length) {
-          await query(
-            `UPDATE uploaded_files
-             SET original_name = $1, stored_path = $2, file_type = 'image/png', file_size = $3,
-                 analysis_result = '{}'::jsonb, created_at = NOW()
-             WHERE id = $4`,
-            [savedFilename, destPath, fileSize, existing[0].id]
-          );
-          logger.info(`[CrawlService] Medcomms System Usage replaced: ${destPath}`);
-        } else {
-          await query(
-            `INSERT INTO uploaded_files
-               (report_job_id, original_name, stored_path, file_type, file_size)
-             VALUES ($1, $2, $3, 'image/png', $4)`,
-            [jobId, savedFilename, destPath, fileSize]
-          );
-          logger.info(`[CrawlService] Medcomms System Usage saved: ${destPath}`);
-        }
-      } catch (saveErr) {
-        logger.warn(
-          `[CrawlService] Medcomms System Usage 파일 등록 실패 (무시): ${(saveErr as Error).message}`
-        );
-      }
+      });
+      await registerLhouseNamedFile(jobId, rep.file);
+      okCount++;
+    } catch (err) {
+      const msg = (err as Error).message;
+      errors.push(`${rep.label}: ${msg}`);
+      logger.error(`[CrawlService] LHOUSE ${rep.label} 실패: ${msg}`);
     }
-
-    await query(
-      `UPDATE crawl_tasks SET status = 'COMPLETED', result_path = $1, updated_at = NOW() WHERE id = $2`,
-      [resultPath, taskId]
-    ).catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
-
-    jobEventBus.emit(jobId, {
-      type:       "task_done",
-      systemName: MEDCOMMS_DASHBOARD_SYSTEM,
-      filePaths:  result.files,
-    });
-
-    logger.info(`[CrawlService] Medcomms Dashboard capture done: ${resultPath}`);
-
-  } catch (err) {
-    const errMsg = (err as Error).message;
-    logger.error(`[CrawlService] Medcomms Dashboard capture failed: ${errMsg}`);
-
-    await query(
-      `UPDATE crawl_tasks SET status = 'FAILED', error = $1, updated_at = NOW() WHERE id = $2`,
-      [errMsg, taskId]
-    ).catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
-
-    jobEventBus.emit(jobId, {
-      type:       "task_error",
-      systemName: MEDCOMMS_DASHBOARD_SYSTEM,
-      error:      errMsg,
-    });
   }
 
-  // 단일 태스크 잡 — all_done 미발행 (병렬 캡처 시 다른 잡의 SSE 스트림이 끊기는 것 방지)
+  if (okCount > 0) {
+    await query(`UPDATE crawl_tasks SET status = 'COMPLETED', updated_at = NOW() WHERE id = $1`, [taskId])
+      .catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
+    jobEventBus.emit(jobId, { type: "task_done", systemName: LHOUSE_DATA_SYSTEM, filePaths: [] });
+    logger.info(`[CrawlService] LHOUSE 데이터 수집 완료: ${okCount}/${LHOUSE_REPORTS.length}` +
+      (errors.length ? ` (실패: ${errors.join("; ")})` : ""));
+  } else {
+    const msg = errors.join("; ") || "수집 실패";
+    await query(`UPDATE crawl_tasks SET status = 'FAILED', error = $1, updated_at = NOW() WHERE id = $2`, [msg, taskId])
+      .catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
+    jobEventBus.emit(jobId, { type: "task_error", systemName: LHOUSE_DATA_SYSTEM, error: msg });
+  }
+
   jobEventBus.scheduleCleanup(jobId);
+  return okCount > 0;
 }
 
-// ── BIO 연구본부 R&D 대시보드 캡처 잡 ────────────────────────────────────────
+// ── BIO 연구본부 Veeva 데이터 수집 잡 (Activity/PerfStats/DocType 화면 스크래핑 → json) ──
 
-const BIO_RD_DASHBOARD_SYSTEM = "BIO_RD_DASHBOARD";
-const BIO_RD_DASHBOARD_DIV    = "BIO" as const;
+const BIO_DATA_SYSTEM = "BIO_DATA";
+const BIO_DATA_DIV    = "BIO" as const;
+const BIO_JSON_MIME   = "application/json";
 
-export async function startBioRdDashboardCapture(params: {
+const BIO_REPORTS: { key: string; file: string; label: string }[] = [
+  { key: "BIO_ACTIVITY",  file: "BIO_Activity.json",  label: "업무 활용(Activity)" },
+  { key: "BIO_PERFSTATS", file: "BIO_PerfStats.xlsx", label: "Performance Statistics" },
+  { key: "BIO_DOCTYPE",   file: "BIO_DocType.json",   label: "생성 문서 구분" },
+];
+
+export async function startBioDataCollection(params: {
   jobId:  string;
   userId: string;
 }): Promise<{ taskId: string }> {
   const { jobId, userId } = params;
 
   const divRows = await query<{ id: string }>(
-    "SELECT id FROM divisions WHERE code = $1",
-    [BIO_RD_DASHBOARD_DIV]
+    "SELECT id FROM divisions WHERE code = $1", [BIO_DATA_DIV]
   );
   if (!divRows.length) throw new AppError(400, "BIO 사업부를 찾을 수 없습니다.");
-  const divisionId = divRows[0].id;
+
+  // 재시도 대비: 이전 실행의 이벤트 히스토리를 비운다.
+  jobEventBus.resetHistory(jobId);
 
   await query(
     `INSERT INTO report_jobs (id, division_id, status, started_at, created_by)
      VALUES ($1, $2, 'RUNNING', NOW(), $3)
      ON CONFLICT (id) DO UPDATE SET status = 'RUNNING', updated_at = NOW()`,
-    [jobId, divisionId, userId]
+    [jobId, divRows[0].id, userId]
   );
 
-  const crawlTaskResult = await query<{ id: string }>(
+  const taskRows = await query<{ id: string }>(
     `INSERT INTO crawl_tasks (report_job_id, system_name, task_type, status)
      VALUES ($1, $2, 'DOWNLOAD', 'PENDING')
      ON CONFLICT (report_job_id, system_name) DO UPDATE
        SET task_type = 'DOWNLOAD', status = 'PENDING', updated_at = NOW()
      RETURNING id`,
-    [jobId, BIO_RD_DASHBOARD_SYSTEM]
+    [jobId, BIO_DATA_SYSTEM]
   );
-  const taskId = crawlTaskResult[0].id;
+  const taskId = taskRows[0].id;
 
-  void runBioRdDashboardInBackground(jobId, taskId);
+  void runBioDataInBackground(jobId, taskId);
 
-  logger.info(`[CrawlService] BIO R&D Dashboard capture started: job=${jobId}, task=${taskId}`);
+  logger.info(`[CrawlService] BIO 데이터 수집 시작: job=${jobId}, task=${taskId}`);
   return { taskId };
 }
 
-async function runBioRdDashboardInBackground(jobId: string, taskId: string): Promise<void> {
-  jobEventBus.emit(jobId, {
-    type:       "task_start",
-    systemName: BIO_RD_DASHBOARD_SYSTEM,
-    total:      1,
-  });
+async function registerBioNamedFile(jobId: string, file: string): Promise<void> {
+  const uploadDir = process.env.UPLOAD_DIR ?? "uploads";
+  const filePath  = path.resolve(uploadDir, jobId, "uploads", file);
+  if (!fs.existsSync(filePath)) return;
+  const fileSize = fs.statSync(filePath).size;
+  const mime     = file.endsWith(".xlsx") ? GCP_XLSX_MIME : BIO_JSON_MIME;
+  const existing = await query<{ id: string }>(
+    `SELECT id FROM uploaded_files WHERE report_job_id = $1 AND original_name = $2
+     ORDER BY created_at DESC LIMIT 1`,
+    [jobId, file]
+  );
+  if (existing.length) {
+    await query(
+      `UPDATE uploaded_files
+       SET stored_path = $1, file_type = $2, file_size = $3, analysis_result = '{}'::jsonb, created_at = NOW()
+       WHERE id = $4`,
+      [filePath, mime, fileSize, existing[0].id]
+    );
+  } else {
+    await query(
+      `INSERT INTO uploaded_files (report_job_id, original_name, stored_path, file_type, file_size)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [jobId, file, filePath, mime, fileSize]
+    );
+  }
+  logger.info(`[CrawlService] BIO 데이터 등록: ${file} (${fileSize.toLocaleString()} bytes)`);
+}
 
-  await query(
-    `UPDATE crawl_tasks SET status = 'RUNNING', updated_at = NOW() WHERE id = $1`,
-    [taskId]
-  ).catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
+async function runBioDataInBackground(jobId: string, taskId: string): Promise<boolean> {
+  jobEventBus.emit(jobId, { type: "task_start", systemName: BIO_DATA_SYSTEM, total: 1 });
+  await query(`UPDATE crawl_tasks SET status = 'RUNNING', updated_at = NOW() WHERE id = $1`, [taskId])
+    .catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
 
-  try {
-    const result = await CrawlerFactory.runSingle(
-      BIO_RD_DASHBOARD_SYSTEM,
-      jobId,
-      (event) => {
+  let okCount = 0;
+  const errors: string[] = [];
+
+  for (let i = 0; i < BIO_REPORTS.length; i++) {
+    const rep = BIO_REPORTS[i];
+    jobEventBus.emit(jobId, {
+      type:       "progress",
+      systemName: BIO_DATA_SYSTEM,
+      percent:    Math.round((i / BIO_REPORTS.length) * 100),
+      message:    `${rep.label} 수집 중… (${i + 1}/${BIO_REPORTS.length})`,
+    });
+    try {
+      await CrawlerFactory.runSingle(rep.key, jobId, (event) => {
         if (event.percent !== undefined || event.message) {
           jobEventBus.emit(jobId, {
             type:       "progress",
-            systemName: BIO_RD_DASHBOARD_SYSTEM,
-            percent:    event.percent,
-            message:    event.message,
+            systemName: BIO_DATA_SYSTEM,
+            message:    `[${rep.label}] ${event.message ?? ""}`,
           });
         }
-      }
+      });
+      await registerBioNamedFile(jobId, rep.file);
+      okCount++;
+    } catch (err) {
+      const msg = (err as Error).message;
+      errors.push(`${rep.label}: ${msg}`);
+      logger.error(`[CrawlService] BIO ${rep.label} 실패: ${msg}`);
+    }
+  }
+
+  if (okCount > 0) {
+    await query(`UPDATE crawl_tasks SET status = 'COMPLETED', updated_at = NOW() WHERE id = $1`, [taskId])
+      .catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
+    jobEventBus.emit(jobId, { type: "task_done", systemName: BIO_DATA_SYSTEM, filePaths: [] });
+    logger.info(`[CrawlService] BIO 데이터 수집 완료: ${okCount}/${BIO_REPORTS.length}` +
+      (errors.length ? ` (실패: ${errors.join("; ")})` : ""));
+  } else {
+    const msg = errors.join("; ") || "수집 실패";
+    await query(`UPDATE crawl_tasks SET status = 'FAILED', error = $1, updated_at = NOW() WHERE id = $2`, [msg, taskId])
+      .catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
+    jobEventBus.emit(jobId, { type: "task_error", systemName: BIO_DATA_SYSTEM, error: msg });
+  }
+
+  jobEventBus.scheduleCleanup(jobId);
+  return okCount > 0;
+}
+
+/** 무인(cron) 실행용 — BIO 수집 완료까지 기다린 뒤 결과 반환 */
+export async function runBioCollectAwait(params: {
+  jobId:  string;
+  userId: string;
+}): Promise<CollectAllResult> {
+  const { jobId, userId } = params;
+
+  const divRows = await query<{ id: string }>(
+    "SELECT id FROM divisions WHERE code = $1", [BIO_DATA_DIV]
+  );
+  if (!divRows.length) throw new AppError(400, "BIO 사업부를 찾을 수 없습니다.");
+
+  jobEventBus.resetHistory(jobId);
+
+  await query(
+    `INSERT INTO report_jobs (id, division_id, status, started_at, created_by)
+     VALUES ($1, $2, 'RUNNING', NOW(), $3)
+     ON CONFLICT (id) DO UPDATE SET status = 'RUNNING', updated_at = NOW()`,
+    [jobId, divRows[0].id, userId]
+  );
+
+  const taskRows = await query<{ id: string }>(
+    `INSERT INTO crawl_tasks (report_job_id, system_name, task_type, status)
+     VALUES ($1, $2, 'DOWNLOAD', 'PENDING')
+     ON CONFLICT (report_job_id, system_name) DO UPDATE
+       SET task_type = 'DOWNLOAD', status = 'PENDING', updated_at = NOW()
+     RETURNING id`,
+    [jobId, BIO_DATA_SYSTEM]
+  );
+
+  logger.info(`[CrawlService] BIO 자동 수집 시작 (대기): job=${jobId}`);
+  const ok = await runBioDataInBackground(jobId, taskRows[0].id);
+  return { ok, results: { [BIO_DATA_SYSTEM]: ok }, failedAt: ok ? null : BIO_DATA_SYSTEM };
+}
+
+// ── DEV Medcomms 데이터 수집 잡 (4개 리포트 Excel export → uploads/ + uploaded_files) ──
+
+const MEDCOMMS_DATA_SYSTEM = "MEDCOMMS_DATA";
+
+const MEDCOMMS_REPORTS: { key: string; file: string; label: string }[] = [
+  { key: "MEDCOMMS_DOCTYPE",   file: "Medcomms_DocType.xlsx",   label: "생성 문서 구분" },
+  { key: "MEDCOMMS_PERFSTATS", file: "Medcomms_PerfStats.xlsx", label: "Performance Statistics" },
+  { key: "MEDCOMMS_ACTIVITY",  file: "Medcomms_Activity.xlsx",  label: "업무 활용" },
+  { key: "MEDCOMMS_REVIEW",    file: "Medcomms_Review.xlsx",    label: "문서 리뷰 시간" },
+];
+
+export async function startMedcommsDataCollection(params: {
+  jobId:  string;
+  userId: string;
+}): Promise<{ taskId: string }> {
+  const { jobId, userId } = params;
+
+  const divRows = await query<{ id: string }>("SELECT id FROM divisions WHERE code = $1", ["DEV"]);
+  if (!divRows.length) throw new AppError(400, "DEV 사업부를 찾을 수 없습니다.");
+
+  await query(
+    `INSERT INTO report_jobs (id, division_id, status, started_at, created_by)
+     VALUES ($1, $2, 'RUNNING', NOW(), $3)
+     ON CONFLICT (id) DO UPDATE SET status = 'RUNNING', updated_at = NOW()`,
+    [jobId, divRows[0].id, userId]
+  );
+
+  const taskRows = await query<{ id: string }>(
+    `INSERT INTO crawl_tasks (report_job_id, system_name, task_type, status)
+     VALUES ($1, $2, 'DOWNLOAD', 'PENDING')
+     ON CONFLICT (report_job_id, system_name) DO UPDATE
+       SET task_type = 'DOWNLOAD', status = 'PENDING', updated_at = NOW()
+     RETURNING id`,
+    [jobId, MEDCOMMS_DATA_SYSTEM]
+  );
+  const taskId = taskRows[0].id;
+
+  void runMedcommsDataInBackground(jobId, taskId);
+
+  logger.info(`[CrawlService] Medcomms 데이터 수집 시작: job=${jobId}, task=${taskId}`);
+  return { taskId };
+}
+
+async function runMedcommsDataInBackground(jobId: string, taskId: string): Promise<boolean> {
+  jobEventBus.emit(jobId, { type: "task_start", systemName: MEDCOMMS_DATA_SYSTEM, total: 1 });
+  await query(`UPDATE crawl_tasks SET status = 'RUNNING', updated_at = NOW() WHERE id = $1`, [taskId])
+    .catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
+
+  let okCount = 0;
+  const errors: string[] = [];
+
+  for (let i = 0; i < MEDCOMMS_REPORTS.length; i++) {
+    const rep = MEDCOMMS_REPORTS[i];
+    jobEventBus.emit(jobId, {
+      type:       "progress",
+      systemName: MEDCOMMS_DATA_SYSTEM,
+      percent:    Math.round((i / MEDCOMMS_REPORTS.length) * 100),
+      message:    `${rep.label} 수집 중… (${i + 1}/${MEDCOMMS_REPORTS.length})`,
+    });
+    try {
+      await CrawlerFactory.runSingle(rep.key, jobId, (event) => {
+        if (event.percent !== undefined || event.message) {
+          jobEventBus.emit(jobId, {
+            type:       "progress",
+            systemName: MEDCOMMS_DATA_SYSTEM,
+            message:    `[${rep.label}] ${event.message ?? ""}`,
+          });
+        }
+      });
+      await registerGcpNamedFile(jobId, rep.file);   // 파일명 기반 등록(범용)
+      okCount++;
+    } catch (err) {
+      const msg = (err as Error).message;
+      errors.push(`${rep.label}: ${msg}`);
+      logger.error(`[CrawlService] Medcomms ${rep.label} 실패: ${msg}`);
+    }
+  }
+
+  if (okCount > 0) {
+    await query(`UPDATE crawl_tasks SET status = 'COMPLETED', updated_at = NOW() WHERE id = $1`, [taskId])
+      .catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
+    jobEventBus.emit(jobId, { type: "task_done", systemName: MEDCOMMS_DATA_SYSTEM, filePaths: [] });
+    logger.info(`[CrawlService] Medcomms 데이터 수집 완료: ${okCount}/${MEDCOMMS_REPORTS.length}` +
+      (errors.length ? ` (실패: ${errors.join("; ")})` : ""));
+  } else {
+    const msg = errors.join("; ") || "수집 실패";
+    await query(`UPDATE crawl_tasks SET status = 'FAILED', error = $1, updated_at = NOW() WHERE id = $2`, [msg, taskId])
+      .catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
+    jobEventBus.emit(jobId, { type: "task_error", systemName: MEDCOMMS_DATA_SYSTEM, error: msg });
+  }
+
+  jobEventBus.scheduleCleanup(jobId);
+  return okCount > 0;
+}
+
+// ── DEV CTMS/eTMF 데이터 수집 잡 (2개 리포트 Excel export) ──────────────────────
+
+const CTMS_DATA_SYSTEM = "CTMS_DATA";
+
+const CTMS_REPORTS: { key: string; file: string; label: string }[] = [
+  { key: "CTMS_PERFSTATS", file: "Clinical_PerfStats.xlsx", label: "Performance Statistics" },
+  { key: "CTMS_STUDY",     file: "Clinical_Study.xlsx",     label: "Study별 사용자" },
+];
+
+export async function startCtmsDataCollection(params: {
+  jobId:  string;
+  userId: string;
+}): Promise<{ taskId: string }> {
+  const { jobId, userId } = params;
+
+  const divRows = await query<{ id: string }>("SELECT id FROM divisions WHERE code = $1", ["DEV"]);
+  if (!divRows.length) throw new AppError(400, "DEV 사업부를 찾을 수 없습니다.");
+
+  await query(
+    `INSERT INTO report_jobs (id, division_id, status, started_at, created_by)
+     VALUES ($1, $2, 'RUNNING', NOW(), $3)
+     ON CONFLICT (id) DO UPDATE SET status = 'RUNNING', updated_at = NOW()`,
+    [jobId, divRows[0].id, userId]
+  );
+
+  const taskRows = await query<{ id: string }>(
+    `INSERT INTO crawl_tasks (report_job_id, system_name, task_type, status)
+     VALUES ($1, $2, 'DOWNLOAD', 'PENDING')
+     ON CONFLICT (report_job_id, system_name) DO UPDATE
+       SET task_type = 'DOWNLOAD', status = 'PENDING', updated_at = NOW()
+     RETURNING id`,
+    [jobId, CTMS_DATA_SYSTEM]
+  );
+  const taskId = taskRows[0].id;
+
+  void runCtmsDataInBackground(jobId, taskId);
+
+  logger.info(`[CrawlService] CTMS 데이터 수집 시작: job=${jobId}, task=${taskId}`);
+  return { taskId };
+}
+
+async function runCtmsDataInBackground(jobId: string, taskId: string): Promise<boolean> {
+  jobEventBus.emit(jobId, { type: "task_start", systemName: CTMS_DATA_SYSTEM, total: 1 });
+  await query(`UPDATE crawl_tasks SET status = 'RUNNING', updated_at = NOW() WHERE id = $1`, [taskId])
+    .catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
+
+  let okCount = 0;
+  const errors: string[] = [];
+
+  for (let i = 0; i < CTMS_REPORTS.length; i++) {
+    const rep = CTMS_REPORTS[i];
+    jobEventBus.emit(jobId, {
+      type:       "progress",
+      systemName: CTMS_DATA_SYSTEM,
+      percent:    Math.round((i / CTMS_REPORTS.length) * 100),
+      message:    `${rep.label} 수집 중… (${i + 1}/${CTMS_REPORTS.length})`,
+    });
+    try {
+      await CrawlerFactory.runSingle(rep.key, jobId, (event) => {
+        if (event.percent !== undefined || event.message) {
+          jobEventBus.emit(jobId, {
+            type:       "progress",
+            systemName: CTMS_DATA_SYSTEM,
+            message:    `[${rep.label}] ${event.message ?? ""}`,
+          });
+        }
+      });
+      await registerGcpNamedFile(jobId, rep.file);
+      okCount++;
+    } catch (err) {
+      const msg = (err as Error).message;
+      errors.push(`${rep.label}: ${msg}`);
+      logger.error(`[CrawlService] CTMS ${rep.label} 실패: ${msg}`);
+    }
+  }
+
+  if (okCount > 0) {
+    await query(`UPDATE crawl_tasks SET status = 'COMPLETED', updated_at = NOW() WHERE id = $1`, [taskId])
+      .catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
+    jobEventBus.emit(jobId, { type: "task_done", systemName: CTMS_DATA_SYSTEM, filePaths: [] });
+    logger.info(`[CrawlService] CTMS 데이터 수집 완료: ${okCount}/${CTMS_REPORTS.length}` +
+      (errors.length ? ` (실패: ${errors.join("; ")})` : ""));
+  } else {
+    const msg = errors.join("; ") || "수집 실패";
+    await query(`UPDATE crawl_tasks SET status = 'FAILED', error = $1, updated_at = NOW() WHERE id = $2`, [msg, taskId])
+      .catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
+    jobEventBus.emit(jobId, { type: "task_error", systemName: CTMS_DATA_SYSTEM, error: msg });
+  }
+
+  jobEventBus.scheduleCleanup(jobId);
+  return okCount > 0;
+}
+
+// ── DEV 통합 원클릭 수집 (순차: GCP_DATA → MEDCOMMS_DATA → CTMS_DATA → GCP_ACTIVITY) ──
+// 하나라도 실패하면 즉시 중단하고 all_done 을 발행한다.
+// (프론트는 all_done 수신 후 4개 태스크가 모두 COMPLETED 인 경우에만 PDF 를 생성한다)
+
+const DEV_ALL_SYSTEMS = ["GCP_DATA", "MEDCOMMS_DATA", "CTMS_DATA", "GCP_ACTIVITY"] as const;
+
+/** report_jobs / crawl_tasks 준비 + 이전 실행 히스토리 초기화 (UI·cron 공용) */
+async function prepareDevCollectAll(jobId: string, userId: string): Promise<Record<string, string>> {
+  const divRows = await query<{ id: string }>("SELECT id FROM divisions WHERE code = $1", ["DEV"]);
+  if (!divRows.length) throw new AppError(400, "DEV 사업부를 찾을 수 없습니다.");
+
+  // 재시도 대비: 이전 실행의 이벤트 히스토리를 비워 replay 로 옛 실패가 되살아나지 않게 한다.
+  jobEventBus.resetHistory(jobId);
+
+  await query(
+    `INSERT INTO report_jobs (id, division_id, status, started_at, created_by)
+     VALUES ($1, $2, 'RUNNING', NOW(), $3)
+     ON CONFLICT (id) DO UPDATE SET status = 'RUNNING', updated_at = NOW()`,
+    [jobId, divRows[0].id, userId]
+  );
+
+  const taskIds: Record<string, string> = {};
+  for (const system of DEV_ALL_SYSTEMS) {
+    const rows = await query<{ id: string }>(
+      `INSERT INTO crawl_tasks (report_job_id, system_name, task_type, status)
+       VALUES ($1, $2, 'DOWNLOAD', 'PENDING')
+       ON CONFLICT (report_job_id, system_name) DO UPDATE
+         SET task_type = 'DOWNLOAD', status = 'PENDING', updated_at = NOW()
+       RETURNING id`,
+      [jobId, system]
     );
+    taskIds[system] = rows[0].id;
+  }
+  return taskIds;
+}
+
+export async function startDevCollectAll(params: {
+  jobId:  string;
+  userId: string;
+}): Promise<{ jobId: string }> {
+  const { jobId, userId } = params;
+  const taskIds = await prepareDevCollectAll(jobId, userId);
+
+  void runDevCollectAllInBackground(jobId, taskIds);
+
+  logger.info(`[CrawlService] DEV 통합 수집 시작 (순차): job=${jobId}`);
+  return { jobId };
+}
+
+/** 수집 단계별 결과 (자동 수집 이력 기록용) */
+export interface CollectAllResult {
+  ok:       boolean;
+  /** 시스템별 성공 여부 — 중단된 이후 단계는 키가 없다(미실행) */
+  results:  Record<string, boolean>;
+  failedAt: string | null;
+}
+
+/**
+ * 무인(cron) 실행용 — 수집이 끝날 때까지 **기다린 뒤** 단계별 결과를 돌려준다.
+ * UI 경로(startDevCollectAll)와 동일한 순차 로직·실패 시 중단 정책을 공유한다.
+ */
+export async function runDevCollectAllAwait(params: {
+  jobId:  string;
+  userId: string;
+}): Promise<CollectAllResult> {
+  const { jobId, userId } = params;
+  const taskIds = await prepareDevCollectAll(jobId, userId);
+  logger.info(`[CrawlService] DEV 자동 수집 시작 (순차, 대기): job=${jobId}`);
+  return runDevCollectAllInBackground(jobId, taskIds);
+}
+
+async function runDevCollectAllInBackground(
+  jobId:   string,
+  taskIds: Record<string, string>,
+): Promise<CollectAllResult> {
+  const steps: Array<{ system: string; run: () => Promise<boolean> }> = [
+    { system: "GCP_DATA",      run: () => runGcpDataInBackground(jobId, taskIds["GCP_DATA"]) },
+    { system: "MEDCOMMS_DATA", run: () => runMedcommsDataInBackground(jobId, taskIds["MEDCOMMS_DATA"]) },
+    { system: "CTMS_DATA",     run: () => runCtmsDataInBackground(jobId, taskIds["CTMS_DATA"]) },
+    { system: "GCP_ACTIVITY",  run: () => runGcpActivityInBackground(jobId, taskIds["GCP_ACTIVITY"]) },
+  ];
+
+  // 완료 신호로 all_done 을 쓰지 않는다.
+  //   all_done 은 SSE 스트림을 종료시키고 히스토리에 남아, 같은 jobId 재실행 시
+  //   replay 로 스트림이 조기 종료된다(crawl.controller.streamCrawlHandler).
+  //   프론트는 개별 수집과 동일하게 taskMap 상태(모두 COMPLETED / 하나라도 FAILED)로 완료를 감지한다.
+  const results: Record<string, boolean> = {};
+
+  for (const step of steps) {
+    let ok = false;
+    try {
+      ok = await step.run();
+    } catch (e) {
+      logger.error(`[CrawlService] DEV 통합 수집 단계 오류 (${step.system}): ${(e as Error).message}`);
+    }
+    results[step.system] = ok;
+    if (!ok) {
+      // 실패 시 중단 — 실패한 태스크는 이미 FAILED(task_error)로 표시됨.
+      //   나머지 단계는 실행하지 않으며 PENDING 으로 남는다(프론트가 실패로 판정).
+      logger.warn(`[CrawlService] DEV 통합 수집 중단 — ${step.system} 실패`);
+      jobEventBus.scheduleCleanup(jobId);
+      return { ok: false, results, failedAt: step.system };
+    }
+  }
+
+  logger.info(`[CrawlService] DEV 통합 수집 완료 (4/4)`);
+  jobEventBus.scheduleCleanup(jobId);
+  return { ok: true, results, failedAt: null };
+}
+
+// ── L HOUSE 원클릭 통합 수집 (순차: LHOUSE_DATA → VEEVA(Activity), 실패 시 중단) ──
+//   개발본부와 동일 패턴 — all_done 미발행, 프론트가 taskMap 으로 완료 감지.
+
+const LHOUSE_ACTIVITY_SYSTEM = "VEEVA";
+const LHOUSE_ALL_SYSTEMS = ["LHOUSE_DATA", LHOUSE_ACTIVITY_SYSTEM] as const;
+
+/** report_jobs / crawl_tasks 준비 + 히스토리 초기화 (UI·cron 공용) */
+async function prepareLhouseCollectAll(jobId: string, userId: string): Promise<Record<string, string>> {
+  const divRows = await query<{ id: string }>("SELECT id FROM divisions WHERE code = $1", [LHOUSE_DATA_DIV]);
+  if (!divRows.length) throw new AppError(400, "LHOUSE 사업부를 찾을 수 없습니다.");
+
+  // 재시도 대비: 이전 실행의 이벤트 히스토리를 비운다.
+  jobEventBus.resetHistory(jobId);
+
+  await query(
+    `INSERT INTO report_jobs (id, division_id, status, started_at, created_by)
+     VALUES ($1, $2, 'RUNNING', NOW(), $3)
+     ON CONFLICT (id) DO UPDATE SET status = 'RUNNING', updated_at = NOW()`,
+    [jobId, divRows[0].id, userId]
+  );
+
+  const taskIds: Record<string, string> = {};
+  for (const system of LHOUSE_ALL_SYSTEMS) {
+    const rows = await query<{ id: string }>(
+      `INSERT INTO crawl_tasks (report_job_id, system_name, task_type, status)
+       VALUES ($1, $2, 'DOWNLOAD', 'PENDING')
+       ON CONFLICT (report_job_id, system_name) DO UPDATE
+         SET task_type = 'DOWNLOAD', status = 'PENDING', updated_at = NOW()
+       RETURNING id`,
+      [jobId, system]
+    );
+    taskIds[system] = rows[0].id;
+  }
+  return taskIds;
+}
+
+export async function startLhouseCollectAll(params: {
+  jobId:  string;
+  userId: string;
+}): Promise<{ jobId: string }> {
+  const { jobId, userId } = params;
+  const taskIds = await prepareLhouseCollectAll(jobId, userId);
+
+  void runLhouseCollectAllInBackground(jobId, taskIds);
+
+  logger.info(`[CrawlService] LHOUSE 통합 수집 시작 (순차): job=${jobId}`);
+  return { jobId };
+}
+
+/** 무인(cron) 실행용 — 수집 완료까지 기다린 뒤 단계별 결과를 반환 */
+export async function runLhouseCollectAllAwait(params: {
+  jobId:  string;
+  userId: string;
+}): Promise<CollectAllResult> {
+  const { jobId, userId } = params;
+  const taskIds = await prepareLhouseCollectAll(jobId, userId);
+  logger.info(`[CrawlService] LHOUSE 자동 수집 시작 (순차, 대기): job=${jobId}`);
+  return runLhouseCollectAllInBackground(jobId, taskIds);
+}
+
+async function runLhouseCollectAllInBackground(
+  jobId:   string,
+  taskIds: Record<string, string>,
+): Promise<CollectAllResult> {
+  const steps: Array<{ system: string; run: () => Promise<boolean> }> = [
+    { system: "LHOUSE_DATA",          run: () => runLhouseDataInBackground(jobId, taskIds["LHOUSE_DATA"]) },
+    { system: LHOUSE_ACTIVITY_SYSTEM, run: () => runLhouseVeevaCrawl(jobId, taskIds[LHOUSE_ACTIVITY_SYSTEM]) },
+  ];
+
+  const results: Record<string, boolean> = {};
+
+  for (const step of steps) {
+    let ok = false;
+    try {
+      ok = await step.run();
+    } catch (e) {
+      logger.error(`[CrawlService] LHOUSE 통합 수집 단계 오류 (${step.system}): ${(e as Error).message}`);
+    }
+    results[step.system] = ok;
+    if (!ok) {
+      logger.warn(`[CrawlService] LHOUSE 통합 수집 중단 — ${step.system} 실패`);
+      jobEventBus.scheduleCleanup(jobId);
+      return { ok: false, results, failedAt: step.system };
+    }
+  }
+
+  logger.info(`[CrawlService] LHOUSE 통합 수집 완료 (2/2)`);
+  jobEventBus.scheduleCleanup(jobId);
+  return { ok: true, results, failedAt: null };
+}
+
+// L HOUSE Veeva 시스템 조회(전체 크롤) → Activity_LHOUSE.xlsx 생성 + uploaded_files 등록.
+//   (기존 /crawl/start 의 VEEVA named-slot 등록 로직과 동일 결과)
+async function runLhouseVeevaCrawl(jobId: string, taskId: string): Promise<boolean> {
+  let succeeded = false;
+  jobEventBus.emit(jobId, { type: "task_start", systemName: LHOUSE_ACTIVITY_SYSTEM, total: 1 });
+  await query(`UPDATE crawl_tasks SET status = 'RUNNING', updated_at = NOW() WHERE id = $1`, [taskId])
+    .catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
+
+  try {
+    const result = await CrawlerFactory.run("LHOUSE", "VEEVA", jobId, (event) => {
+      if (event.percent !== undefined || event.message) {
+        jobEventBus.emit(jobId, {
+          type:       "progress",
+          systemName: LHOUSE_ACTIVITY_SYSTEM,
+          percent:    event.percent,
+          message:    event.message,
+        });
+      }
+    });
 
     const resultPath = result.files[0] ?? null;
-
-    if (resultPath) {
+    if (resultPath && fs.existsSync(resultPath)) {
       try {
-        const uploadDir  = process.env.UPLOAD_DIR ?? "uploads";
-        const uploadsDir = path.resolve(uploadDir, jobId, "uploads");
-        fs.mkdirSync(uploadsDir, { recursive: true });
-
-        const savedFilename = "Systemusage_RD.png";
-        const destPath      = path.join(uploadsDir, savedFilename);
-        fs.copyFileSync(resultPath, destPath);
-
-        const fileSize = fs.statSync(destPath).size;
-
+        const fileSize = fs.statSync(resultPath).size;
         const existing = await query<{ id: string }>(
           `SELECT id FROM uploaded_files
-           WHERE report_job_id = $1
-             AND original_name IN ('Systemusage_RD.png', 'Systemusage_RD.jpg')
+           WHERE report_job_id = $1 AND original_name = 'Activity_LHOUSE.xlsx'
            ORDER BY created_at DESC LIMIT 1`,
           [jobId]
         );
         if (existing.length) {
           await query(
             `UPDATE uploaded_files
-             SET original_name = $1, stored_path = $2, file_type = 'image/png', file_size = $3,
+             SET stored_path = $1, file_type = $2, file_size = $3,
                  analysis_result = '{}'::jsonb, created_at = NOW()
              WHERE id = $4`,
-            [savedFilename, destPath, fileSize, existing[0].id]
+            [resultPath, GCP_XLSX_MIME, fileSize, existing[0].id]
           );
-          logger.info(`[CrawlService] BIO RD System Usage replaced: ${destPath}`);
         } else {
           await query(
             `INSERT INTO uploaded_files
                (report_job_id, original_name, stored_path, file_type, file_size)
-             VALUES ($1, $2, $3, 'image/png', $4)`,
-            [jobId, savedFilename, destPath, fileSize]
+             VALUES ($1, 'Activity_LHOUSE.xlsx', $2, $3, $4)`,
+            [jobId, resultPath, GCP_XLSX_MIME, fileSize]
           );
-          logger.info(`[CrawlService] BIO RD System Usage saved: ${destPath}`);
         }
+        logger.info(`[CrawlService] LHOUSE Activity 등록: ${resultPath}`);
       } catch (saveErr) {
-        logger.warn(
-          `[CrawlService] BIO RD System Usage 파일 등록 실패 (무시): ${(saveErr as Error).message}`
-        );
+        logger.warn(`[CrawlService] LHOUSE Activity 파일 등록 실패 (무시): ${(saveErr as Error).message}`);
       }
     }
 
@@ -1131,188 +1283,22 @@ async function runBioRdDashboardInBackground(jobId: string, taskId: string): Pro
       `UPDATE crawl_tasks SET status = 'COMPLETED', result_path = $1, updated_at = NOW() WHERE id = $2`,
       [resultPath, taskId]
     ).catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
-
-    jobEventBus.emit(jobId, {
-      type:       "task_done",
-      systemName: BIO_RD_DASHBOARD_SYSTEM,
-      filePaths:  result.files,
-    });
-
-    logger.info(`[CrawlService] BIO R&D Dashboard capture done: ${resultPath}`);
+    jobEventBus.emit(jobId, { type: "task_done", systemName: LHOUSE_ACTIVITY_SYSTEM, filePaths: result.files });
+    logger.info(`[CrawlService] LHOUSE Veeva 시스템 조회 완료: ${resultPath}`);
+    succeeded = true;
 
   } catch (err) {
     const errMsg = (err as Error).message;
-    logger.error(`[CrawlService] BIO R&D Dashboard capture failed: ${errMsg}`);
-
+    logger.error(`[CrawlService] LHOUSE Veeva 시스템 조회 실패: ${errMsg}`);
     await query(
       `UPDATE crawl_tasks SET status = 'FAILED', error = $1, updated_at = NOW() WHERE id = $2`,
       [errMsg, taskId]
     ).catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
-
-    jobEventBus.emit(jobId, {
-      type:       "task_error",
-      systemName: BIO_RD_DASHBOARD_SYSTEM,
-      error:      errMsg,
-    });
+    jobEventBus.emit(jobId, { type: "task_error", systemName: LHOUSE_ACTIVITY_SYSTEM, error: errMsg });
   }
 
-  // 단일 태스크 잡 — all_done 미발행 (병렬 캡처 시 다른 잡의 SSE 스트림이 끊기는 것 방지)
   jobEventBus.scheduleCleanup(jobId);
-}
-
-// ── DEV Clinical (CTMS) 대시보드 캡처 잡 ─────────────────────────────────────
-
-const CLINICAL_DASHBOARD_SYSTEM = "CLINICAL_DASHBOARD";
-const CLINICAL_DASHBOARD_DIV    = "DEV" as const;
-
-export async function startClinicalDashboardCapture(params: {
-  jobId:  string;
-  userId: string;
-}): Promise<{ taskId: string }> {
-  const { jobId, userId } = params;
-
-  const divRows = await query<{ id: string }>(
-    "SELECT id FROM divisions WHERE code = $1",
-    [CLINICAL_DASHBOARD_DIV]
-  );
-  if (!divRows.length) throw new AppError(400, "DEV 사업부를 찾을 수 없습니다.");
-  const divisionId = divRows[0].id;
-
-  await query(
-    `INSERT INTO report_jobs (id, division_id, status, started_at, created_by)
-     VALUES ($1, $2, 'RUNNING', NOW(), $3)
-     ON CONFLICT (id) DO UPDATE SET status = 'RUNNING', updated_at = NOW()`,
-    [jobId, divisionId, userId]
-  );
-
-  const crawlTaskResult = await query<{ id: string }>(
-    `INSERT INTO crawl_tasks (report_job_id, system_name, task_type, status)
-     VALUES ($1, $2, 'DOWNLOAD', 'PENDING')
-     ON CONFLICT (report_job_id, system_name) DO UPDATE
-       SET task_type = 'DOWNLOAD', status = 'PENDING', updated_at = NOW()
-     RETURNING id`,
-    [jobId, CLINICAL_DASHBOARD_SYSTEM]
-  );
-  const taskId = crawlTaskResult[0].id;
-
-  void runClinicalDashboardInBackground(jobId, taskId);
-
-  logger.info(`[CrawlService] Clinical Dashboard capture started: job=${jobId}, task=${taskId}`);
-  return { taskId };
-}
-
-async function runClinicalDashboardInBackground(jobId: string, taskId: string): Promise<void> {
-  jobEventBus.emit(jobId, {
-    type:       "task_start",
-    systemName: CLINICAL_DASHBOARD_SYSTEM,
-    total:      1,
-  });
-
-  await query(
-    `UPDATE crawl_tasks SET status = 'RUNNING', updated_at = NOW() WHERE id = $1`,
-    [taskId]
-  ).catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
-
-  try {
-    const result = await CrawlerFactory.runSingle(
-      CLINICAL_DASHBOARD_SYSTEM,
-      jobId,
-      (event) => {
-        if (event.percent !== undefined || event.message) {
-          jobEventBus.emit(jobId, {
-            type:       "progress",
-            systemName: CLINICAL_DASHBOARD_SYSTEM,
-            percent:    event.percent,
-            message:    event.message,
-          });
-        }
-      }
-    );
-
-    // result.files[0] = 차트 2+3 결합 → Systemusage_Clinical1.png
-    // result.files[1] = 차트 1 단독   → Systemusage_Clinical2.png
-    const clinical1Src = result.files[0] ?? null;
-    const clinical2Src = result.files[1] ?? null;
-
-    const uploadDir  = process.env.UPLOAD_DIR ?? "uploads";
-    const uploadsDir = path.resolve(uploadDir, jobId, "uploads");
-    fs.mkdirSync(uploadsDir, { recursive: true });
-
-    const saveSlot = async (srcPath: string | null, savedFilename: string) => {
-      if (!srcPath) return;
-      try {
-        const destPath = path.join(uploadsDir, savedFilename);
-        fs.copyFileSync(srcPath, destPath);
-        const fileSize = fs.statSync(destPath).size;
-
-        // .jpg(수동 업로드) / .png(이전 캡처) 모두 탐색 → 최신 1건을 PNG로 덮어씀
-        const jpgName = savedFilename.replace(/\.png$/, ".jpg");
-        const existing = await query<{ id: string }>(
-          `SELECT id FROM uploaded_files
-           WHERE report_job_id = $1
-             AND original_name IN ($2, $3)
-           ORDER BY created_at DESC LIMIT 1`,
-          [jobId, savedFilename, jpgName]
-        );
-        if (existing.length) {
-          await query(
-            `UPDATE uploaded_files
-             SET original_name = $1, stored_path = $2, file_type = 'image/png', file_size = $3,
-                 analysis_result = '{}'::jsonb, created_at = NOW()
-             WHERE id = $4`,
-            [savedFilename, destPath, fileSize, existing[0].id]
-          );
-          logger.info(`[CrawlService] Clinical ${savedFilename} replaced: ${destPath}`);
-        } else {
-          await query(
-            `INSERT INTO uploaded_files
-               (report_job_id, original_name, stored_path, file_type, file_size)
-             VALUES ($1, $2, $3, 'image/png', $4)`,
-            [jobId, savedFilename, destPath, fileSize]
-          );
-          logger.info(`[CrawlService] Clinical ${savedFilename} saved: ${destPath}`);
-        }
-      } catch (saveErr) {
-        logger.warn(
-          `[CrawlService] Clinical ${savedFilename} 등록 실패 (무시): ${(saveErr as Error).message}`
-        );
-      }
-    };
-
-    await saveSlot(clinical1Src, "Systemusage_Clinical1.png");
-    await saveSlot(clinical2Src, "Systemusage_Clinical2.png");
-
-    await query(
-      `UPDATE crawl_tasks SET status = 'COMPLETED', result_path = $1, updated_at = NOW() WHERE id = $2`,
-      [clinical1Src, taskId]
-    ).catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
-
-    jobEventBus.emit(jobId, {
-      type:       "task_done",
-      systemName: CLINICAL_DASHBOARD_SYSTEM,
-      filePaths:  result.files,
-    });
-
-    logger.info(`[CrawlService] Clinical Dashboard capture done`);
-
-  } catch (err) {
-    const errMsg = (err as Error).message;
-    logger.error(`[CrawlService] Clinical Dashboard capture failed: ${errMsg}`);
-
-    await query(
-      `UPDATE crawl_tasks SET status = 'FAILED', error = $1, updated_at = NOW() WHERE id = $2`,
-      [errMsg, taskId]
-    ).catch((e: Error) => logger.warn(`[CrawlService] DB update failed: ${e.message}`));
-
-    jobEventBus.emit(jobId, {
-      type:       "task_error",
-      systemName: CLINICAL_DASHBOARD_SYSTEM,
-      error:      errMsg,
-    });
-  }
-
-  // 단일 태스크 잡 — all_done 미발행 (병렬 캡처 시 다른 잡의 SSE 스트림이 끊기는 것 방지)
-  jobEventBus.scheduleCleanup(jobId);
+  return succeeded;
 }
 
 // ── 백그라운드 실행 ────────────────────────────────────────────────────────────

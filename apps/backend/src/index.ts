@@ -4,6 +4,7 @@ import fs from "fs";
 import app from "./app";
 import { testConnection, runMigrations } from "./config/db";
 import { logger } from "./utils/logger";
+import { startCollectionScheduler, stopCollectionScheduler } from "./modules/dashboard/collection.scheduler";
 
 const PORT = Number(process.env.PORT ?? 4000);
 
@@ -35,9 +36,13 @@ for (const dir of [
     logger.info(`[Server] http://localhost:${PORT}  (${process.env.NODE_ENV ?? "development"})`);
   });
 
+  // 대시보드 자동 수집 스케줄러 (매일 새벽) — DASHBOARD_CRON_ENABLED=false 로 끌 수 있음
+  startCollectionScheduler();
+
   // Graceful shutdown
   const shutdown = (signal: string) => {
     logger.info(`[Server] ${signal} received — shutting down`);
+    stopCollectionScheduler();
     server.close(() => {
       logger.info("[Server] HTTP server closed");
       process.exit(0);

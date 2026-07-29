@@ -18,13 +18,14 @@ import {
   streamCrawlHandler,
   getJobStatusHandler,
   screenshotHandler,
-  veevaDashboardHandler,
-  gcpDashboardHandler,
   gcpActivityHandler,
+  devCollectAllHandler,
+  lhouseCollectAllHandler,
   gcpDataHandler,
-  medcommsDashboardHandler,
-  clinicalDashboardHandler,
-  bioRdDashboardHandler,
+  lhouseDataHandler,
+  medcommsDataHandler,
+  ctmsDataHandler,
+  bioDataHandler,
 } from "./crawl.controller";
 
 export const crawlRouter = Router();
@@ -42,22 +43,22 @@ crawlRouter.post("/start", startCrawlHandler);
 crawlRouter.post("/screenshot", screenshotHandler);
 
 // ---------------------------------------------------------------------------
-// POST /api/crawl/veeva-dashboard
-// Veeva 대시보드 6개 차트 스크린샷 캡처 (LHOUSE, SSE로 완료 알림)
-// ---------------------------------------------------------------------------
-crawlRouter.post("/veeva-dashboard", veevaDashboardHandler);
-
-// ---------------------------------------------------------------------------
-// POST /api/crawl/gcp-dashboard
-// GCP Quality System Veeva 대시보드 스크린샷 캡처 (DEV, SSE로 완료 알림)
-// ---------------------------------------------------------------------------
-crawlRouter.post("/gcp-dashboard", gcpDashboardHandler);
-
-// ---------------------------------------------------------------------------
 // POST /api/crawl/gcp-activity
 // GCP Quality System Activity (Task) Count 리포트 Excel export → Activity_GCP.xlsx
 // ---------------------------------------------------------------------------
 crawlRouter.post("/gcp-activity", gcpActivityHandler);
+
+// ---------------------------------------------------------------------------
+// POST /api/crawl/dev-collect-all
+// 개발본부 원클릭: 데이터 수집 3종(GCP/Medcomms/CTMS) + 시스템 조회 1종(GCP Activity) 순차 실행
+// ---------------------------------------------------------------------------
+crawlRouter.post("/dev-collect-all", devCollectAllHandler);
+
+// ---------------------------------------------------------------------------
+// POST /api/crawl/lhouse-collect-all
+// L HOUSE 원클릭: 데이터 수집(LHOUSE_DATA) + 시스템 조회(VEEVA → Activity) 순차 실행
+// ---------------------------------------------------------------------------
+crawlRouter.post("/lhouse-collect-all", lhouseCollectAllHandler);
 
 // ---------------------------------------------------------------------------
 // POST /api/crawl/gcp-data
@@ -66,22 +67,28 @@ crawlRouter.post("/gcp-activity", gcpActivityHandler);
 crawlRouter.post("/gcp-data", gcpDataHandler);
 
 // ---------------------------------------------------------------------------
-// POST /api/crawl/medcomms-dashboard
-// Medcomms Veeva 대시보드 스크린샷 캡처 (DEV, SSE로 완료 알림)
+// POST /api/crawl/lhouse-data
+// L HOUSE Veeva 보고서용 리포트 수집 (PerfStats/Quality Excel export + Training 화면 스크래핑)
 // ---------------------------------------------------------------------------
-crawlRouter.post("/medcomms-dashboard", medcommsDashboardHandler);
+crawlRouter.post("/lhouse-data", lhouseDataHandler);
 
 // ---------------------------------------------------------------------------
-// POST /api/crawl/clinical-dashboard
-// Clinical(CTMS) Veeva 대시보드 스크린샷 캡처 (DEV, SSE로 완료 알림)
+// POST /api/crawl/bio-data
+// Bio연구본부 Veeva 보고서용 리포트 수집 (Activity/PerfStats/DocType 화면 스크래핑)
 // ---------------------------------------------------------------------------
-crawlRouter.post("/clinical-dashboard", clinicalDashboardHandler);
+crawlRouter.post("/bio-data", bioDataHandler);
 
 // ---------------------------------------------------------------------------
-// POST /api/crawl/bio-rd-dashboard
-// BIO 연구본부 R&D Veeva 대시보드 스크린샷 캡처 (BIO, SSE로 완료 알림)
+// POST /api/crawl/medcomms-data
+// Medcomms 보고서용 4개 리포트 Excel export (DocType/PerfStats/Activity/Review)
 // ---------------------------------------------------------------------------
-crawlRouter.post("/bio-rd-dashboard", bioRdDashboardHandler);
+crawlRouter.post("/medcomms-data", medcommsDataHandler);
+
+// ---------------------------------------------------------------------------
+// POST /api/crawl/ctms-data
+// CTMS/eTMF 보고서용 2개 리포트 Excel export (PerfStats/Study)
+// ---------------------------------------------------------------------------
+crawlRouter.post("/ctms-data", ctmsDataHandler);
 
 // ---------------------------------------------------------------------------
 // GET /api/crawl/:jobId/stream  (SSE)

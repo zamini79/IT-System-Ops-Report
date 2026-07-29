@@ -1,5 +1,6 @@
 import fs                      from "fs";
 import path                    from "path";
+import { openVeevaReportUrl } from "./veevaNavigation";
 import { BaseCrawler }         from "../../BaseCrawler";
 import type { CrawlerContext } from "../../types";
 
@@ -30,8 +31,14 @@ export abstract class VeevaReportExportCrawler extends BaseCrawler {
   protected exportFormat:   "Template" | "Formatted" = "Formatted";
   protected injectDateRange = false;
 
-  protected readonly veevaUser = process.env.DEV_GCP_VEEVA_USER ?? process.env.LHOUSE_VEEVA_USER ?? "apiadmin@sk.com";
-  protected readonly veevaPass = process.env.DEV_GCP_VEEVA_PASS ?? process.env.LHOUSE_VEEVA_PASS ?? "12345QWert";
+  /** 계정 env 접두 (예: DEV_GCP, DEV_MEDCOMMS). 서브클래스에서 재정의 가능. */
+  protected credEnv = "DEV_GCP";
+  protected get veevaUser(): string {
+    return process.env[`${this.credEnv}_VEEVA_USER`] ?? process.env.LHOUSE_VEEVA_USER ?? "apiadmin@sk.com";
+  }
+  protected get veevaPass(): string {
+    return process.env[`${this.credEnv}_VEEVA_PASS`] ?? process.env.LHOUSE_VEEVA_PASS ?? "12345QWert";
+  }
 
   constructor(ctx: CrawlerContext) {
     super(ctx);
@@ -187,6 +194,7 @@ export abstract class VeevaReportExportCrawler extends BaseCrawler {
 
     // 3) anchorText가 visible 요소에 나타날 때까지 폴링 (최대 60초)
     this.emit("navigating", `'${anchorText}' 콘텐츠 확인 중…`, 39);
+    let anchorFound = false;
     const deadline = Date.now() + CONTENT_TIMEOUT;
     while (Date.now() < deadline) {
       const found = await this.page.evaluate((text) => {
@@ -200,7 +208,7 @@ export abstract class VeevaReportExportCrawler extends BaseCrawler {
         }
         return false;
       }, anchorText);
-      if (found) break;
+      if (found) { anchorFound = true; break; }
       await this.page.waitForTimeout(1_000);
     }
 
@@ -224,7 +232,14 @@ export abstract class VeevaReportExportCrawler extends BaseCrawler {
     // 5) 디버그 스크린샷 (viewport만 — 현재 보이는 상태 확인용)
     const shotPath = `${this.downloadDir}/debug_loaded_${Date.now()}.png`;
     await this.page.screenshot({ path: shotPath, fullPage: false }).catch(() => {});
-    this.emit("navigating", `페이지 로딩 완료 (스크린샷: ${shotPath})`, 40);
+    if (anchorFound) {
+      this.emit("navigating", `페이지 로딩 완료 (스크린샷: ${shotPath})`, 40);
+    } else {
+      // 리포트 라우트 검증은 이동 단계에서 이미 통과했으므로 여기서 예외를 던지지는 않는다.
+      // 다만 "완료" 로 오인되지 않도록 경고로 남긴다(과거 오진의 원인).
+      this.emit("navigating",
+        `'${anchorText}' 텍스트를 확인하지 못했습니다 — 계속 진행합니다. (스크린샷: ${shotPath})`, 40);
+    }
   }
 
   // ── 헬퍼: "Running report …" 배너(=리포트 실행 중) 가시 여부 ───────────────────
@@ -639,7 +654,8 @@ export abstract class VeevaReportExportCrawler extends BaseCrawler {
 
   // ── 메인 ─────────────────────────────────────────────────────────────────────
 
-  protected async downloadReport(): Promise<string[]> {
+  /** Step 1-3: 로그인 → Vault 선택 → 리포트 URL 접속 + 로딩 대기 (Excel export / 화면 스크래핑 공용) */
+  protected async loginVaultAndOpenReport(): Promise<void> {
 
     // ── Step 1. 로그인 ───────────────────────────────────────────────────────────
     this.emit("login", "Veeva Vault 로그인 페이지 접속 중…", 3);
@@ -755,31 +771,21 @@ export abstract class VeevaReportExportCrawler extends BaseCrawler {
     // ── Step 3. 리포트 URL 직접 접속 + 완전 로딩 대기 ──────────────────────────────
     this.emit("navigating", "리포트 페이지 접속 중…", 30);
 
-    // Vault(GCP) 선택 후 이미 sk-gcp.veevavault.com/ui/ 에 와 있으면,
-    // 해시(#reporting/...)만 다른 URL로의 goto는 same-document 이동이라 net::ERR_ABORTED
-    // 가 발생한다. 같은 문서면 in-page 해시 변경으로 라우팅하고, 다른 문서일 때만 goto 한다.
+    // 이동 + 실제로 리포트 라우트에 머물렀는지 검증 (공용 헬퍼).
+    //   해시만 바꾸면 SPA 부팅 라우팅과 경쟁해 Home 으로 튕기는 문제가 있어,
+    //   해시를 심고 강제 재로딩한 뒤 URL 유지를 확인한다. 실패 시 명확한 예외를 던진다.
     const targetUrl = this.buildReportUrl();
-    const sameDoc   = this.page.url().split("#")[0] === targetUrl.split("#")[0];
-
-    if (sameDoc) {
-      await this.page.evaluate((u) => { window.location.href = u; }, targetUrl);
-      await this.page.waitForTimeout(2_000);
-    } else {
-      try {
-        await this.page.goto(targetUrl, {
-          waitUntil: "domcontentloaded", // SPA는 networkidle이 오래 걸리므로 DOM 기준으로 먼저
-          timeout:   60_000,
-        });
-      } catch (e: any) {
-        // SPA 해시 네비게이션이 same-document 로 처리되어 ABORT 되는 경우는 무시
-        if (!String(e?.message ?? e).includes("ERR_ABORTED")) throw e;
-      }
-    }
-    await this.page.waitForLoadState("domcontentloaded").catch(() => {});
+    await openVeevaReportUrl(this.page, targetUrl, {
+      emit: (m) => this.emit("navigating", m, 31),
+    });
 
     this.emit("navigating", "리포트 페이지 렌더링 대기 중…", 33);
     await this._waitForReportReady(this.titlePrefix || "Back to reports");
     await this._debugShot("report_loaded");
+  }
+
+  protected async downloadReport(): Promise<string[]> {
+    await this.loginVaultAndOpenReport();
 
     // ── Step 4-5. … 메뉴 → Export to Excel (리포트 로딩 완료까지 재시도) ─────────
     // 리포트가 아직 실행 중("Running report" 배너 / 표가 연하게 표시)이면 … 메뉴에

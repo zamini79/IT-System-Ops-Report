@@ -17,7 +17,11 @@ import { v4 as uuidv4 } from "uuid";
 import { respond }       from "../../utils/response";
 import { AppError }      from "../../utils/errors";
 import { logger }        from "../../utils/logger";
-import { xlsxSheetToPng } from "../../utils/xlsxSheetToPng";
+import { DASHBOARD_JOB_IDS } from "../dashboard/dashboard.types";
+import { refreshSnapshot }   from "../dashboard/dashboard.service";
+import { DEV_SOURCES }       from "../dashboard/dev.dashboard.service";
+import { LHOUSE_SOURCES }    from "../dashboard/lhouse.dashboard.service";
+import { BIO_SOURCES }       from "../dashboard/bio.dashboard.service";
 import {
   saveUploadedFiles,
   saveNamedUploadedFile,
@@ -268,14 +272,14 @@ const NAMED_SLOTS = {
     label: "임검분 LIMS — 데이터 (Excel)",
   },
   lims_image: {
-    // 사용자는 xlsx 를 업로드하고, 서버에서 "Dash Board" 시트를 LIMS.png 로 변환합니다.
-    filename:   "LIMS.png",
+    // xlsx 를 그대로 LIMS_Dashboard.xlsx 로 저장 (PNG 변환 없음)
+    filename:   "LIMS_Dashboard.xlsx",
     mimeTypes:  new Set([
       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
       "application/vnd.ms-excel",
     ]),
     extensions: new Set([".xlsx", ".xls"]),
-    label: "임검분 LIMS — Dash Board 시트 (Excel)",
+    label: "임검분 LIMS — Dashboard (Excel)",
   },
   eln_report: {
     filename:  "ELN_report.xlsx",
@@ -348,12 +352,6 @@ const namedStorage = multer.diskStorage({
       cb(null, `${base}${ext}`);
       return;
     }
-    // lims_image: xlsx 업로드 → 변환 후 LIMS.png 로 저장됨. 우선 임시 xlsx 로 저장.
-    if (slot === "lims_image") {
-      const ext = path.extname(file.originalname).toLowerCase();
-      cb(null, `_lims_dashboard_input${ext}`);
-      return;
-    }
     const cfg = slot ? NAMED_SLOTS[slot] : undefined;
     cb(null, cfg?.filename ?? `upload_${Date.now()}`);
   },
@@ -394,6 +392,43 @@ const namedUpload = multer({
 
 // ---------------------------------------------------------------------------
 // POST /api/file/upload-named
+/**
+ * 업로드된 파일이 대시보드 소스에 해당하면 스냅샷을 다시 계산한다.
+ *
+ * - 본부 작업공간(DASHBOARD_JOB_IDS)에 올라온 파일 → 그 본부 대시보드 갱신
+ * - 세 본부 공유 Timesheet → jobId 와 무관하게 DEV 대시보드 갱신
+ *   (Timesheet 은 DB 에서 파일명으로 전역 조회되므로 어떤 jobId 로 올라와도 반영된다)
+ *
+ * 업로드 응답을 지연시키지 않도록 fire-and-forget 으로 실행하고, 실패는 로그만 남긴다.
+ */
+function refreshDashboardAfterUpload(jobId: string, savedFilename: string): void {
+  const TIMESHEET = "SKB_Quallity_MS_Timesheet.xlsx";
+  const targets = new Set<"DEV" | "LHOUSE" | "BIO">();
+
+  // 본부 작업공간에 올라온 파일 → 그 본부
+  for (const [code, wsJobId] of Object.entries(DASHBOARD_JOB_IDS)) {
+    if (wsJobId === jobId) targets.add(code as "DEV" | "LHOUSE" | "BIO");
+  }
+  // 공유 Timesheet 은 jobId 와 무관하게 세 본부 모두에 반영된다
+  if (savedFilename === TIMESHEET) {
+    targets.add("DEV"); targets.add("LHOUSE"); targets.add("BIO");
+  }
+
+  // 대시보드가 쓰지 않는 파일이면 아무 것도 하지 않는다
+  const isSource =
+    savedFilename === TIMESHEET ||
+    DEV_SOURCES.some((s) => s.file === savedFilename) ||
+    LHOUSE_SOURCES.some((s) => s.file === savedFilename) ||
+    BIO_SOURCES.some((s) => s.file === savedFilename);
+  if (!targets.size || !isSource) return;
+
+  for (const code of targets) {
+    void refreshSnapshot(code)
+      .then((r) => logger.info(`[FileRouter] 업로드 반영 — ${code} 대시보드 갱신 (${r.capturedDate})`))
+      .catch((e: Error) => logger.warn(`[FileRouter] 대시보드 갱신 실패(${code}): ${e.message}`));
+  }
+}
+
 // multipart/form-data 필드: file (단일), jobId, divisionCode, slot
 // slot: "activity" | "systemusage"
 // ---------------------------------------------------------------------------
@@ -420,24 +455,6 @@ fileRouter.post(
         ? `${cfg.filename.replace(/\.(jpg|jpeg|png)$/i, "")}${path.extname(file.originalname).toLowerCase()}`
         : cfg.filename;
 
-      // lims_image: xlsx → "Dash Board" 시트 PNG 변환 후 LIMS.png 로 저장
-      if (slot === "lims_image") {
-        const targetPath = path.join(path.dirname(file.path), cfg.filename); // .../LIMS.png
-        try {
-          await xlsxSheetToPng(file.path, "Dash Board", targetPath);
-        } catch (e) {
-          try { fs.unlinkSync(file.path); } catch { /* ignore */ }
-          throw new AppError(400, `xlsx → PNG 변환 실패: ${(e as Error).message}`);
-        }
-        // 임시 xlsx 삭제, file 객체를 변환된 PNG 로 교체
-        const pngStat = fs.statSync(targetPath);
-        try { fs.unlinkSync(file.path); } catch { /* ignore */ }
-        file.path     = targetPath;
-        file.filename = cfg.filename;
-        file.mimetype = "image/png";
-        file.size     = pngStat.size;
-      }
-
       const saved = await saveNamedUploadedFile(jobId, divisionCode, userId!, file, savedFilename);
 
       // Excel 슬롯: 암호화 여부 검증 (저장 직후 읽기 시도)
@@ -462,6 +479,10 @@ fileRouter.post(
       }
 
       triggerAnalysis([saved.id]);
+
+      // 업로드가 대시보드에 반영되도록 스냅샷을 다시 계산한다(수집은 하지 않음).
+      //   업로드 응답을 막지 않도록 fire-and-forget.
+      refreshDashboardAfterUpload(jobId, savedFilename);
 
       respond.created(res, { jobId, slot, file: saved }, `${savedFilename} 파일이 저장되었습니다.`);
     } catch (err) {

@@ -24,6 +24,11 @@ import { AppError }     from "../../utils/errors";
 import { logger }       from "../../utils/logger";
 import { PdfGenerator } from "../../engines/report/PdfGenerator";
 import { query }        from "../../config/db";
+import {
+  parseGcpMonthGroups,
+  renderGcpBarToPng,
+  renderGcpGroupedBarToPng,
+} from "./dev.report.service";
 
 // ── 날짜 헬퍼 ─────────────────────────────────────────────────────────────────
 
@@ -51,7 +56,7 @@ function normalizeXmlText(s: string): string {
 
 // ── 차트 데이터 집계 ──────────────────────────────────────────────────────────
 
-interface CategoryCounts {
+export interface CategoryCounts {
   labels: string[];   // D2, D3, D4 값
   values: number[];   // 직접 계산한 카운트
   total:  number;     // 합계
@@ -72,7 +77,7 @@ interface HeadlineStats {
 // ── MS Timesheet 데이터 구조 ─────────────────────────────────────────────────
 
 /** YYYY-MM 시트에서 추출한 SKB GMP 1행 요약 (막대 차트용) */
-interface MsChartRow {
+export interface MsChartRow {
   month:     string;  // e.g. "2026-03"
   possible:  number;  // B열 = GMP 가능 MS
   used:      number;  // C열 = GMP 사용 MS
@@ -91,7 +96,7 @@ interface MsTableRow {
   status:    string;  // M열
 }
 
-interface MsTimesheetData {
+export interface MsTimesheetData {
   chartRows:   MsChartRow[];
   tableRows:   MsTableRow[];
   latestMonth: string;    // e.g. "2026-03"
@@ -144,7 +149,7 @@ function formatMonthKorean(yyyymm: string): string {
  * xlsx(ZIP)를 압축 해제하여 XML 원문을 정규식으로 읽음.
  * Windows에서 Expand-Archive는 .xlsx 확장자를 거부하므로 .zip 복사본 사용.
  */
-function readExportBColumn(xlsxPath: string): CategoryCounts {
+export function readExportBColumn(xlsxPath: string): CategoryCounts {
   logger.info(`[LHOUSE] Export B열(카테고리) 집계 시작: ${xlsxPath}`);
 
   // ── 암호화 검사 ───────────────────────────────────────────────────────────
@@ -938,7 +943,7 @@ async function extractTrainingCount(imagePath: string): Promise<number> {
  *  - A열 = "SKB GMP" 인 첫 행 → B(가능)/C(사용)/D(잔여) 값 수집 (막대 차트용)
  *  - 최신 월 시트의 SKB GMP 그룹 하위 행 → E/G/H/I/J/K/L/M 수집 (표 용)
  */
-function readMsTimesheetData(xlsxPath: string): MsTimesheetData {
+export function readMsTimesheetData(xlsxPath: string): MsTimesheetData {
   let wb: XLSX.WorkBook;
   try {
     wb = XLSX.readFile(xlsxPath);
@@ -1143,12 +1148,265 @@ ${scriptTag}
 
 // ── PDF HTML 빌드 ─────────────────────────────────────────────────────────────
 
+// ── Veeva 데이터 수집 기반 차트 (GCP Quality System 보고서와 동일 방식) ─────────
+//   LHOUSE_PerfStats.xlsx / LHOUSE_Quality.xlsx / LHOUSE_Training.json 를 읽어
+//   #2 문서관리 · #3 품질관리 · #4 교육관리 · #5 사용자등록 · #6 일일사용 막대를 생성한다.
+
+const LH_MONTH_ABBR: Record<string, number> = {
+  jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6,
+  jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12,
+};
+
+/** 교육 화면 스크래핑의 Name(Created Date 월) 문자열 → 월 라벨/정렬키 */
+export function parseTrainingMonth(name: string): { label: string; ym: string | null } {
+  const s = String(name ?? "").trim();
+  let m = s.match(/(\d{4})[-/.\s]+(\d{1,2})\b/);                     // 2026-03 / 2026/3
+  if (m) { const mo = parseInt(m[2], 10); return { label: `${mo}월`, ym: `${m[1]}-${String(mo).padStart(2, "0")}` }; }
+  m = s.match(/(\d{4})\s+([A-Za-z]{3,})/) ?? s.match(/([A-Za-z]{3,})\s+(\d{4})/);  // 2026 Mar / Mar 2026
+  if (m) {
+    const yr     = /^\d{4}$/.test(m[1]) ? m[1] : m[2];
+    const monStr = /^\d{4}$/.test(m[1]) ? m[2] : m[1];
+    const mo     = LH_MONTH_ABBR[monStr.slice(0, 3).toLowerCase()];
+    if (mo) return { label: `${mo}월`, ym: `${yr}-${String(mo).padStart(2, "0")}` };
+  }
+  const mk = s.match(/(\d{1,2})\s*월/);                              // 3월
+  if (mk) return { label: `${parseInt(mk[1], 10)}월`, ym: null };
+  return { label: s, ym: null };
+}
+
+/** 월 라벨(2026 Mar / Mar 2026 / 2026-03 / 03/2026 …) → "YYYY-MM" (실패 시 null) */
+function parseMonthLabel(s: string): string | null {
+  const t   = String(s ?? "").trim();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  let m = t.match(/(\d{4})\s+([A-Za-z]{3,})/);                 // 2026 Mar / 2026 March
+  if (m) { const mo = LH_MONTH_ABBR[m[2].slice(0, 3).toLowerCase()]; if (mo) return `${m[1]}-${pad(mo)}`; }
+  m = t.match(/([A-Za-z]{3,})\s+(\d{4})/);                     // Mar 2026 / March 2026
+  if (m) { const mo = LH_MONTH_ABBR[m[1].slice(0, 3).toLowerCase()]; if (mo) return `${m[2]}-${pad(mo)}`; }
+  m = t.match(/\b(\d{4})[-/.](\d{1,2})\b/);                    // 2026-03 / 2026/3 / 2026-03-01
+  if (m) { const mo = parseInt(m[2], 10); if (mo >= 1 && mo <= 12) return `${m[1]}-${pad(mo)}`; }
+  m = t.match(/\b(\d{1,2})\/(\d{4})\b/);                       // 03/2026
+  if (m) { const mo = parseInt(m[1], 10); if (mo >= 1 && mo <= 12) return `${m[2]}-${pad(mo)}`; }
+  return null;
+}
+
+/**
+ * L HOUSE 품질 리포트(Formatted) 파싱 → 월 × Quality Event Type 분포.
+ *
+ * Excel 구조(2단 그룹):
+ *   A열 "Quality Event Type: <type>"            ← 상위 분류
+ *   A열   "Created Date(Month): <month>"  B열 N  ← 하위 분류(월) + Quality Event Count
+ *   A열   "Created Date(Month): <month>"  B열 N
+ *   A열 "Quality Event Type: <next type>"
+ *   ...
+ * → Type별 월 집계를 '월' 기준으로 뒤집어 byMonth[YYYY-MM][type] = count 로 만든다.
+ */
+export function parseLhouseQualityByType(
+  xlsxPath: string,
+): { types: string[]; byMonth: Record<string, Record<string, number>> } {
+  const byMonth: Record<string, Record<string, number>> = {};
+  const types: string[] = [];
+  try {
+    const wb   = XLSX.readFile(xlsxPath);
+    const rows = XLSX.utils.sheet_to_json<unknown[]>(
+      wb.Sheets[wb.SheetNames[0]], { header: 1, defval: "" }
+    ) as unknown[][];
+
+    const numAt = (r: unknown[], i: number): number => {
+      const raw = String(r[i] ?? "").trim();
+      const n   = Number(raw.replace(/,/g, ""));
+      return raw !== "" && Number.isFinite(n) ? n : NaN;
+    };
+    const firstNum = (r: unknown[]): number => {
+      for (let i = 1; i < r.length; i++) { const n = numAt(r, i); if (Number.isFinite(n)) return n; }
+      return NaN;
+    };
+
+    let curType: string | null = null;
+    for (const r of rows) {
+      const a = String(r[0] ?? "").trim();
+
+      // 상위 분류: Quality Event Type
+      const tm = a.match(/Quality Event Type:\s*(.+?)\s*(?:\([\d,]+\))?\s*$/i);
+      if (tm) {
+        const t = tm[1].trim();
+        curType = (!t || /^all\b/i.test(t)) ? null : t;   // "All Quality Event Type" 총계행 제외
+        if (curType && !types.includes(curType)) types.push(curType);
+        continue;
+      }
+
+      // 하위 분류: Created Date(Month) — 현재 타입의 해당 월 건수(B열)를 기록
+      const mm = a.match(/Created\s*Date\s*\(Month\):\s*(.+?)\s*$/i);
+      if (mm && curType) {
+        const ym = parseMonthLabel(mm[1]);
+        if (!ym || /^all\b/i.test(mm[1].trim())) continue;  // "All Created Date" 총계행 제외
+        let val = numAt(r, 1);                              // B열 = Quality Event Count
+        if (!Number.isFinite(val)) val = firstNum(r);       // 폴백: 첫 숫자 셀
+        if (!Number.isFinite(val)) val = 0;
+        byMonth[ym] = byMonth[ym] ?? {};
+        byMonth[ym][curType] = (byMonth[ym][curType] ?? 0) + val;
+      }
+    }
+  } catch (e) {
+    logger.warn(`[LHOUSE Report] 품질 세분화 파싱 실패: ${(e as Error).message}`);
+  }
+  return { types, byMonth };
+}
+
+interface LhouseVeevaCharts {
+  docCount:    string | null;  // #2 문서 관리 (E Doc Count 월평균)
+  quality:     string | null;  // #3 품질 관리 (Quality Event Type 월별 그룹)
+  training:    string | null;  // #4 교육 관리 (월별 Activity count)
+  activeUser:  string | null;  // #5 사용자 등록 (B Active User 월평균)
+  uniqueLogin: string | null;  // #6 일일 사용 (D Unique Login 월평균)
+  msgs: { doc: string; quality: string; training: string; user: string; login: string };
+  insight: string[];
+  data: { docLast: number; userLast: number; loginLast: number; qualityTotal: number; trainingTotal: number };
+}
+
+async function buildLhouseVeevaCharts(uploadPath: string): Promise<LhouseVeevaCharts | null> {
+  const perf      = path.join(uploadPath, "LHOUSE_PerfStats.xlsx");
+  const qual      = path.join(uploadPath, "LHOUSE_Quality.xlsx");
+  const trainJson = path.join(uploadPath, "LHOUSE_Training.json");
+  if (!fs.existsSync(perf) && !fs.existsSync(qual) && !fs.existsSync(trainJson)) return null;
+
+  // PerfStats: B(1)=Active User, D(3)=Unique Login, E(4)=Doc Count
+  const doc   = fs.existsSync(perf) ? parseGcpMonthGroups(perf, 4) : {};
+  const user  = fs.existsSync(perf) ? parseGcpMonthGroups(perf, 1) : {};
+  const login = fs.existsSync(perf) ? parseGcpMonthGroups(perf, 3) : {};
+
+  const monthsSet = new Set<string>([...Object.keys(doc), ...Object.keys(user), ...Object.keys(login)]);
+  const months = [...monthsSet].sort().slice(-3);
+  const labels = months.map((ym) => `${parseInt(ym.slice(5, 7), 10)}월`);
+  const series = (m: Record<string, number>) => months.map((ym) => Math.round(m[ym] ?? 0));
+
+  const renderBar = async (lbls: string[], vals: number[], color: string, name: string): Promise<string | null> => {
+    if (!lbls.length || vals.every((v) => v === 0)) return null;
+    try {
+      const p = path.join(uploadPath, `lhouse_bar_${name}_${Date.now()}.png`);
+      await renderGcpBarToPng(lbls, vals, color, p);
+      return fs.readFileSync(p).toString("base64");
+    } catch (e) { logger.warn(`[LHOUSE Report] bar(${name}) 실패: ${(e as Error).message}`); return null; }
+  };
+
+  const docV = series(doc), userV = series(user), loginV = series(login);
+  const docCount    = await renderBar(labels, docV,   "#4472C4", "doc");
+  const activeUser  = await renderBar(labels, userV,  "#5B9BD5", "user");
+  const uniqueLogin = await renderBar(labels, loginV, "#70AD47", "login");
+
+  // #3 품질 — 매월 Quality Event Type 분포 (그룹 막대)
+  const qt = fs.existsSync(qual) ? parseLhouseQualityByType(qual) : { types: [], byMonth: {} };
+  const qMonthsSet = new Set<string>(Object.keys(qt.byMonth));
+  const qMonths = qMonthsSet.size ? [...qMonthsSet].sort().slice(-3) : months;
+  const qLabels = qMonths.map((ym) => /^\d{4}-\d{2}$/.test(ym) ? `${parseInt(ym.slice(5, 7), 10)}월` : ym);
+  logger.info(`[LHOUSE Report] 품질 파싱 — types:[${qt.types.join(", ")}] buckets:[${Object.keys(qt.byMonth).join(", ")}]`);
+  let quality: string | null = null;
+  let qualityTotal = 0;
+  if (qt.types.length) {
+    const palette = ["#ED7D31", "#4472C4", "#70AD47", "#FFC000", "#A5A5A5"];
+    const qSeries = qt.types.map((t, i) => ({
+      name: t, color: palette[i % palette.length],
+      values: qMonths.map((ym) => Math.round(qt.byMonth[ym]?.[t] ?? 0)),
+    }));
+    qualityTotal = qSeries.reduce((s, ser) => s + ser.values.reduce((a, b) => a + b, 0), 0);
+    if (qSeries.some((s) => s.values.some((v) => v > 0))) {
+      try {
+        const p = path.join(uploadPath, `lhouse_bar_quality_${Date.now()}.png`);
+        await renderGcpGroupedBarToPng(qLabels, qSeries, p);
+        quality = fs.readFileSync(p).toString("base64");
+      } catch (e) { logger.warn(`[LHOUSE Report] bar(quality) 실패: ${(e as Error).message}`); }
+    }
+  }
+
+  // #4 교육 — 화면 스크래핑 JSON (rows:[{name, count}])
+  let training: string | null = null;
+  let trainingTotal = 0;
+  let trnLabels: string[] = [];
+  if (fs.existsSync(trainJson)) {
+    try {
+      const raw  = JSON.parse(fs.readFileSync(trainJson, "utf-8")) as { rows?: { name: string; count: number }[] };
+      const rows = (raw.rows ?? []).map((r) => ({ ...parseTrainingMonth(r.name), count: Number(r.count) || 0 }));
+      if (rows.every((r) => r.ym)) rows.sort((a, b) => (a.ym ?? "").localeCompare(b.ym ?? ""));
+      const last3 = rows.slice(-3);
+      trnLabels   = last3.map((r) => r.label);
+      const trnVals = last3.map((r) => r.count);
+      trainingTotal = trnVals.reduce((a, b) => a + b, 0);
+      training = await renderBar(trnLabels, trnVals, "#FFC000", "training");
+    } catch (e) { logger.warn(`[LHOUSE Report] 교육 JSON 파싱 실패: ${(e as Error).message}`); }
+  }
+
+  const lastN = (a: number[]) => a[a.length - 1] ?? 0;
+  const lm    = labels[labels.length - 1] ?? "";
+  const msgs = {
+    doc:      `${lm} 평균 약 <strong>${lastN(docV).toLocaleString()}</strong>건 문서 관리 중`,
+    quality:  `최근 3개월 품질 이벤트 총 <strong>${qualityTotal.toLocaleString()}</strong>건`,
+    training: `최근 ${trnLabels.length || 3}개월 교육 실행 총 <strong>${trainingTotal.toLocaleString()}</strong>건`,
+    user:     `${lm} 평균 등록 사용자 약 <strong>${lastN(userV).toLocaleString()}</strong>명`,
+    login:    `${lm} 일평균 접속 약 <strong>${lastN(loginV).toLocaleString()}</strong>명`,
+  };
+
+  const insight = buildLhouseInsightLines({ labels, docV, userV, loginV, qLabels, qMonths, qt, trainingTotal, trnLabels });
+
+  logger.info(`[LHOUSE Report] Veeva 차트 — 월:${months.join(",")} doc:${docV} user:${userV} login:${loginV} quality:${qualityTotal} training:${trainingTotal}`);
+  return {
+    docCount, quality, training, activeUser, uniqueLogin, msgs, insight,
+    data: { docLast: lastN(docV), userLast: lastN(userV), loginLast: lastN(loginV), qualityTotal, trainingTotal },
+  };
+}
+
+/** L HOUSE 데이터 인사이트 — 연결어미로 잇고 마지막만 종결형 (GCP 인사이트와 동일 컨셉) */
+export function buildLhouseInsightLines(a: {
+  labels: string[]; docV: number[]; userV: number[]; loginV: number[];
+  qLabels: string[]; qMonths: string[]; qt: { types: string[]; byMonth: Record<string, Record<string, number>> };
+  trainingTotal: number; trnLabels: string[];
+}): string[] {
+  const { labels, docV, userV, loginV, qLabels, qMonths, qt, trainingTotal, trnLabels } = a;
+  const fmt   = (n: number) => Math.round(n).toLocaleString();
+  const first = (x: number[]) => x[0] ?? 0;
+  const last  = (x: number[]) => x[x.length - 1] ?? 0;
+  const nz    = (x: number[]) => { const f = x.filter((v) => v > 0); return f.length ? [Math.min(...f), Math.max(...f)] as const : [0, 0] as const; };
+  const tword = (x: number[]) => last(x) > first(x) ? "증가" : last(x) < first(x) ? "감소" : "유지";
+  const range = labels.length ? `${labels[0]}~${labels[labels.length - 1]}` : "";
+  const lines: string[] = [];
+
+  if (docV.some((v) => v > 0)) {
+    lines.push(`최근 3개월(${range}) 안동공장 L HOUSE Veeva Quality System의 문서 수는 월평균 ${fmt(first(docV))}→${fmt(last(docV))}건으로 ${tword(docV)} 흐름을 보였으며,`);
+  }
+  const [uMin, uMax] = nz(userV);
+  const [lMin, lMax] = nz(loginV);
+  const uStr = uMin === uMax ? `약 ${fmt(uMax)}명` : `약 ${fmt(uMin)}~${fmt(uMax)}명`;
+  const lStr = lMin === lMax ? `약 ${fmt(lMax)}명` : `약 ${fmt(lMin)}~${fmt(lMax)}명`;
+  lines.push(`활성 사용자는 ${uStr}, 일일 평균 접속은 ${lStr} 수준을 유지했고,`);
+
+  const qTotal = qMonths.reduce((s, ym) => s + qt.types.reduce((t, ty) => t + (qt.byMonth[ym]?.[ty] ?? 0), 0), 0);
+  if (qTotal > 0) {
+    const perType = qt.types
+      .map((t) => `${t} ${fmt(qMonths.reduce((s, ym) => s + (qt.byMonth[ym]?.[t] ?? 0), 0))}건`)
+      .join("·");
+    const perMonth = qLabels
+      .map((l, i) => `${l} ${qt.types.reduce((s, t) => s + (qt.byMonth[qMonths[i]]?.[t] ?? 0), 0)}건`)
+      .join(", ");
+    lines.push(`품질 이벤트는 ${perMonth}으로 발생했고(전체 ${qTotal}건${perType ? `, ${perType}` : ""}),`);
+  }
+  if (trainingTotal > 0) {
+    lines.push(`교육은 최근 ${trnLabels.length || 3}개월간 총 ${fmt(trainingTotal)}건 실행되었습니다.`);
+  }
+
+  if (lines.length) {
+    const i = lines.length - 1;
+    lines[i] = lines[i]
+      .replace(/보였으며,$/, "보였습니다.")
+      .replace(/유지했고,$/, "유지했습니다.")
+      .replace(/\),$/, ").");
+  }
+  return lines;
+}
+
 function buildReportHtml(
   titleDate:         string,
   chartImgBase64:    string | null,
   chartImgMime:      "image/png" | "image/jpeg",
-  /** Systemusage.jpg 에서 분리한 6개 차트 base64 */
-  usageCharts:       string[],
+  /** Veeva 데이터 수집 기반 #2~#6 차트 묶음 */
+  veeva:             LhouseVeevaCharts,
   stats:             HeadlineStats,
   msData?:           MsTimesheetData | null,
   msBarChartBase64?: string | null,
@@ -1164,35 +1422,37 @@ function buildReportHtml(
   // ── "xx월" 형식 추출 (titleDate 에서, cellMsgs 보다 먼저 선언) ───────────────
   const monthLabel = titleDate.replace(/^\d+년\s*/, "");   // "03월"
 
-  // ── 1번: 도넛 차트 ─────────────────────────────────────────────────────────
+  // ── 이미지 래퍼 헬퍼 ──────────────────────────────────────────────────────
+  const imgCell = (b64: string | null, alt: string) =>
+    b64
+      ? `<div class="img-wrap"><img src="data:image/png;base64,${b64}" alt="${alt}" /></div>`
+      : `<div class="img-wrap" style="color:#9ca3af;font-size:12px;">데이터 없음</div>`;
+
+  // ── 1번: 업무 활용 현황 — 도넛 차트(Activity_LHOUSE.xlsx, 기존 유지) ─────────
   const donutImgHtml = chartImgBase64
     ? `<div class="img-wrap"><img src="data:${chartImgMime};base64,${chartImgBase64}" alt="업무 활용 현황" /></div>`
     : `<div class="img-wrap" style="color:#9ca3af;font-size:12px;">차트 없음</div>`;
+  const cell1Msg = `${monthLabel} 총 실행된 Task는 <strong>${stats.totalTasks.toLocaleString()}</strong>건`;
 
-  // ── 차트별 개별 헤드메시지 ─────────────────────────────────────────────────
-  const cellMsgs: Record<number, string> = {
-    1: `${monthLabel} 총 실행된 Task는 <strong>${stats.totalTasks.toLocaleString()}</strong>건`,
-    2: `${monthLabel} 약 <strong>${stats.newDocuments.toLocaleString()}</strong>개의 신규 문서 등록`,
-    3: `${monthLabel} <strong>${stats.qualityEvents.toLocaleString()}</strong>건의 Quality Event 발생`,
-    4: `${monthLabel} 약 <strong>${stats.trainings.toLocaleString()}</strong>건의 교육이 실행됨`,
-    5: `신규 등록 포함 안동공장 Quality System 총 사용자는 <strong>${stats.activeUsers.toLocaleString()}</strong>명 등록`,
-    6: `매일 평균 <strong>${stats.uniqueLogin.toLocaleString()}</strong>명 시스템 사용 중`,
-  };
-
-  // ── 6개 차트 전체 (2열 × 3행, 단일 페이지) ───────────────────────────────────
+  // ── 6개 차트 (2열 × 3행, 단일 페이지) ─ ①업무활용 ②문서관리 ③품질관리 ④교육관리 ⑤사용자등록 ⑥일일사용
   const allCells: string[] = [
-    makeCell(1, CHART_TITLES[0], donutImgHtml, cellMsgs[1]),
+    makeCell(1, CHART_TITLES[0], donutImgHtml,                       cell1Msg),
+    makeCell(2, CHART_TITLES[1], imgCell(veeva.docCount,    CHART_TITLES[1]), veeva.msgs.doc),
+    makeCell(3, CHART_TITLES[2], imgCell(veeva.quality,     CHART_TITLES[2]), veeva.msgs.quality),
+    makeCell(4, CHART_TITLES[3], imgCell(veeva.training,    CHART_TITLES[3]), veeva.msgs.training),
+    makeCell(5, CHART_TITLES[4], imgCell(veeva.activeUser,  CHART_TITLES[4]), veeva.msgs.user),
+    makeCell(6, CHART_TITLES[5], imgCell(veeva.uniqueLogin, CHART_TITLES[5]), veeva.msgs.login),
   ];
-  for (let i = 1; i <= 5 && i < usageCharts.length; i++) {
-    const title  = CHART_TITLES[i] ?? "";
-    const cellNo = i + 1;
-    allCells.push(makeCell(
-      cellNo, title,
-      `<div class="img-wrap"><img src="data:image/png;base64,${usageCharts[i]}" alt="${title}" /></div>`,
-      cellMsgs[cellNo],
-    ));
-  }
-  const grid = `<div class="usage-grid grid-3row">${allCells.join("\n")}</div>`;
+  // 인사이트가 들어가도 한 페이지에 맞도록 행 높이를 줄인다(grid-3row-gcp).
+  const grid = `<div class="usage-grid grid-3row-gcp">${allCells.join("\n")}</div>`;
+
+  // ── 데이터 인사이트 (GCP Quality System 보고서와 동일 — 페이지 하단) ──────────
+  const insightHtml = veeva.insight.length > 0
+    ? `<div class="gcp-insight">
+        <div class="gcp-insight-label">데이터 인사이트 (최근 3개월 분석)</div>
+        ${veeva.insight.map((l) => `<p>${l}</p>`).join("")}
+      </div>`
+    : "";
 
   const today = new Date().toLocaleDateString("ko-KR", {
     year: "numeric", month: "long", day: "numeric",
@@ -1273,6 +1533,20 @@ function buildReportHtml(
     }
     /* 단일 페이지: 2열 × 3행 */
     .grid-3row { grid-template-rows: repeat(3, 255px); }
+    /* 인사이트 포함 시 한 페이지에 맞도록 행 높이 축소 */
+    .grid-3row-gcp { grid-template-rows: repeat(3, 210px); }
+
+    /* 데이터 인사이트 (GCP Quality System 보고서와 동일) */
+    .gcp-insight {
+      margin-top: 10px; padding: 9px 14px; background: #f0fdf4;
+      border-left: 4px solid #16a34a; border-radius: 0 4px 4px 0;
+      font-size: 10.5px; line-height: 1.65; color: #374151;
+    }
+    .gcp-insight .gcp-insight-label {
+      font-weight: 700; color: #15803d; font-size: 11px; margin-bottom: 4px;
+    }
+    .gcp-insight p { margin: 0 0 3px; }
+    .gcp-insight p:last-child { margin-bottom: 0; }
 
     .usage-cell {
       border: 1px solid #e5e7eb;
@@ -1413,6 +1687,7 @@ function buildReportHtml(
     </div>
     ${headlineHtml}
     ${grid}
+    ${insightHtml}
     <p class="caption">[ ${titleDate} Veeva 시스템 사용 현황 ]</p>
     <div class="footer">
       <span>SK Bioscience L HOUSE 공장 — Veeva System 운영 현황</span>
@@ -1541,28 +1816,17 @@ export async function generateLhouseReport(jobId: string): Promise<LhouseReportR
   const uploadPath      = path.resolve(uploadDir, jobId, "uploads");
   const activityPath    = path.join(uploadPath, "Activity_LHOUSE.xlsx");
 
-  // Systemusage 는 jpg / png 모두 허용 — 업로드된 확장자에 따라 파일명이 다를 수 있음
-  const systemusagePathJpg = path.join(uploadPath, "Systemusage_LHOUSE.jpg");
-  const systemusagePathPng = path.join(uploadPath, "Systemusage_LHOUSE.png");
-  const systemusagePath =
-    fs.existsSync(systemusagePathJpg) ? systemusagePathJpg :
-    fs.existsSync(systemusagePathPng) ? systemusagePathPng :
-    systemusagePathJpg; // 둘 다 없으면 jpg 경로로 설정 (이후 존재 체크에서 에러)
-
   logger.info(`[LHOUSE Report] 보고서 생성 요청 — jobId: ${jobId}`);
   logger.info(`[LHOUSE Report] Activity_LHOUSE.xlsx : ${activityPath} (존재: ${fs.existsSync(activityPath)})`);
-  logger.info(`[LHOUSE Report] Systemusage_LHOUSE.*  : ${systemusagePath} (존재: ${fs.existsSync(systemusagePath)})`);
 
-  if (!fs.existsSync(activityPath))    throw new AppError(400, "Activity_LHOUSE.xlsx 파일이 없습니다. 먼저 업로드해주세요.");
-  if (!fs.existsSync(systemusagePath)) throw new AppError(400, "Systemusage_LHOUSE.jpg / .png 파일이 없습니다. 먼저 업로드해주세요.");
+  if (!fs.existsSync(activityPath)) throw new AppError(400, "Activity_LHOUSE.xlsx 파일이 없습니다. 먼저 업로드해주세요.");
 
-  // 1) 도넛 차트 PNG + CategoryCounts (#3 #4 #5 데이터)
-  logger.info("[LHOUSE Report] ── 차트 생성 ──");
+  // 1) #1 업무 활용 현황 — 도넛 차트 PNG + CategoryCounts (Activity_LHOUSE.xlsx, 기존 유지)
+  logger.info("[LHOUSE Report] ── 업무 활용(도넛) 차트 생성 ──");
   const { png: chartPng, counts } = await generateChartPng(activityPath, uploadPath);
   if (!chartPng) logger.warn("[LHOUSE Report] 차트 이미지 생성 실패 — PDF 에 대체 텍스트 표시");
   else logger.info(`[LHOUSE Report] 차트 PNG: ${chartPng} (${fs.statSync(chartPng).size.toLocaleString()} bytes)`);
 
-  // 2) base64
   let chartBase64: string | null              = null;
   let chartMime:   "image/png" | "image/jpeg" = "image/png";
   if (chartPng && fs.existsSync(chartPng)) {
@@ -1570,45 +1834,30 @@ export async function generateLhouseReport(jobId: string): Promise<LhouseReportR
     chartMime   = /\.jpe?g$/i.test(chartPng) ? "image/jpeg" : "image/png";
   }
 
-  // 2-b) Systemusage.jpg → 6개 차트 분리
-  logger.info("[LHOUSE Report] ── Systemusage 분할 ──");
-  const usageCharts = await splitSystemusageCharts(systemusagePath, uploadPath);
-  logger.info(`[LHOUSE Report] 분할 차트 수: ${usageCharts.length}`);
+  // 2) #2~#6 — Veeva 데이터 수집(LHOUSE_PerfStats/Quality/Training) 기반 막대/그룹 차트
+  logger.info("[LHOUSE Report] ── Veeva 데이터 차트 생성 ──");
+  const veeva = await buildLhouseVeevaCharts(uploadPath);
+  if (!veeva) {
+    throw new AppError(
+      400,
+      "Veeva 수집 데이터(LHOUSE_PerfStats.xlsx 등)가 없습니다. 먼저 '데이터 수집'을 실행해주세요.",
+    );
+  }
 
-  // 2-c) OCR — 6개 차트 이미지에서 통계 수치 추출
-  logger.info("[LHOUSE Report] ── OCR 추출 ──");
-  const chart2Path = path.join(uploadPath, "systemusage_chart_1.png");  // Total Document
-  const chart3Path = path.join(uploadPath, "systemusage_chart_2.png");  // Quality Event
-  const chart4Path = path.join(uploadPath, "systemusage_chart_3.png");  // Training
-  const chart5Path = path.join(uploadPath, "systemusage_chart_4.png");  // Active User
-  const chart6Path = path.join(uploadPath, "systemusage_chart_5.png");  // Unique Login
-
-  const [activeUsers, uniqueLogin, newDocuments, qualityEvents, trainings] = await Promise.all([
-    extractRightmostChartValue(chart5Path),   // #1
-    extractRightmostChartValue(chart6Path),   // #2
-    extractNewDocuments(chart2Path),           // #6
-    extractQualityEvents(chart3Path),          // #7
-    extractTrainingCount(chart4Path),          // #8
-  ]);
-  logger.info(
-    `[LHOUSE Report] OCR 결과 — activeUsers:${activeUsers}, uniqueLogin:${uniqueLogin}, ` +
-    `newDocuments:${newDocuments}, qualityEvents:${qualityEvents}, trainings:${trainings}`,
-  );
-
-  // 2-d) #3 #4 #5 — Activity.xlsx counts 에서 추출
+  // 3) 헤드라인 통계 — 업무활용(Task)은 Activity, 나머지는 수집 데이터에서 산출
   const findCount = (keyword: string) => {
     const idx = counts.labels.findIndex((l) => l.toLowerCase().includes(keyword.toLowerCase()));
     return idx >= 0 ? counts.values[idx] : 0;
   };
   const stats: HeadlineStats = {
-    activeUsers,
-    uniqueLogin,
+    activeUsers:   veeva.data.userLast,
+    uniqueLogin:   veeva.data.loginLast,
     totalTasks:    counts.total,
     eLmsTasks:     findCount("eLMS"),
     eDmsTasks:     findCount("eDMS"),
-    newDocuments,
-    qualityEvents,
-    trainings,
+    newDocuments:  veeva.data.docLast,
+    qualityEvents: veeva.data.qualityTotal,
+    trainings:     veeva.data.trainingTotal,
   };
   logger.info(`[LHOUSE Report] 헤드라인 통계: ${JSON.stringify(stats)}`);
 
@@ -1652,7 +1901,7 @@ export async function generateLhouseReport(jobId: string): Promise<LhouseReportR
   // 4) PDF
   const { year, month } = getLastMonth();
   const titleDate  = `${year}년 ${String(month).padStart(2, "0")}월`;
-  const html       = buildReportHtml(titleDate, chartBase64, chartMime, usageCharts, stats, msData, msBarChartBase64);
+  const html       = buildReportHtml(titleDate, chartBase64, chartMime, veeva, stats, msData, msBarChartBase64);
   const outputDir  = path.resolve(process.env.OUTPUT_DIR ?? "outputs");
   fs.mkdirSync(outputDir, { recursive: true });
   const filename   = `${year}.${String(month).padStart(2, "0")} L HOUSE Veeva System Report.pdf`;

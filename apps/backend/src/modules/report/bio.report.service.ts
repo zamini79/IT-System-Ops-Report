@@ -3,7 +3,7 @@
  *
  * 페이지 구성:
  *  - 표지: "Bio연구본부 시스템 운영 현황"
- *  - Page 1: "1. Veeva 시스템 사용현황" — Systemusage_RD.jpg 5개 차트 그리드
+ *  - Page 1: "1. Veeva 시스템 사용현황" — 데이터 수집(BIO_Activity/PerfStats/DocType) 기반 5개 차트 그리드 + 인사이트
  *  - Page 2 (선택): "2. Managed Service 진행 현황"
  *                   MS Timesheet (DB 에서 최신 파일 조회)
  */
@@ -13,13 +13,12 @@ import path from "path";
 
 import * as XLSX    from "xlsx";
 import { chromium } from "playwright";
-// eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-explicit-any
-const sharp = require("sharp") as (input: any, options?: any) => any;
 
 import { logger }       from "../../utils/logger";
 import { AppError }     from "../../utils/errors";
 import { PdfGenerator } from "../../engines/report/PdfGenerator";
 import { query }        from "../../config/db";
+import { renderGcpBarToPng, renderGcpGroupedBarToPng, parseGcpMonthGroups } from "./dev.report.service";
 
 // ── 날짜 헬퍼 ─────────────────────────────────────────────────────────────────
 
@@ -34,7 +33,7 @@ function getLastMonth(): { year: number; month: number } {
 // ── MS Timesheet 데이터 구조 ─────────────────────────────────────────────────
 
 /** YYYY-MM 시트에서 추출한 SKB GMP 1행 요약 (막대 차트용) */
-interface MsChartRow {
+export interface MsChartRow {
   month:     string;  // e.g. "2026-03"
   possible:  number;  // B열 = GMP 가능 MS
   used:      number;  // C열 = GMP 사용 MS
@@ -53,7 +52,7 @@ interface MsTableRow {
   status:    string;  // M열
 }
 
-interface MsTimesheetData {
+export interface MsTimesheetData {
   chartRows:   MsChartRow[];
   tableRows:   MsTableRow[];
   latestMonth: string;    // e.g. "2026-03"
@@ -88,261 +87,11 @@ const VEEVA_RD_CHART_TITLES = [
   "일일 사용 현황",
 ] as const;
 
-// ── 이미지 분할 헬퍼 ──────────────────────────────────────────────────────────
+// ── 차트 이미지 타입 ──────────────────────────────────────────────────────────
 
 type ChartImg = { base64: string; mime: "image/png" };
 
-/** 업로드 경로에서 지정 파일명의 실제 경로 탐색 (.jpg / .jpeg / .png 순서) */
-function resolveImagePath(dir: string, baseName: string): string | null {
-  for (const ext of [".jpg", ".jpeg", ".png"]) {
-    const p = path.join(dir, baseName + ext);
-    if (fs.existsSync(p)) return p;
-  }
-  return null;
-}
-
-/**
- * Systemusage_RD 이미지를 3열×2행 그리드에서 5개 차트로 분할합니다.
- *
- * 이미지 내 차트 배치 (3열 × 2행):
- *   [0] 업무 활용 현황  | [1] 문서 관리 현황 | [2] 생성 문서 구분
- *   [3] 사용자 현황    | [4] 일일 사용 현황 | (빈 공간)
- *
- * 인덱스 0~4 (5개)만 반환합니다.
- */
-async function split5Charts(
-  imgPath: string,
-  outDir:  string,
-): Promise<ChartImg[]> {
-  fs.mkdirSync(outDir, { recursive: true });
-
-  const meta = await sharp(imgPath).metadata();
-  const W    = (meta.width  as number) ?? 1478;
-  const H    = (meta.height as number) ?? 960;
-  const COLS = 3, ROWS = 2;
-  const cellW = Math.floor(W / COLS);
-  const cellH = Math.floor(H / ROWS);
-
-  logger.info(`[BIO Report] Veeva RD 이미지 분할 — 원본: ${W}×${H}, 셀: ${cellW}×${cellH}`);
-
-  const results: ChartImg[] = [];
-  for (let row = 0; row < ROWS; row++) {
-    for (let col = 0; col < COLS; col++) {
-      const idx = row * COLS + col;
-      if (idx >= 5) break;  // 5번째(인덱스 4)까지만 추출
-      const left   = col * cellW;
-      const top    = row * cellH;
-      const width  = col === COLS - 1 ? W - left : cellW;
-      const height = row === ROWS - 1 ? H - top  : cellH;
-      const out    = path.join(outDir, `rd_split_${idx}.png`);
-      await sharp(imgPath).extract({ left, top, width, height }).png().toFile(out);
-      results.push({ base64: fs.readFileSync(out).toString("base64"), mime: "image/png" });
-      logger.info(`[BIO Report] Veeva RD 셀 ${idx}: ${out} (${fs.statSync(out).size.toLocaleString()} B)`);
-    }
-  }
-  return results;
-}
-
-// ── OCR 헬퍼 ─────────────────────────────────────────────────────────────────
-
-/**
- * OCR 공통 헬퍼 — 크롭 → 업스케일 → 전처리 → Tesseract 인식 → 텍스트 반환
- *
- * @param mode  "norm"   : normalize + sharpen  (밝기 편차가 큰 이미지)
- *              "thresh" : threshold(180)        (단순 흑백 — 고대비 레이블에 최적)
- */
-async function ocrCrop(
-  imagePath: string,
-  region: { left: number; top: number; width: number; height: number },
-  scale: number,
-  psm: string,
-  mode: "norm" | "thresh",
-  tmpSuffix: string,
-  keepFile = false,  // true 시 OCR 진단용 중간 이미지를 삭제하지 않고 유지
-): Promise<string> {
-  const tmp = imagePath.replace(/\.png$/, `_ocr_${tmpSuffix}.png`);
-  try {
-    let pipeline = sharp(imagePath)
-      .extract(region)
-      .resize(region.width * scale, region.height * scale, { kernel: "lanczos3" })
-      .greyscale();
-    if (mode === "norm")   pipeline = (pipeline as unknown as ReturnType<typeof sharp>).normalize().sharpen() as typeof pipeline;
-    if (mode === "thresh") pipeline = (pipeline as unknown as ReturnType<typeof sharp>).threshold(180) as typeof pipeline;
-    await (pipeline as unknown as ReturnType<typeof sharp>).png().toFile(tmp);
-    // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-explicit-any
-    const Tesseract = require("tesseract.js") as any;
-    const worker    = await Tesseract.createWorker("eng");
-    await worker.setParameters({ tessedit_pageseg_mode: psm });
-    const { data } = await worker.recognize(tmp);
-    await worker.terminate();
-    return (data.text ?? "").replace(/\s+/g, " ").trim();
-  } finally {
-    if (!keepFile) {
-      try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch { /* 임시 파일 삭제 실패는 무시 */ }
-    }
-  }
-}
-
-/** 콤마 포함 숫자 파싱: "1,014" → 1014 */
-function parseCommaInt(s: string): number {
-  return parseInt(s.replace(/,/g, ""), 10);
-}
-
-/**
- * chart4 사용자 현황 — 세로 막대 3개 중 가장 오른쪽 막대 상단 숫자 (#1)
- * 전략: 우측 30% × 상단 72% 크롭 → PSM 11 + normalize → 첫 번째 유효 정수
- */
-async function extractBioRightmostBar(imagePath: string, label: string): Promise<number> {
-  if (!fs.existsSync(imagePath)) { logger.warn(`[BIO OCR] 파일 없음: ${imagePath}`); return 0; }
-  const { width: W = 548, height: H = 477 } = await sharp(imagePath).metadata();
-  const left = Math.floor(W * 0.70), top = 0;
-  const width = W - left, height = Math.floor(H * 0.72);
-  try {
-    const text = await ocrCrop(imagePath, { left, top, width, height }, 6, "11", "norm", `bio_${label}`);
-    logger.info(`[BIO OCR] ${label} 텍스트: "${text}"`);
-    const numbers = (text.match(/\d[\d,]*/g) ?? [])
-      .map(parseCommaInt)
-      .filter(n => !isNaN(n) && n >= 1 && n <= 999_999 && !(n >= 2000 && n <= 2030));
-    logger.info(`[BIO OCR] ${label} 추출: ${JSON.stringify(numbers)}`);
-    return numbers[0] ?? 0;
-  } catch (e) {
-    logger.error(`[BIO OCR] ${label} 실패: ${(e as Error).message}`);
-    return 0;
-  }
-}
-
-/**
- * chart5 일일 사용 현황 (Unique Login) — 오른쪽 막대 상단 숫자 (#2)
- *
- * 3개 막대 = 3개월 비교 차트 (시간순: 왼쪽=이전월, 오른쪽=보고서 대상월)
- *
- * 근본 원인:
- *  - 연도 필터 없이 상단 75% 크롭 시 차트 제목의 "2025" 같은 연도가 nums[0] 으로 반환됨
- *  - 막대가 짧을 경우 상단 75% 크롭에 막대 레이블이 포함되지 않을 수 있음
- *
- * 수정 전략 (모두 연도 필터 + keepFile=true 진단용 이미지 보존):
- *  S1: 우측 30% × 전체 높이, scale 6, norm   — chart4 와 동일 파라미터 (검증된 설정)
- *  S2: 우측 30% × 전체 높이, scale 6, thresh — S1 실패 시
- *  S3: 우측 33% × 전체 높이, scale 10, norm  — 소형 텍스트 고배율
- *  S4: 우측 40% × 전체 높이, scale 6, PSM 6 — 블록 텍스트 모드, 마지막 숫자
- *  S5: 전체 너비 × 전체 높이, scale 4, norm  — 완전 폴백, 마지막 숫자
- */
-async function extractBioUniqueLoginBar(imagePath: string): Promise<number> {
-  if (!fs.existsSync(imagePath)) { logger.warn(`[BIO OCR] 파일 없음: ${imagePath}`); return 0; }
-  const { width: W = 493, height: H = 480 } = await sharp(imagePath).metadata();
-
-  /**
-   * 모든 전략에 공통 적용: 연도(2000-2030) 필터 포함
-   * — 이전 parseTop 은 연도 필터가 없어 차트 제목의 연도가 nums[0] 으로 반환되는 버그 존재
-   */
-  const parseNums = (text: string): number[] =>
-    (text.match(/\d[\d,]*/g) ?? [])
-      .map(parseCommaInt)
-      .filter(n => !isNaN(n) && n >= 1 && n <= 99_999 && !(n >= 2000 && n <= 2030));
-
-  const left30 = Math.floor(W * 0.70);
-  const left33 = Math.floor(W * 0.67);
-  const left40 = Math.floor(W * 0.60);
-
-  // S1: 우측 30% × 전체 높이, scale 6, PSM 11, norm (chart4 extractBioRightmostBar 동일 파라미터)
-  // keepFile=true → uploads/{jobId}/rd_split_4_ocr_bio_ul_s1.png 로 저장 (진단용)
-  try {
-    const text = await ocrCrop(imagePath,
-      { left: left30, top: 0, width: W - left30, height: H },
-      6, "11", "norm", "bio_ul_s1", true);
-    const nums = parseNums(text);
-    logger.info(`[BIO OCR] chart5 [S1 right30% full-H norm] "${text}" → ${JSON.stringify(nums)}`);
-    if (nums.length > 0) { logger.info(`[BIO OCR] chart5 ✓S1 → ${nums[0]}`); return nums[0]; }
-  } catch (e) { logger.error(`[BIO OCR] chart5 S1: ${(e as Error).message}`); }
-
-  // S2: 우측 30% × 전체 높이, scale 6, PSM 11, thresh
-  try {
-    const text = await ocrCrop(imagePath,
-      { left: left30, top: 0, width: W - left30, height: H },
-      6, "11", "thresh", "bio_ul_s2", true);
-    const nums = parseNums(text);
-    logger.info(`[BIO OCR] chart5 [S2 right30% full-H thresh] "${text}" → ${JSON.stringify(nums)}`);
-    if (nums.length > 0) { logger.info(`[BIO OCR] chart5 ✓S2 → ${nums[0]}`); return nums[0]; }
-  } catch (e) { logger.error(`[BIO OCR] chart5 S2: ${(e as Error).message}`); }
-
-  // S3: 우측 33% × 전체 높이, scale 10, PSM 11, norm (소형 텍스트 고배율)
-  try {
-    const text = await ocrCrop(imagePath,
-      { left: left33, top: 0, width: W - left33, height: H },
-      10, "11", "norm", "bio_ul_s3", true);
-    const nums = parseNums(text);
-    logger.info(`[BIO OCR] chart5 [S3 right33% full-H scale10] "${text}" → ${JSON.stringify(nums)}`);
-    if (nums.length > 0) { logger.info(`[BIO OCR] chart5 ✓S3 → ${nums[0]}`); return nums[0]; }
-  } catch (e) { logger.error(`[BIO OCR] chart5 S3: ${(e as Error).message}`); }
-
-  // S4: 우측 40% × 전체 높이, scale 6, PSM 6 (블록 텍스트), norm — 마지막 숫자 = 오른쪽 막대
-  try {
-    const text = await ocrCrop(imagePath,
-      { left: left40, top: 0, width: W - left40, height: H },
-      6, "6", "norm", "bio_ul_s4", true);
-    const nums = parseNums(text);
-    logger.info(`[BIO OCR] chart5 [S4 right40% full-H PSM6] "${text}" → ${JSON.stringify(nums)}`);
-    if (nums.length > 0) { const v = nums[nums.length - 1]; logger.info(`[BIO OCR] chart5 ✓S4 → ${v}`); return v; }
-  } catch (e) { logger.error(`[BIO OCR] chart5 S4: ${(e as Error).message}`); }
-
-  // S5: 전체 너비 × 전체 높이, scale 4, PSM 11, norm — 완전 폴백, 마지막 숫자
-  try {
-    const text = await ocrCrop(imagePath,
-      { left: 0, top: 0, width: W, height: H },
-      4, "11", "norm", "bio_ul_s5", true);
-    const nums = parseNums(text);
-    logger.info(`[BIO OCR] chart5 [S5 full-image] "${text}" → ${JSON.stringify(nums)}`);
-    if (nums.length > 0) { const v = nums[nums.length - 1]; logger.info(`[BIO OCR] chart5 ✓S5 → ${v}`); return v; }
-  } catch (e) { logger.error(`[BIO OCR] chart5 S5: ${(e as Error).message}`); }
-
-  logger.warn("[BIO OCR] chart5 ✗ 모든 전략 실패 → 0");
-  return 0;
-}
-
-/**
- * 업무 활용 현황 (chart1) — 가로 막대 10개
- *  - sum (#3): 우측 25% × 전체 높이 → 모든 유효 정수 합산
- *  - top (#4): 우측 25% × 상단 20% → 가장 위 막대의 값 (첫 번째 숫자)
- */
-async function extractBioTaskSumAndMax(imagePath: string): Promise<{ sum: number; top: number }> {
-  if (!fs.existsSync(imagePath)) { logger.warn(`[BIO OCR] 파일 없음: ${imagePath}`); return { sum: 0, top: 0 }; }
-  const { width: W = 548, height: H = 477 } = await sharp(imagePath).metadata();
-  const left  = Math.floor(W * 0.75);
-  const width = W - left;
-
-  // #3: 전체 오른쪽 → 모든 막대 값 합산
-  let sum = 0;
-  try {
-    const text = await ocrCrop(imagePath, { left, top: 0, width, height: H }, 6, "11", "norm", "bio_task_all");
-    logger.info(`[BIO OCR] chart1(task-all) 텍스트: "${text}"`);
-    const numbers = (text.match(/\d[\d,]*/g) ?? [])
-      .map(parseCommaInt)
-      .filter(n => !isNaN(n) && n >= 1 && n <= 999_999 && !(n >= 2000 && n <= 2030));
-    logger.info(`[BIO OCR] chart1(task-all) 숫자: ${JSON.stringify(numbers)}`);
-    sum = numbers.reduce((s, n) => s + n, 0);
-  } catch (e) {
-    logger.error(`[BIO OCR] chart1(task-all) 실패: ${(e as Error).message}`);
-  }
-
-  // #4: 상단 20% 크롭 → 가장 위 막대 값 (첫 번째 숫자)
-  let top = 0;
-  try {
-    const topH = Math.floor(H * 0.20);
-    const text  = await ocrCrop(imagePath, { left, top: 0, width, height: topH }, 8, "11", "norm", "bio_task_top");
-    logger.info(`[BIO OCR] chart1(task-top) 텍스트: "${text}"`);
-    const numbers = (text.match(/\d[\d,]*/g) ?? [])
-      .map(parseCommaInt)
-      .filter(n => !isNaN(n) && n >= 1 && n <= 999_999 && !(n >= 2000 && n <= 2030));
-    logger.info(`[BIO OCR] chart1(task-top) 숫자: ${JSON.stringify(numbers)}`);
-    top = numbers[0] ?? 0;
-  } catch (e) {
-    logger.error(`[BIO OCR] chart1(task-top) 실패: ${(e as Error).message}`);
-  }
-
-  return { sum, top };
-}
-
-/** Bio Veeva 헤드라인용 OCR 통계 */
+/** Bio Veeva 헤드라인용 통계 (데이터 수집 결과에서 산출) */
 interface BioVeevaStats {
   totalUsers:    number;  // #1: chart4 사용자 현황 오른쪽 막대 상단
   dailyAvgLogin: number;  // #2: chart5 일일 사용 현황 오른쪽 막대 상단
@@ -386,7 +135,7 @@ function loadChartJsScript(): string {
  *  - A열 = "SKB R&D" 인 첫 행 → B(가능)/C(사용)/D(잔여) 값 수집 (막대 차트용)
  *  - 최신 월 시트의 SKB R&D 그룹 하위 행 → E/G/H/I/J/K/L/M 수집 (표 용)
  */
-function readMsTimesheetData(xlsxPath: string): MsTimesheetData {
+export function readMsTimesheetData(xlsxPath: string): MsTimesheetData {
   let wb: XLSX.WorkBook;
   try {
     wb = XLSX.readFile(xlsxPath);
@@ -649,9 +398,186 @@ ${scriptTag}
 
 // ── PDF HTML 빌드 ─────────────────────────────────────────────────────────────
 
+// ── Veeva 데이터 수집(화면 스크래핑 JSON) 기반 차트 ─────────────────────────────
+//   BIO_Activity.json / BIO_PerfStats.json / BIO_DocType.json ({headers, rows})를 읽어
+//   #1 업무활용 · #2 문서관리 · #3 생성문서구분 · #4 사용자 · #5 일일사용 막대를 생성한다.
+
+const BIO_MONTH_ABBR: Record<string, number> = {
+  jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6,
+  jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12,
+};
+
+export interface ScrapedTable { headers: string[]; rows: string[][]; }
+
+export function readScrapedTable(p: string): ScrapedTable | null {
+  try {
+    if (!fs.existsSync(p)) return null;
+    const j = JSON.parse(fs.readFileSync(p, "utf-8")) as Partial<ScrapedTable>;
+    return { headers: j.headers ?? [], rows: j.rows ?? [] };
+  } catch (e) { logger.warn(`[BIO Report] 스크래핑 JSON 파싱 실패 (${path.basename(p)}): ${(e as Error).message}`); return null; }
+}
+
+const bioToNum = (s: unknown): number => {
+  const m = String(s ?? "").replace(/,/g, "").match(/-?\d+(?:\.\d+)?/);
+  return m ? Number(m[0]) : NaN;
+};
+const bioColIdx = (headers: string[], re: RegExp): number => headers.findIndex((h) => re.test(h));
+
+/** 월 라벨(2026 Mar / Mar 2026 / 2026-03) → "YYYY-MM" */
+function parseBioMonthLabel(s: string): string | null {
+  const t   = String(s ?? "").trim();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  let m = t.match(/(\d{4})\s+([A-Za-z]{3,})/);
+  if (m) { const mo = BIO_MONTH_ABBR[m[2].slice(0, 3).toLowerCase()]; if (mo) return `${m[1]}-${pad(mo)}`; }
+  m = t.match(/([A-Za-z]{3,})\s+(\d{4})/);
+  if (m) { const mo = BIO_MONTH_ABBR[m[1].slice(0, 3).toLowerCase()]; if (mo) return `${m[2]}-${pad(mo)}`; }
+  m = t.match(/\b(\d{4})[-/.](\d{1,2})\b/);
+  if (m) { const mo = parseInt(m[2], 10); if (mo >= 1 && mo <= 12) return `${m[1]}-${pad(mo)}`; }
+  return null;
+}
+
+/** "<prefix>: <label> (N)" 그룹 행 분포 → {label, value}[] (paren 우선, 없으면 count 컬럼/첫 숫자) */
+export function parseBioGroupDistribution(
+  table: ScrapedTable, labelPrefixRe: RegExp, countHeaderRe?: RegExp,
+): { label: string; value: number }[] {
+  const ci = countHeaderRe ? bioColIdx(table.headers, countHeaderRe) : -1;
+  const out: { label: string; value: number }[] = [];
+  for (const r of table.rows) {
+    let label: string | null = null, parenVal = NaN, labelIdx = -1;
+    for (let i = 0; i < r.length; i++) {
+      const mm = String(r[i] ?? "").match(labelPrefixRe);
+      if (mm) { label = mm[1].trim(); parenVal = mm[2] ? Number(mm[2].replace(/,/g, "")) : NaN; labelIdx = i; break; }
+    }
+    if (label == null || /^all\b/i.test(label)) continue;   // 총계행 제외
+    let val = parenVal;
+    if (!Number.isFinite(val) && ci >= 0) val = bioToNum(r[ci]);
+    if (!Number.isFinite(val)) {
+      for (let i = 0; i < r.length; i++) { if (i === labelIdx) continue; const n = bioToNum(r[i]); if (Number.isFinite(n)) { val = n; break; } }
+    }
+    if (!Number.isFinite(val)) val = 0;
+    out.push({ label, value: val });
+  }
+  return out;
+}
+
+interface BioVeevaCharts {
+  activity:    string | null;  // #1 업무 활용
+  docCount:    string | null;  // #2 문서 관리 (월 × Doc Count)
+  docType:     string | null;  // #3 생성 문서 구분
+  activeUser:  string | null;  // #4 사용자 (월 × Active User)
+  uniqueLogin: string | null;  // #5 일일 사용 (월 × Unique Login)
+  msgs: { activity: string; docCount: string; docType: string; user: string; login: string };
+  insight: string[];
+  stats: { totalUsers: number; dailyAvgLogin: number; taskTotal: number; taskTop: number };
+}
+
+async function buildBioVeevaCharts(uploadPath: string): Promise<BioVeevaCharts | null> {
+  const actT     = readScrapedTable(path.join(uploadPath, "BIO_Activity.json"));
+  const docT     = readScrapedTable(path.join(uploadPath, "BIO_DocType.json"));
+  const perfXlsx = path.join(uploadPath, "BIO_PerfStats.xlsx");
+  const hasPerf  = fs.existsSync(perfXlsx);
+  if (!actT && !hasPerf && !docT) return null;
+
+  const renderBar = async (labels: string[], vals: number[], color: string, name: string): Promise<string | null> => {
+    if (!labels.length || vals.every((v) => v === 0)) return null;
+    try {
+      const p = path.join(uploadPath, `bio_bar_${name}_${Date.now()}.png`);
+      await renderGcpBarToPng(labels, vals, color, p);
+      return fs.readFileSync(p).toString("base64");
+    } catch (e) { logger.warn(`[BIO Report] bar(${name}) 실패: ${(e as Error).message}`); return null; }
+  };
+
+  // #1 업무 활용 — Name: 카테고리 × Activity count
+  const actDist = actT ? parseBioGroupDistribution(actT, /Name:\s*(.+?)\s*(?:\(([\d,]+)\))?\s*$/i, /activity\s*count|count/i) : [];
+  const taskTotal = actDist.reduce((s, d) => s + d.value, 0);
+  const taskTop   = actDist.reduce((m, d) => Math.max(m, d.value), 0);
+  const activity  = await renderBar(actDist.map((d) => d.label), actDist.map((d) => d.value), "#4472C4", "activity");
+
+  // #3 생성 문서 구분 — Type: 텍스트 × (xxx)
+  const docDist = docT ? parseBioGroupDistribution(docT, /Type:\s*(.+?)\s*\(([\d,]+)\)/i) : [];
+  const docType = await renderBar(docDist.map((d) => d.label), docDist.map((d) => d.value), "#ED7D31", "doctype");
+
+  // #2/#4/#5 — PerfStats(Excel Formatted) 월별 평균: B(1)=Active User, D(3)=Unique Login, E(4)=Doc Count
+  let docCount: string | null = null, activeUser: string | null = null, uniqueLogin: string | null = null;
+  let docV: number[] = [], userV: number[] = [], loginV: number[] = [], perfLabels: string[] = [];
+  if (hasPerf) {
+    const docM   = parseGcpMonthGroups(perfXlsx, 4);  // E Doc Count (월평균)
+    const userM  = parseGcpMonthGroups(perfXlsx, 1);  // B Active User Count (월평균)
+    const loginM = parseGcpMonthGroups(perfXlsx, 3);  // D Unique Login Count (월평균)
+    const monthsSet = new Set<string>([...Object.keys(docM), ...Object.keys(userM), ...Object.keys(loginM)]);
+    const months = [...monthsSet].sort().slice(-3);
+    perfLabels = months.map((ym) => `${parseInt(ym.slice(5, 7), 10)}월`);
+    docV   = months.map((ym) => Math.round(docM[ym]   ?? 0));
+    userV  = months.map((ym) => Math.round(userM[ym]  ?? 0));
+    loginV = months.map((ym) => Math.round(loginM[ym] ?? 0));
+    logger.info(`[BIO Report] PerfStats(xlsx) 파싱 — 월:${months.join(",")} doc:${docV} user:${userV} login:${loginV}`);
+    docCount    = await renderBar(perfLabels, docV,   "#5B9BD5", "doc");
+    activeUser  = await renderBar(perfLabels, userV,  "#70AD47", "user");
+    uniqueLogin = await renderBar(perfLabels, loginV, "#FFC000", "login");
+  }
+
+  const last = (a: number[]) => a[a.length - 1] ?? 0;
+  const lm   = perfLabels[perfLabels.length - 1] ?? "";
+  const msgs = {
+    activity: `최근 3개월 업무 활동 총 <strong>${taskTotal.toLocaleString()}</strong>건`,
+    docCount: `${lm} 약 <strong>${last(docV).toLocaleString()}</strong>건 문서 관리 중`,
+    docType:  `생성 문서 총 <strong>${docDist.reduce((s, d) => s + d.value, 0).toLocaleString()}</strong>건`,
+    user:     `${lm} 등록 사용자 약 <strong>${last(userV).toLocaleString()}</strong>명`,
+    login:    `${lm} 일평균 접속 약 <strong>${last(loginV).toLocaleString()}</strong>명`,
+  };
+
+  const insight = buildBioInsightLines({ perfLabels, docV, userV, loginV, actDist, docDist });
+
+  logger.info(`[BIO Report] Veeva 차트 — activity:${actDist.length}종 doctype:${docDist.length}종 perf월:${perfLabels.join(",")}`);
+  return {
+    activity, docCount, docType, activeUser, uniqueLogin, msgs, insight,
+    stats: { totalUsers: last(userV), dailyAvgLogin: last(loginV), taskTotal, taskTop },
+  };
+}
+
+/** BIO 데이터 인사이트 — 연결어미로 잇고 마지막만 종결형 (GCP 인사이트와 동일 컨셉) */
+export function buildBioInsightLines(a: {
+  perfLabels: string[]; docV: number[]; userV: number[]; loginV: number[];
+  actDist: { label: string; value: number }[]; docDist: { label: string; value: number }[];
+}): string[] {
+  const { perfLabels, docV, userV, loginV, actDist, docDist } = a;
+  const fmt   = (n: number) => Math.round(n).toLocaleString();
+  const first = (x: number[]) => x[0] ?? 0;
+  const last  = (x: number[]) => x[x.length - 1] ?? 0;
+  const sum   = (x: number[]) => x.reduce((s, v) => s + v, 0);
+  const tword = (x: number[]) => last(x) > first(x) ? "증가" : last(x) < first(x) ? "감소" : "유지";
+  const range = perfLabels.length ? `${perfLabels[0]}~${perfLabels[perfLabels.length - 1]}` : "";
+  const lines: string[] = [];
+
+  const actSum = actDist.reduce((s, d) => s + d.value, 0);
+  if (actSum > 0) {
+    const top = [...actDist].sort((x, y) => y.value - x.value)[0];
+    lines.push(`최근 3개월(${range}) Bio연구본부 Veeva Quality System의 업무 활동은 총 ${fmt(actSum)}건으로 ${top ? `${top.label}(${fmt(top.value)}건)에 가장 집중되었으며,` : ""}`);
+  }
+  if (docV.some((v) => v > 0)) {
+    lines.push(`관리 문서 수는 월평균 ${fmt(first(docV))}→${fmt(last(docV))}건으로 ${tword(docV)} 흐름을 보였고,`);
+  }
+  const dTop = [...docDist].sort((x, y) => y.value - x.value)[0];
+  if (dTop) {
+    lines.push(`생성 문서는 총 ${fmt(sum(docDist.map((d) => d.value)))}건 중 ${dTop.label}(${fmt(dTop.value)}건)가 가장 많았으며,`);
+  }
+  if (userV.some((v) => v > 0) || loginV.some((v) => v > 0)) {
+    lines.push(`활성 사용자는 약 ${fmt(last(userV))}명, 일일 평균 접속은 약 ${fmt(last(loginV))}명 수준을 유지했습니다.`);
+  }
+
+  if (lines.length) {
+    const i = lines.length - 1;
+    lines[i] = lines[i]
+      .replace(/집중되었으며,$/, "집중되었습니다.")
+      .replace(/보였고,$/, "보였습니다.")
+      .replace(/많았으며,$/, "많았습니다.");
+  }
+  return lines;
+}
+
 function buildBioReportHtml(
   titleDate:         string,
-  veevaCharts:       Array<ChartImg | null>,
+  veeva:             BioVeevaCharts | null,
   msData?:           MsTimesheetData | null,
   msBarChartBase64?: string | null,
   veevaStats?:       BioVeevaStats,
@@ -849,6 +775,20 @@ function buildBioReportHtml(
     }
     /* 단일 페이지: 2열 × 3행 */
     .grid-3row { grid-template-rows: repeat(3, 255px); }
+    /* 인사이트 포함 시 한 페이지에 맞도록 행 높이 축소 */
+    .grid-3row-gcp { grid-template-rows: repeat(3, 210px); }
+
+    /* 데이터 인사이트 (GCP Quality System 보고서와 동일) */
+    .gcp-insight {
+      margin-top: 10px; padding: 9px 14px; background: #f0fdf4;
+      border-left: 4px solid #16a34a; border-radius: 0 4px 4px 0;
+      font-size: 10.5px; line-height: 1.65; color: #374151;
+    }
+    .gcp-insight .gcp-insight-label {
+      font-weight: 700; color: #15803d; font-size: 11px; margin-bottom: 4px;
+    }
+    .gcp-insight p { margin: 0 0 3px; }
+    .gcp-insight p:last-child { margin-bottom: 0; }
 
     .usage-cell {
       border: 1px solid #e5e7eb;
@@ -971,20 +911,25 @@ function buildBioReportHtml(
     </div>
     ${headlineHtml}
     ${(() => {
-      const c       = veevaCharts;
-      const hasAny  = c.some(Boolean);
-      if (!hasAny) {
-        return `<div class="placeholder-box">Systemusage_RD.jpg 파일을 업로드하면 차트가 표시됩니다.</div>`;
+      if (!veeva) {
+        return `<div class="placeholder-box">먼저 '데이터 수집'을 실행하면 차트가 표시됩니다.</div>`;
       }
+      const img = (b64: string | null): ChartImg | null => (b64 ? { base64: b64, mime: "image/png" } : null);
       const cells = [
-        makeCell(1, VEEVA_RD_CHART_TITLES[0], c[0] ?? null),
-        makeCell(2, VEEVA_RD_CHART_TITLES[1], c[1] ?? null),
-        makeCell(3, VEEVA_RD_CHART_TITLES[2], c[2] ?? null),
-        makeCell(4, VEEVA_RD_CHART_TITLES[3], c[3] ?? null),
-        makeCell(5, VEEVA_RD_CHART_TITLES[4], c[4] ?? null),
+        makeCell(1, VEEVA_RD_CHART_TITLES[0], img(veeva.activity),    veeva.msgs.activity),
+        makeCell(2, VEEVA_RD_CHART_TITLES[1], img(veeva.docCount),    veeva.msgs.docCount),
+        makeCell(3, VEEVA_RD_CHART_TITLES[2], img(veeva.docType),     veeva.msgs.docType),
+        makeCell(4, VEEVA_RD_CHART_TITLES[3], img(veeva.activeUser),  veeva.msgs.user),
+        makeCell(5, VEEVA_RD_CHART_TITLES[4], img(veeva.uniqueLogin), veeva.msgs.login),
         `<div></div>`,  // 6번째 빈 셀
       ];
-      return `<div class="usage-grid grid-3row">${cells.join("\n")}</div>`;
+      const insightHtml = veeva.insight.length > 0
+        ? `<div class="gcp-insight">
+            <div class="gcp-insight-label">데이터 인사이트 (최근 3개월 분석)</div>
+            ${veeva.insight.map((l) => `<p>${l}</p>`).join("")}
+          </div>`
+        : "";
+      return `<div class="usage-grid grid-3row-gcp">${cells.join("\n")}</div>${insightHtml}`;
     })()}
     <p class="caption">[ ${titleDate} Veeva 시스템 사용 현황 ]</p>
     <div class="footer">
@@ -1014,53 +959,23 @@ export async function generateBioReport(jobId: string): Promise<BioReportResult>
   logger.info(`[BIO Report] 보고서 생성 요청 — jobId: ${jobId}`);
   logger.info(`[BIO Report] 업로드 경로: ${uploadPath}`);
 
-  // ── Systemusage_RD 이미지 → 5개 차트 분할 ──────────────────────────────────
-  let veevaCharts: Array<ChartImg | null> = [null, null, null, null, null];
-
-  const rdSrc = resolveImagePath(uploadPath, "Systemusage_RD");
-  logger.info(`[BIO Report] Systemusage_RD: ${rdSrc ?? "없음"}`);
-
-  if (rdSrc) {
-    try {
-      const charts = await split5Charts(rdSrc, uploadPath);
-      veevaCharts  = [
-        charts[0] ?? null,
-        charts[1] ?? null,
-        charts[2] ?? null,
-        charts[3] ?? null,
-        charts[4] ?? null,
-      ];
-    } catch (e) {
-      logger.error(`[BIO Report] Veeva RD 이미지 분할 실패: ${(e as Error).message}`);
-    }
+  // ── Veeva 데이터 수집(화면 스크래핑 JSON) → #1~#5 막대 차트 ──────────────────
+  const veeva = await buildBioVeevaCharts(uploadPath);
+  if (!veeva) {
+    throw new AppError(
+      400,
+      "Veeva 수집 데이터(BIO_Activity/PerfStats/DocType.json)가 없습니다. 먼저 '데이터 수집'을 실행해주세요.",
+    );
   }
 
-  // ── OCR: Veeva 헤드라인 통계 (#1~#4) ─────────────────────────────────────
-  // 항상 0으로 초기화 — OCR 실패 시에도 burnedMs(#5) 읽기가 실행되도록
-  const veevaStats: BioVeevaStats = { totalUsers: 0, dailyAvgLogin: 0, taskTotal: 0, taskTop: 0, burnedMs: 0 };
-
-  if (rdSrc && veevaCharts.some(Boolean)) {
-    const chart1Path = path.join(uploadPath, "rd_split_0.png");  // 업무 활용 현황
-    const chart4Path = path.join(uploadPath, "rd_split_3.png");  // 사용자 현황
-    const chart5Path = path.join(uploadPath, "rd_split_4.png");  // 일일 사용 현황
-
-    // 각 OCR 독립 실행 — 하나 실패해도 나머지 계속
-    try {
-      const taskStats = await extractBioTaskSumAndMax(chart1Path);
-      veevaStats.taskTotal = taskStats.sum;
-      veevaStats.taskTop   = taskStats.top;
-    } catch (e) { logger.error(`[BIO Report] chart1 OCR 실패: ${(e as Error).message}`); }
-
-    try {
-      veevaStats.totalUsers = await extractBioRightmostBar(chart4Path, "chart4_user");
-    } catch (e) { logger.error(`[BIO Report] chart4 OCR 실패: ${(e as Error).message}`); }
-
-    try {
-      veevaStats.dailyAvgLogin = await extractBioUniqueLoginBar(chart5Path);  // #2 전용 멀티전략
-    } catch (e) { logger.error(`[BIO Report] chart5 OCR 실패: ${(e as Error).message}`); }
-
-    logger.info(`[BIO Report] OCR 통계 (burnedMs 제외): ${JSON.stringify(veevaStats)}`);
-  }
+  // 헤드라인 통계 — #1~#4 는 수집 데이터, burnedMs(#5)는 아래 MS Timesheet 에서 채움
+  const veevaStats: BioVeevaStats = {
+    totalUsers:    veeva.stats.totalUsers,
+    dailyAvgLogin: veeva.stats.dailyAvgLogin,
+    taskTotal:     veeva.stats.taskTotal,
+    taskTop:       veeva.stats.taskTop,
+    burnedMs:      0,
+  };
 
   // MS Timesheet — DB 에서 최신 파일 조회
   let msData:           MsTimesheetData | null = null;
@@ -1108,7 +1023,7 @@ export async function generateBioReport(jobId: string): Promise<BioReportResult>
   // HTML → PDF 생성
   const { year, month } = getLastMonth();
   const titleDate  = `${year}년 ${String(month).padStart(2, "0")}월`;
-  const html       = buildBioReportHtml(titleDate, veevaCharts, msData, msBarChartBase64, veevaStats);
+  const html       = buildBioReportHtml(titleDate, veeva, msData, msBarChartBase64, veevaStats);
   const outputDir  = path.resolve(process.env.OUTPUT_DIR ?? "outputs");
   fs.mkdirSync(outputDir, { recursive: true });
 
@@ -1190,34 +1105,247 @@ function readLimsServiceData(xlsxPath: string): { rows: LimsServiceRow[]; descri
   return { rows, description };
 }
 
+// ─ 임검분 LIMS 운영 현황 (ELN_report.xlsx "browser export" 시트 기반) ────────────
+//   월은 B열(CREATEDATE), 주차는 O열(week). 최근 3개월(M-3~M-1) 기준.
+//   E(4)=Lifecyclestate, G(6)=Samplecount, I(8)=taskID, M(12)=Task Plan, O(14)=week
+
+/** 보고서 기준 최근 3개월 [M-3, M-2, M-1] ("YYYY-MM") */
+function recentThreeMonths(): string[] {
+  const { year, month } = getLastMonth();   // M-1
+  const out: string[] = [];
+  for (let k = 2; k >= 0; k--) {
+    let y = year, m = month - k;
+    while (m <= 0) { m += 12; y -= 1; }
+    out.push(`${y}-${String(m).padStart(2, "0")}`);
+  }
+  return out;
+}
+
+/** 주차 라벨 → 정렬 키 (YYYY-Www / Www / nn 등) */
+function weekSortKey(w: string): number {
+  const ym = w.match(/(\d{4}).*?(\d{1,2})\s*$/);
+  if (ym) return parseInt(ym[1], 10) * 100 + parseInt(ym[2], 10);
+  const n = w.match(/(\d{1,2})/);
+  return n ? parseInt(n[1], 10) : 0;
+}
+
+interface LimsElnData {
+  monthLabels: string[];                 // ["3월","4월","5월"]
+  taskPlan:    number[];                 // #1 M열 Task Plan 월별 종류(고유값) 개수
+  taskCount:   number[];                 // #2 I열 taskID 월별 건수
+  sample:      number[];                 // #3 G열 Samplecount 월별 합산
+  latestLabel: string;                   // M-1 라벨
+  statusDist:  { label: string; value: number }[];  // #4 M-1 Lifecyclestate 분포
+  weeks:       string[];                 // #5 최근 3개월 주차(정렬)
+  weekStates:  string[];                 // #5 Lifecyclestate 종류(총합 내림차순)
+  weekMatrix:  Record<string, Record<string, number>>;  // #5 week×state 건수
+  totals:      { taskPlan: number; taskCount: number; sample: number };
+}
+
+function readLimsElnData(xlsxPath: string): LimsElnData | null {
+  const wb = XLSX.readFile(xlsxPath);
+  // "PreprocessdData" 시트 사용 (오탈자 대비 preprocess 부분일치)
+  const sheetName = wb.SheetNames.find((n: string) => /preprocess/i.test(n));
+  if (!sheetName) {
+    logger.warn(`[BIO LIMS] PreprocessdData 시트를 찾을 수 없습니다. 시트 목록: [${wb.SheetNames.join(", ")}]`);
+    return null;
+  }
+  logger.info(`[BIO LIMS] 시트: "${sheetName}"`);
+  const ws   = wb.Sheets[sheetName];
+  const rows = XLSX.utils.sheet_to_json<unknown[]>(ws, { header: 1, defval: "" }) as unknown[][];
+  if (rows.length < 2) return null;
+
+  const num = (v: unknown): number => {
+    const m = String(v ?? "").replace(/,/g, "").match(/-?\d+(?:\.\d+)?/);
+    return m ? Number(m[0]) : 0;
+  };
+  const parseMonth = (raw: unknown): string => {
+    if (raw === null || raw === undefined || raw === "") return "";
+    if (typeof raw === "number") return excelDateToStr(raw).slice(0, 7);
+    const s = String(raw).trim();
+    const m = s.match(/(\d{4})[./-](\d{1,2})/);
+    return m ? `${m[1]}-${m[2].padStart(2, "0")}` : "";
+  };
+
+  const months      = recentThreeMonths();
+  const latestMonth = months[months.length - 1];
+  const mlabel      = (ym: string) => `${parseInt(ym.slice(5, 7), 10)}월`;
+
+  // 헤더 이름으로 컬럼 탐지 (실패 시 글자 인덱스로 폴백). 시트 구조가 가정과 달라도 대응.
+  const headers = (rows[0] as unknown[]).map((h) => String(h ?? "").trim());
+  const norm    = (s: string) => s.toLowerCase().replace(/[\s_()]/g, "");
+  const findCol = (fallback: number, ...terms: string[]): number => {
+    for (const t of terms) {
+      const i = headers.findIndex((h) => norm(h).includes(norm(t)));
+      if (i >= 0) return i;
+    }
+    return fallback;
+  };
+  const COL = {
+    date:   findCol(1,  "createdate", "접수일", "생성일", "date"),
+    state:  findCol(4,  "lifecyclestate", "lifecycle", "상태", "status"),
+    sample: findCol(6,  "samplecount", "검체", "sample"),
+    taskId: findCol(8,  "taskid"),
+    plan:   findCol(12, "taskplan", "task plan", "plan", "수행", "계획"),
+    week:   findCol(14, "week", "주차"),
+  };
+  const hname = (i: number) => (i >= 0 && i < headers.length ? headers[i] : "(범위밖)");
+  logger.info(`[BIO LIMS] 컬럼 — date:${COL.date}(${hname(COL.date)}) state:${COL.state}(${hname(COL.state)}) sample:${COL.sample}(${hname(COL.sample)}) taskId:${COL.taskId}(${hname(COL.taskId)}) plan:${COL.plan}(${hname(COL.plan)}) week:${COL.week}(${hname(COL.week)})`);
+  logger.info(`[BIO LIMS] 전체 헤더: [${headers.map((h, i) => `${i}:${h}`).join(" | ")}]`);
+  if (rows.length > 1) {
+    const r1 = rows[1] as unknown[];
+    logger.info(`[BIO LIMS] 첫 데이터행 값 — plan(${COL.plan})="${r1[COL.plan] ?? ""}" sample(${COL.sample})="${r1[COL.sample] ?? ""}" taskId(${COL.taskId})="${r1[COL.taskId] ?? ""}" state(${COL.state})="${r1[COL.state] ?? ""}"`);
+  }
+
+  const sampleBy: Record<string, number> = {}, taskCntBy: Record<string, number> = {};
+  const planTypesBy: Record<string, Set<string>> = {};   // 월별 Task Plan 고유 종류
+  for (const m of months) { sampleBy[m] = 0; taskCntBy[m] = 0; planTypesBy[m] = new Set<string>(); }
+  const statusMap: Record<string, number> = {};
+  const weekMatrix: Record<string, Record<string, number>> = {};
+  const stateSet = new Set<string>(), weekSet = new Set<string>();
+
+  for (let i = 1; i < rows.length; i++) {
+    const r  = rows[i] as unknown[];
+    const ym = parseMonth(r[COL.date]);
+    if (!months.includes(ym)) continue;
+
+    const planVal = String(r[COL.plan] ?? "").trim();
+    if (planVal) planTypesBy[ym].add(planVal);                    // 월별 Task Plan 종류(고유값)
+    sampleBy[ym]   += num(r[COL.sample]);
+    if (String(r[COL.taskId] ?? "").trim()) taskCntBy[ym] += 1;
+
+    const state = String(r[COL.state] ?? "").trim();
+    if (ym === latestMonth && state) statusMap[state] = (statusMap[state] ?? 0) + 1;
+
+    const week = String(r[COL.week] ?? "").trim();
+    if (week && state) {
+      weekSet.add(week); stateSet.add(state);
+      weekMatrix[week] = weekMatrix[week] ?? {};
+      weekMatrix[week][state] = (weekMatrix[week][state] ?? 0) + 1;
+    }
+  }
+
+  const weeks = [...weekSet].sort((a, b) => weekSortKey(a) - weekSortKey(b) || (a < b ? -1 : 1));
+  const stateTotals: Record<string, number> = {};
+  for (const s of stateSet) stateTotals[s] = weeks.reduce((t, w) => t + (weekMatrix[w]?.[s] ?? 0), 0);
+  const weekStates = Object.entries(stateTotals).sort((a, b) => b[1] - a[1]).map(([s]) => s);
+
+  const taskPlan  = months.map((m) => planTypesBy[m].size);   // 월별 Task Plan 종류 개수
+  const taskCount = months.map((m) => taskCntBy[m]);
+  const sample    = months.map((m) => Math.round(sampleBy[m]));
+
+  logger.info(`[BIO LIMS] 월:${months.join(",")} taskPlan:${taskPlan} taskCount:${taskCount} sample:${sample} 상태(${latestMonth}):${Object.keys(statusMap).length}종 주차:${weeks.length}`);
+  return {
+    monthLabels: months.map(mlabel),
+    taskPlan, taskCount, sample,
+    latestLabel: mlabel(latestMonth),
+    statusDist:  Object.entries(statusMap).sort((a, b) => b[1] - a[1]).map(([label, value]) => ({ label, value })),
+    weeks, weekStates, weekMatrix,
+    totals: {
+      taskPlan:  taskPlan.reduce((s, v) => s + v, 0),
+      taskCount: taskCount.reduce((s, v) => s + v, 0),
+      sample:    sample.reduce((s, v) => s + v, 0),
+    },
+  };
+}
+
+/** Lifecyclestate 분포 도넛 차트 PNG (범례에 건수 표기) */
+async function renderLimsDonutToPng(dist: { label: string; value: number }[], outputPng: string): Promise<void> {
+  const chartJs   = loadChartJsScript();
+  const scriptTag = chartJs
+    ? `<script>${chartJs}</script>`
+    : `<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>`;
+  const labels = dist.map((d) => `${d.label} (${d.value})`);
+  const values = dist.map((d) => d.value);
+  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+    *{margin:0;padding:0;box-sizing:border-box;} body{background:#fff;font-family:"Malgun Gothic",Arial,sans-serif;}
+    #c{width:440px;height:300px;background:#fff;}
+  </style></head><body><div id="c"><canvas id="ch" width="440" height="300"></canvas></div>
+  ${scriptTag}<script>(function(){
+    var ctx=document.getElementById('ch').getContext('2d');
+    if(!window.Chart){ctx.fillText('Chart.js load fail',10,30);return;}
+    new Chart(ctx,{type:'doughnut',data:{labels:${JSON.stringify(labels)},datasets:[{data:${JSON.stringify(values)},backgroundColor:${JSON.stringify(ELN_PALETTE)},borderColor:'#fff',borderWidth:1}]},
+      options:{responsive:false,animation:false,cutout:'52%',layout:{padding:8},
+        plugins:{legend:{display:true,position:'right',labels:{font:{size:10},boxWidth:10,padding:6}},tooltip:{enabled:false}}}});
+  })();</script></body></html>`;
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.setViewportSize({ width: 440, height: 300 });
+    await page.setContent(html, { waitUntil: "networkidle", timeout: 30_000 });
+    await page.waitForTimeout(400);
+    await page.locator("#c").screenshot({ path: outputPng, type: "png" });
+  } finally {
+    await browser.close();
+  }
+}
+
+/** 임검분 LIMS 데이터 인사이트 (GCP 컨셉) */
+function buildLimsInsightLines(d: LimsElnData): string[] {
+  const fmt = (n: number) => Math.round(n).toLocaleString();
+  const first = (x: number[]) => x[0] ?? 0;
+  const last  = (x: number[]) => x[x.length - 1] ?? 0;
+  const tword = (x: number[]) => last(x) > first(x) ? "증가" : last(x) < first(x) ? "감소" : "유지";
+  const range = d.monthLabels.length ? `${d.monthLabels[0]}~${d.monthLabels[d.monthLabels.length - 1]}` : "";
+  const lines: string[] = [];
+
+  lines.push(`최근 3개월(${range}) 임검분 LIMS는 수행 Task Plan 총 ${fmt(d.totals.taskPlan)}건(월 ${fmt(first(d.taskPlan))}→${fmt(last(d.taskPlan))}, ${tword(d.taskPlan)}), 생성 Task 총 ${fmt(d.totals.taskCount)}건으로 집계되었으며,`);
+  lines.push(`시험 검체는 총 ${fmt(d.totals.sample)}개가 처리되었고,`);
+  if (d.statusDist.length) {
+    const topS = d.statusDist[0];
+    lines.push(`${d.latestLabel} Task 상태는 ${topS.label}(${fmt(topS.value)}건)이 가장 많은 비중을 차지했습니다.`);
+  } else {
+    lines[lines.length - 1] = lines[lines.length - 1].replace(/처리되었고,$/, "처리되었습니다.");
+  }
+  return lines;
+}
+
 function buildBioLimsReportHtml(
   titleDate:       string,
   today:           string,
-  limsImageBase64: string | null,
-  limsRows:        LimsServiceRow[],
-  limsDescription: string,
+  charts:          { taskPlan: string | null; taskCount: string | null; sample: string | null; status: string | null; weekly: string | null },
+  data:            LimsElnData | null,
 ): string {
-  const imgTag = limsImageBase64
-    ? `<img src="data:image/png;base64,${limsImageBase64}" style="max-width:100%;height:auto;display:block;margin:0 auto;" />`
-    : `<div class="placeholder-box">LIMS.png 이미지가 업로드되지 않았습니다.</div>`;
-
-  const tableRows = limsRows.map((r, i) => `
-    <tr class="${i % 2 === 0 ? "" : "alt"}">
-      <td>${r.initiatedAt}</td>
-      <td>${r.area}</td>
-      <td class="td-left">${r.contentSummary}</td>
-      <td class="td-left">${r.detail}</td>
-      <td>${r.issueType}</td>
-      <td>${r.status}</td>
-      <td>${r.hours}</td>
-    </tr>`).join("");
-
-  const emptyNote = limsRows.length === 0
-    ? `<tr><td colspan="7" style="text-align:center;color:#9ca3af;padding:20px;">데이터 없음</td></tr>`
+  const monthRange = data && data.monthLabels.length
+    ? `${data.monthLabels[0]}~${data.monthLabels[data.monthLabels.length - 1]}`
     : "";
 
-  const descHtml = limsDescription
-    ? `<div class="desc-box">${limsDescription}</div>`
+  const cell = (no: number, title: string, img: string | null, msg?: string) => `
+    <div class="lims-cell">
+      <div class="lims-cell-title"><span class="lims-no">${no}</span>${escHtml(title)}</div>
+      ${msg ? `<div class="lims-cell-msg">${msg}</div>` : ""}
+      <div class="lims-img-wrap">${
+        img
+          ? `<img src="data:image/png;base64,${img}" alt="${escHtml(title)}" />`
+          : `<div class="lims-no-data">데이터 없음</div>`
+      }</div>
+    </div>`;
+
+  const wide = (no: number, title: string, img: string | null, msg?: string) => `
+    <div class="lims-cell lims-wide">
+      <div class="lims-cell-title"><span class="lims-no">${no}</span>${escHtml(title)}</div>
+      ${msg ? `<div class="lims-cell-msg">${msg}</div>` : ""}
+      <div class="lims-img-wrap lims-img-wide">${
+        img
+          ? `<img src="data:image/png;base64,${img}" alt="${escHtml(title)}" />`
+          : `<div class="lims-no-data">데이터 없음</div>`
+      }</div>
+    </div>`;
+
+  const msgs = data ? {
+    taskPlan:  `월별 수행된 Task Plan 종류 수 (최근 3개월)`,
+    taskCount: `최근 3개월 합 <strong>${data.totals.taskCount.toLocaleString()}</strong>건`,
+    sample:    `최근 3개월 합 <strong>${data.totals.sample.toLocaleString()}</strong>개`,
+    status:    `${data.latestLabel} 기준 Task 상태 분포`,
+    weekly:    `최근 3개월 주차별 Task 상태 현황`,
+  } : { taskPlan: "", taskCount: "", sample: "", status: "", weekly: "" };
+
+  const insight = data ? buildLimsInsightLines(data) : [];
+  const insightHtml = insight.length > 0
+    ? `<div class="gcp-insight">
+        <div class="gcp-insight-label">데이터 인사이트 (최근 3개월 분석)</div>
+        ${insight.map((l) => `<p>${l}</p>`).join("")}
+      </div>`
     : "";
 
   return `<!DOCTYPE html>
@@ -1237,46 +1365,61 @@ function buildBioLimsReportHtml(
     .cover-main  { font-size:30px; font-weight:700; line-height:1.55; }
     .cover-rule  { width:60px; height:3px; background:rgba(255,255,255,.3); margin:32px auto; }
     .cover-date  { font-size:13px; opacity:.45; }
-    .page { break-before:page; padding:36px 44px 28px; }
+    .page { break-before:page; padding:32px 40px 24px; }
     .page-header {
       display:flex; align-items:flex-end; justify-content:space-between;
-      border-bottom:2.5px solid #0f2d55; padding-bottom:10px; margin-bottom:16px;
+      border-bottom:2.5px solid #0f2d55; padding-bottom:10px; margin-bottom:14px;
     }
     .page-header h2  { font-size:18px; font-weight:700; color:#0f2d55; }
     .page-header .pg { font-size:11px; color:#9ca3af; }
     .headline {
-      background:#f0f4ff; border-left:4px solid #1a4a8a; padding:10px 14px;
-      font-size:12px; line-height:1.7; color:#1e3a5f; margin-bottom:18px; border-radius:0 4px 4px 0;
+      background:#f0f4ff; border-left:4px solid #1a4a8a; padding:9px 14px;
+      font-size:11px; line-height:1.6; color:#1e3a5f; margin-bottom:12px; border-radius:0 4px 4px 0;
     }
-    .section-title {
-      font-size:13px; font-weight:700; color:#0f2d55;
-      margin-bottom:12px; padding-bottom:4px; border-bottom:1px solid #e5e7eb;
+    /* 4개 차트(2×2) + 전폭(주차) */
+    .lims-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+    .lims-grid-rows { grid-template-rows:repeat(2, 200px); }
+    .lims-wide { grid-column:1 / -1; }
+    .lims-cell {
+      border:1px solid #e5e7eb; border-radius:6px; overflow:hidden;
+      background:#fff; display:flex; flex-direction:column; min-width:0;
     }
-    .placeholder-box {
-      border:2px dashed #cbd5e1; border-radius:8px; padding:40px;
-      text-align:center; color:#9ca3af; font-size:12px; background:#f8fafc;
+    .lims-cell-title {
+      flex-shrink:0; height:24px; padding:0 10px; gap:6px;
+      font-size:10px; font-weight:700; color:#1f2937;
+      background:#f0f4f8; border-bottom:1px solid #e5e7eb;
+      display:flex; align-items:center; justify-content:center;
     }
-    .svc-table { width:100%; border-collapse:collapse; font-size:9px; margin-top:4px; }
-    .svc-table th {
-      background:#0f2d55; color:#fff; padding:5px 4px; text-align:center;
-      font-size:9px; font-weight:600; border:1px solid #0f2d55;
+    .lims-no {
+      display:inline-flex; align-items:center; justify-content:center;
+      width:16px; height:16px; border-radius:50%;
+      background:#0f2d55; color:#fff; font-size:9px; font-weight:700; flex-shrink:0;
     }
-    .svc-table td { padding:4px 5px; border:1px solid #d1d5db; vertical-align:top; text-align:center; }
-    .svc-table .td-left { text-align:left; }
-    .svc-table tr.alt td { background:#f9fafb; }
-    .desc-box {
-      margin-top:16px; padding:10px 14px; background:#f8fafc;
-      border:1px solid #e5e7eb; border-radius:4px;
-      font-size:9.5px; color:#374151; line-height:1.6;
+    .lims-cell-msg {
+      flex-shrink:0; padding:3px 10px; font-size:9px; color:#374151;
+      background:#f8fafc; border-bottom:1px solid #e5e7eb; line-height:1.4; text-align:center;
     }
+    .lims-cell-msg strong { color:#0f2d55; font-weight:700; }
+    .lims-img-wrap { flex:1; min-height:0; display:flex; align-items:center; justify-content:center; padding:4px; overflow:hidden; }
+    .lims-img-wrap img { display:block; max-width:100%; max-height:100%; height:auto; width:auto; object-fit:contain; }
+    .lims-img-wide { align-items:stretch; }
+    .lims-img-wide img { width:100%; height:auto; max-height:none; }
+    .lims-no-data { color:#9ca3af; font-size:11px; }
+    .gcp-insight {
+      margin-top:10px; padding:9px 14px; background:#f0fdf4;
+      border-left:4px solid #16a34a; border-radius:0 4px 4px 0;
+      font-size:10.5px; line-height:1.6; color:#374151;
+    }
+    .gcp-insight .gcp-insight-label { font-weight:700; color:#15803d; font-size:11px; margin-bottom:4px; }
+    .gcp-insight p { margin:0 0 3px; }
+    .gcp-insight p:last-child { margin-bottom:0; }
     .footer {
-      margin-top:24px; padding-top:12px; border-top:1px solid #e5e7eb;
+      margin-top:14px; padding-top:10px; border-top:1px solid #e5e7eb;
       font-size:10px; color:#d1d5db; display:flex; justify-content:space-between;
     }
   </style>
 </head>
 <body>
-  <!-- 표지 -->
   <div class="cover">
     <div class="cover-badge">SK Bioscience</div>
     <div class="cover-main">${titleDate}<br>Bio연구본부 임검분 LIMS 운영 현황</div>
@@ -1284,44 +1427,22 @@ function buildBioLimsReportHtml(
     <div class="cover-date">작성일: ${today}</div>
   </div>
 
-  <!-- 2페이지: LIMS 이미지 -->
   <div class="page">
     <div class="page-header">
-      <h2>Bio연구본부 임검분 LIMS 사용 현황</h2>
+      <h2>임검분 LIMS 운영 현황</h2>
       <span class="pg">${titleDate}</span>
     </div>
-    <div class="headline">연구본부에서 사용 중인 임상시험검체분석기관 LIMS 현황 Report 입니다.</div>
-    <div class="section-title">연구본부 LIMS (임상시험검체분석기관) 사용 현황</div>
-    ${imgTag}
-    <div class="footer">
-      <span>SK Bioscience Bio연구본부 — 임검분 LIMS 운영 현황</span>
-      <span>${titleDate}</span>
+    <div class="headline">최근 3개월(${monthRange}) 임검분 LIMS 운영 현황입니다. (ELN_report.xlsx 기준)</div>
+    <div class="lims-grid lims-grid-rows">
+      ${cell(1, "수행된 Task Plan", charts.taskPlan, msgs.taskPlan)}
+      ${cell(2, "생성된 Task",      charts.taskCount, msgs.taskCount)}
+      ${cell(3, "시험 검체 개수",   charts.sample, msgs.sample)}
+      ${cell(4, "Task Status 요약", charts.status, msgs.status)}
     </div>
-  </div>
-
-  <!-- 3페이지: IT서비스 진행 현황 -->
-  <div class="page">
-    <div class="page-header">
-      <h2>IT서비스 진행 현황</h2>
-      <span class="pg">${titleDate}</span>
+    <div class="lims-grid" style="margin-top:8px;">
+      ${wide(5, "주차 별 Task 생성 개수 및 현황", charts.weekly, msgs.weekly)}
     </div>
-    <table class="svc-table">
-      <thead>
-        <tr>
-          <th style="width:10%">발의일자</th>
-          <th style="width:9%">영역구분</th>
-          <th style="width:18%">내용요약</th>
-          <th style="width:28%">상세내용</th>
-          <th style="width:9%">이슈구분</th>
-          <th style="width:9%">진행상태</th>
-          <th style="width:7%">지원시간</th>
-        </tr>
-      </thead>
-      <tbody>
-        ${tableRows}${emptyNote}
-      </tbody>
-    </table>
-    ${descHtml}
+    ${insightHtml}
     <div class="footer">
       <span>SK Bioscience Bio연구본부 — 임검분 LIMS 운영 현황</span>
       <span>${titleDate}</span>
@@ -1338,48 +1459,70 @@ export async function generateBioLimsReport(jobId: string): Promise<BioReportRes
   const titleDate = `${year}년 ${String(month).padStart(2, "0")}월`;
   const today     = new Date().toISOString().slice(0, 10);
 
-  let limsImageBase64: string | null = null;
-  let limsRows:        LimsServiceRow[] = [];
-  let limsDescription  = "";
+  const uploadPath = path.resolve(process.env.UPLOAD_DIR ?? "uploads", jobId, "uploads");
+  fs.mkdirSync(uploadPath, { recursive: true });
+
+  let data: LimsElnData | null = null;
+  const charts: { taskPlan: string | null; taskCount: string | null; sample: string | null; status: string | null; weekly: string | null } =
+    { taskPlan: null, taskCount: null, sample: null, status: null, weekly: null };
 
   try {
-    const xlsxRows = await query<{ stored_path: string }>(
+    const srcRows = await query<{ stored_path: string }>(
       `SELECT stored_path FROM uploaded_files
-       WHERE report_job_id = $1 AND original_name = 'LIMS.xlsx'
+       WHERE report_job_id = $1 AND LOWER(original_name) = 'lims_dashboard.xlsx'
        ORDER BY created_at DESC LIMIT 1`,
       [jobId]
     );
-    if (xlsxRows.length && fs.existsSync(xlsxRows[0].stored_path)) {
-      logger.info(`[BIO LIMS Report] LIMS.xlsx: ${xlsxRows[0].stored_path}`);
-      const parsed    = readLimsServiceData(xlsxRows[0].stored_path);
-      limsRows        = parsed.rows;
-      limsDescription = parsed.description;
-      logger.info(`[BIO LIMS Report] 서비스 행 수: ${limsRows.length}`);
+    if (srcRows.length && fs.existsSync(srcRows[0].stored_path)) {
+      logger.info(`[BIO LIMS Report] LIMS_Dashboard.xlsx: ${srcRows[0].stored_path}`);
+      data = readLimsElnData(srcRows[0].stored_path);
     } else {
-      logger.info("[BIO LIMS Report] LIMS.xlsx 없음 — 표 생략");
+      logger.info("[BIO LIMS Report] LIMS_Dashboard.xlsx 없음 — 차트 생략");
     }
   } catch (e) {
-    logger.error(`[BIO LIMS Report] LIMS.xlsx 처리 실패: ${(e as Error).message}`);
+    logger.error(`[BIO LIMS Report] LIMS_Dashboard.xlsx 처리 실패: ${(e as Error).message}`);
   }
 
-  try {
-    const imgRows = await query<{ stored_path: string }>(
-      `SELECT stored_path FROM uploaded_files
-       WHERE report_job_id = $1 AND original_name = 'LIMS.png'
-       ORDER BY created_at DESC LIMIT 1`,
-      [jobId]
-    );
-    if (imgRows.length && fs.existsSync(imgRows[0].stored_path)) {
-      logger.info(`[BIO LIMS Report] LIMS.png: ${imgRows[0].stored_path}`);
-      limsImageBase64 = fs.readFileSync(imgRows[0].stored_path).toString("base64");
-    } else {
-      logger.info("[BIO LIMS Report] LIMS.png 없음 — 이미지 생략");
+  if (data) {
+    const d  = data;
+    const ts = Date.now();
+    const renderBar = async (vals: number[], color: string, name: string): Promise<string | null> => {
+      if (vals.every((v) => v === 0)) return null;
+      try {
+        const p = path.join(uploadPath, `lims_${name}_${ts}.png`);
+        await renderGcpBarToPng(d.monthLabels, vals, color, p);
+        return fs.readFileSync(p).toString("base64");
+      } catch (e) { logger.warn(`[BIO LIMS] bar(${name}) 실패: ${(e as Error).message}`); return null; }
+    };
+    charts.taskPlan  = await renderBar(d.taskPlan,  "#4472C4", "taskplan");   // #1 Task Plan 월별 합산
+    charts.taskCount = await renderBar(d.taskCount, "#5B9BD5", "taskcount");  // #2 생성 Task 월별 건수
+    charts.sample    = await renderBar(d.sample,    "#70AD47", "sample");     // #3 검체 월별 합산
+
+    // #4 도넛 — M-1 Lifecyclestate 분포
+    if (d.statusDist.length) {
+      try {
+        const p = path.join(uploadPath, `lims_status_${ts}.png`);
+        await renderLimsDonutToPng(d.statusDist, p);
+        charts.status = fs.readFileSync(p).toString("base64");
+      } catch (e) { logger.warn(`[BIO LIMS] donut 실패: ${(e as Error).message}`); }
     }
-  } catch (e) {
-    logger.error(`[BIO LIMS Report] LIMS.png 처리 실패: ${(e as Error).message}`);
+
+    // #5 주차별 Task 생성 개수 및 현황 — Lifecyclestate × week (전폭 그룹 막대)
+    if (d.weeks.length && d.weekStates.length) {
+      const series = d.weekStates.map((s, i) => ({
+        name: s, color: ELN_PALETTE[i % ELN_PALETTE.length],
+        values: d.weeks.map((w) => d.weekMatrix[w]?.[s] ?? 0),
+      }));
+      try {
+        const p  = path.join(uploadPath, `lims_weekly_${ts}.png`);
+        const gw = Math.min(2600, Math.max(1400, d.weeks.length * Math.max(1, d.weekStates.length) * 26 + 240));
+        await renderGcpGroupedBarToPng(d.weeks, series, p, gw, 420);
+        charts.weekly = fs.readFileSync(p).toString("base64");
+      } catch (e) { logger.warn(`[BIO LIMS] weekly 실패: ${(e as Error).message}`); }
+    }
   }
 
-  const html = buildBioLimsReportHtml(titleDate, today, limsImageBase64, limsRows, limsDescription);
+  const html = buildBioLimsReportHtml(titleDate, today, charts, data);
 
   const outputDir  = path.resolve(process.env.OUTPUT_DIR ?? "outputs");
   fs.mkdirSync(outputDir, { recursive: true });
@@ -1781,11 +1924,12 @@ interface ElnServiceRow {
  * ELN_service.xlsx 첫 번째 시트를 파싱합니다.
  *  - 헤더 행(row 0)에서 열 이름으로 인덱스를 자동 탐색
  *  - G열(index 6) = "접수일" — 탐색 실패 시 폴백
- *  - 가장 최근 월(YYYY-MM) 행만 반환
+ *  - 보고서 기준 대상 월(M-1, "YYYY-MM") 접수 행만 반환
  *
- * @returns { rows, latestMonth }
+ * @param targetMonth 보고서 대상 월 "YYYY-MM" (전월 = M-1)
+ * @returns { rows, latestMonth } (latestMonth = targetMonth)
  */
-function readElnServiceData(xlsxPath: string): { rows: ElnServiceRow[]; latestMonth: string } {
+function readElnServiceData(xlsxPath: string, targetMonth: string): { rows: ElnServiceRow[]; latestMonth: string } {
   const wb = XLSX.readFile(xlsxPath);
 
   // 첫 번째 시트 사용 (또는 데이터가 있는 첫 시트)
@@ -1838,23 +1982,13 @@ function readElnServiceData(xlsxPath: string): { rows: ElnServiceRow[]; latestMo
   const cell = (row: unknown[], idx: number) =>
     idx >= 0 ? String(row[idx] ?? "").trim() : "";
 
-  // 현재 월 (미래 날짜 제외 기준)
-  const now = new Date();
-  const currentMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+  logger.info(`[BIO ELN Svc] 대상 월(보고서 M-1): ${targetMonth}`);
 
-  // 전체 행에서 접수일 → 월 목록 (미래 월 제외)
-  const allMonths = rows
-    .slice(1)
-    .map((r) => toMonth((r as unknown[])[colReception]))
-    .filter((m) => !!m && m <= currentMonth);
-  const latestMonth = allMonths.sort().at(-1) ?? "";
-  logger.info(`[BIO ELN Svc] 접수일 최근 월: ${latestMonth} (현재 월 기준: ${currentMonth})`);
-
-  // 최근 월 행만 필터링
+  // 대상 월(M-1) 접수 행만 필터링
   const result: ElnServiceRow[] = [];
   for (let i = 1; i < rows.length; i++) {
     const row = rows[i] as unknown[];
-    if (toMonth(row[colReception]) !== latestMonth) continue;
+    if (toMonth(row[colReception]) !== targetMonth) continue;
     result.push({
       requestId:    cell(row, colRequestId),
       requestTeam:  cell(row, colRequestTeam),
@@ -1865,8 +1999,8 @@ function readElnServiceData(xlsxPath: string): { rows: ElnServiceRow[]; latestMo
       status:       cell(row, colStatus),
     });
   }
-  logger.info(`[BIO ELN Svc] 최근 월 행: ${result.length}개`);
-  return { rows: result, latestMonth };
+  logger.info(`[BIO ELN Svc] ${targetMonth} 접수 행: ${result.length}개`);
+  return { rows: result, latestMonth: targetMonth };
 }
 
 // ─ 인사이트 분석 (공통) ────────────────────────────────────────────────────────
@@ -2195,8 +2329,9 @@ export async function generateBioElnReport(jobId: string): Promise<BioReportResu
   fs.mkdirSync(uploadPath, { recursive: true });
 
   const { year, month } = getLastMonth();
-  const titleDate = `${year}년 ${String(month).padStart(2, "0")}월`;
-  const today     = new Date().toISOString().slice(0, 10);
+  const titleDate   = `${year}년 ${String(month).padStart(2, "0")}월`;
+  const targetMonth = `${year}-${String(month).padStart(2, "0")}`;   // 보고서 대상 월 (M-1)
+  const today       = new Date().toISOString().slice(0, 10);
 
   let chart1Base64: string | null = null;
   let chart2Base64: string | null = null;
@@ -2251,7 +2386,7 @@ export async function generateBioElnReport(jobId: string): Promise<BioReportResu
     if (svcRows.length && fs.existsSync(svcRows[0].stored_path)) {
       const svcPath = svcRows[0].stored_path;
       logger.info(`[BIO ELN Report] ELN_service.xlsx: ${svcPath}`);
-      const svcData = readElnServiceData(svcPath);
+      const svcData = readElnServiceData(svcPath, targetMonth);
       serviceRows    = svcData.rows;
       svcLatestMonth = svcData.latestMonth;
       logger.info(`[BIO ELN Report] IT서비스 행 수: ${serviceRows.length}, 최근월: ${svcLatestMonth}`);

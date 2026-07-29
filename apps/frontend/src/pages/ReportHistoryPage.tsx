@@ -131,7 +131,7 @@ export function ReportHistoryPage() {
   // ── 렌더 ────────────────────────────────────────────────────────────────────
 
   return (
-    <AppLayout>
+    <AppLayout title="보고서 History">
       <div className="max-w-7xl mx-auto px-6 py-8">
         <div className="mb-6">
           <h1 className="text-2xl font-bold text-gray-900">보고서 History</h1>

@@ -23,6 +23,20 @@ const NAV_ITEMS: NavItem[] = [
   },
 ];
 
+/** 운영 현황 대시보드 — 매일 새벽 자동 수집된 데이터를 조회 */
+const OPS_ICON = (
+  <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8}
+      d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+  </svg>
+);
+
+const OPS_ITEMS: NavItem[] = [
+  { to: "/ops/BIO",    label: "Bio연구본부 현황",  icon: OPS_ICON },
+  { to: "/ops/DEV",    label: "개발본부 현황",     icon: OPS_ICON },
+  { to: "/ops/LHOUSE", label: "L HOUSE 공장 현황", icon: OPS_ICON },
+];
+
 const DIV_ITEMS: NavItem[] = [
   {
     to:    "/bio-research",
@@ -143,6 +157,9 @@ export function Sidebar() {
       {/* 네비게이션 */}
       <nav className="flex-1 overflow-y-auto px-3 py-2 space-y-0.5">
         <NavGroup items={NAV_ITEMS} />
+
+        <SectionLabel>운영 현황</SectionLabel>
+        <NavGroup items={OPS_ITEMS} />
 
         <SectionLabel>사업부</SectionLabel>
         <NavGroup items={DIV_ITEMS} />

@@ -102,6 +102,23 @@ class JobEventBus {
   }
 
   /**
+   * 같은 jobId 로 새 수집을 시작할 때 호출 — 이전 실행의 이벤트 히스토리를 비웁니다.
+   *
+   * 히스토리를 남겨두면 재연결 시 replay(streamCrawlHandler) 로 이전 실행의
+   * task_error / task_done 이 그대로 전달되어, 새 실행이 시작도 하기 전에
+   * 클라이언트가 "이미 실패/완료" 로 판단하는 문제가 발생합니다.
+   * 구독자(emitter)는 유지하므로 진행 중인 SSE 연결은 끊기지 않습니다.
+   */
+  resetHistory(jobId: string): void {
+    this.histories.set(jobId, []);
+    const timer = this.timers.get(jobId);
+    if (timer) {
+      clearTimeout(timer);
+      this.timers.delete(jobId);
+    }
+  }
+
+  /**
    * all_done 이벤트 후 호출 — HISTORY_TTL_MS 뒤 자원 자동 해제.
    */
   scheduleCleanup(jobId: string): void {

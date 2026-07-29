@@ -79,16 +79,54 @@ const MAX_SIZE_BYTES  = 50 * 1024 * 1024; // 50 MB
 const MAX_FILE_COUNT  = 10;
 
 /**
- * 대시보드 캡처 시스템별 저장 이미지 파일명 후보.
- * `${divisionCode}:${systemCode}` → 저장된 Systemusage 파일명(.png/.jpg).
- * 캡처 성공 후 uploaded_files 에 저장되며, 파일 목록에서 찾아 "저장됨"으로 표시한다.
+/**
+ * 데이터 수집 시스템별 결과 파일명.
+ * `${divisionCode}:${systemCode}` → 수집 시 저장되는 파일들.
+ * 파일 목록에 하나라도 있으면 "데이터 수집 완료"로 표시(새로고침 후에도 유지).
  */
-const DASHBOARD_IMG_NAMES: Record<string, string[]> = {
-  "LHOUSE:VEEVA":    ["Systemusage_LHOUSE.png", "Systemusage_LHOUSE.jpg"],
-  "DEV:GCP_QUALITY": ["Systemusage_GCP.png", "Systemusage_GCP.jpg"],
-  "DEV:MEDCOMMS":    ["Systemusage_Medcomms.png", "Systemusage_Medcomms.jpg"],
-  "DEV:CTMS":        ["Systemusage_Clinical1.png", "Systemusage_Clinical1.jpg"],
-  "BIO:EDMS":        ["Systemusage_RD.png", "Systemusage_RD.jpg"],
+// DEV 원클릭 통합 수집 대상(순차 실행 순서) — 백엔드 crawl_tasks.system_name 과 일치
+const DEV_COLLECT_SYSTEMS = ["GCP_DATA", "MEDCOMMS_DATA", "CTMS_DATA", "GCP_ACTIVITY"] as const;
+
+// DEV 통합 수집 시스템명 → 사용자 표시 라벨 (진행 표시·오류 메시지용)
+const DEV_SYSTEM_LABELS: Record<string, string> = {
+  GCP_DATA:     "GCP Quality System (데이터)",
+  MEDCOMMS_DATA: "Medcomms (데이터)",
+  CTMS_DATA:    "CTMS/eTMF (데이터)",
+  GCP_ACTIVITY: "Activity (Task) Count (시스템 조회)",
+};
+
+// DEV 시스템 카드 코드 → 통합 수집 태스크 키 (카드 진행 표시를 수집 태스크에 연결)
+const DEV_CARD_TASK_KEY: Record<string, string> = {
+  GCP_QUALITY: "GCP_DATA",
+  MEDCOMMS:    "MEDCOMMS_DATA",
+  CTMS:        "CTMS_DATA",
+};
+
+// LHOUSE 원클릭 통합 수집 대상(순차 실행 순서) — 백엔드 crawl_tasks.system_name 과 일치
+//   LHOUSE_DATA = Veeva 데이터(PerfStats/Quality/Training), VEEVA = 시스템 조회(Activity_LHOUSE.xlsx)
+const LHOUSE_COLLECT_SYSTEMS = ["LHOUSE_DATA", "VEEVA"] as const;
+
+const LHOUSE_SYSTEM_LABELS: Record<string, string> = {
+  LHOUSE_DATA: "Veeva 데이터 (PerfStats/Quality/Training)",
+  VEEVA:       "Activity (Task) Count (시스템 조회)",
+};
+
+// LHOUSE 시스템 카드 코드 → 통합 수집 태스크 키 (VEEVA 카드는 데이터 수집 진행을 표시)
+const LHOUSE_CARD_TASK_KEY: Record<string, string> = {
+  VEEVA: "LHOUSE_DATA",
+};
+
+// BIO 시스템 카드 코드 → 수집 태스크 키 (eDMS 카드는 BIO_DATA 수집 진행을 표시)
+const BIO_CARD_TASK_KEY: Record<string, string> = {
+  EDMS: "BIO_DATA",
+};
+
+const DATA_COLLECTED_FILES: Record<string, string[]> = {
+  "DEV:GCP_QUALITY": ["GCP_PerfStats.xlsx", "GCP_Quality.xlsx", "GCP_Training.xlsx"],
+  "DEV:MEDCOMMS":    ["Medcomms_DocType.xlsx", "Medcomms_PerfStats.xlsx", "Medcomms_Activity.xlsx", "Medcomms_Review.xlsx"],
+  "DEV:CTMS":        ["Clinical_PerfStats.xlsx", "Clinical_Study.xlsx"],
+  "LHOUSE:VEEVA":    ["LHOUSE_PerfStats.xlsx", "LHOUSE_Quality.xlsx", "LHOUSE_Training.json"],
+  "BIO:EDMS":        ["BIO_Activity.json", "BIO_PerfStats.xlsx", "BIO_DocType.json"],
 };
 
 // ── 유틸 ─────────────────────────────────────────────────────────────────────
@@ -208,12 +246,13 @@ function SystemCard({
   onPreview,
   onCrawl,
   crawlActive,
-  onDashboardCapture,
-  dashboardCapturing,
-  dashboardTask,
-  dashboardSavedFile,
   onDataCollect,
   dataCollecting,
+  dataCollectedAt,
+  onGenerate,
+  generating,
+  generatingLabel,
+  onSave,
 }: {
   config:       SystemConfig;
   task:         TaskState;
@@ -221,15 +260,17 @@ function SystemCard({
   /** LHOUSE 전용: 카드 내 "시스템 조회" 버튼 클릭 핸들러 */
   onCrawl?:             () => void;
   crawlActive?:         boolean;
-  /** LHOUSE VEEVA 전용: 대시보드 캡처 버튼 */
-  onDashboardCapture?:  () => void;
-  dashboardCapturing?:  boolean;
-  dashboardTask?:       TaskState | null;
-  /** 이전에 캡처되어 저장된 대시보드 이미지 (파일 목록 기반, 새로고침 후에도 유지) */
-  dashboardSavedFile?:  { name: string; url: string; updatedAt: string } | null;
   /** GCP 전용: 보고서용 리포트 3종 Excel 수집 버튼 */
   onDataCollect?:       () => void;
   dataCollecting?:      boolean;
+  /** 데이터 수집 완료 시각 (수집 파일 목록 기반, 새로고침 후에도 유지) */
+  dataCollectedAt?:     string | null;
+  /** 보고서 생성/저장 버튼 (eDMS 등 카드 내에서 직접 보고서 생성하는 경우) */
+  onGenerate?:          () => void;
+  generating?:          boolean;
+  /** 선택: generating 중 버튼 라벨 (미지정 시 "생성 중…") — 수집·생성 단계 구분용 */
+  generatingLabel?:     string;
+  onSave?:              () => void;
 }) {
   const icon = SYSTEM_ICONS[config.code] ?? DEFAULT_ICON;
 
@@ -246,7 +287,7 @@ function SystemCard({
             <p className="text-[11px] text-gray-400">{config.code}</p>
           </div>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center justify-end gap-2">
           <StatusBadge status={task.status} size="sm" />
           {onCrawl && (
             <button
@@ -276,42 +317,11 @@ function SystemCard({
               )}
             </button>
           )}
-          {onDashboardCapture && (
-            <button
-              onClick={onDashboardCapture}
-              disabled={dashboardCapturing}
-              title="로그인 후 Veeva 대시보드 6개 차트를 1장 이미지로 캡처합니다"
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all border
-                ${dashboardCapturing
-                  ? "bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed"
-                  : "bg-amber-50 text-amber-700 border-amber-300 hover:bg-amber-100 shadow-sm"}`}
-            >
-              {dashboardCapturing ? (
-                <>
-                  <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24">
-                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
-                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
-                  </svg>
-                  캡처 중
-                </>
-              ) : (
-                <>
-                  <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                      d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                      d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" />
-                  </svg>
-                  대시보드 캡처
-                </>
-              )}
-            </button>
-          )}
           {onDataCollect && (
             <button
               onClick={onDataCollect}
               disabled={dataCollecting}
-              title="GCP 보고서용 리포트 3종(문서/사용자/품질/교육 등)을 Excel 로 수집합니다"
+              title="보고서용 리포트를 Excel 로 수집합니다 (문서/사용자/품질/교육 등)"
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all border
                 ${dataCollecting
                   ? "bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed"
@@ -331,9 +341,53 @@ function SystemCard({
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
                       d="M4 7v10c0 2 1.5 3 4 3h8c2.5 0 4-1 4-3V7c0-2-1.5-3-4-3H8c-2.5 0-4 1-4 3z M4 7c0 2 1.5 3 4 3h8c2.5 0 4-1 4-3" />
                   </svg>
-                  GCP 데이터 수집
+                  데이터 수집
                 </>
               )}
+            </button>
+          )}
+          {onGenerate && (
+            <button
+              onClick={onGenerate}
+              disabled={generating}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all
+                ${generating
+                  ? "bg-gray-100 text-gray-400 cursor-not-allowed"
+                  : "bg-secondary text-white hover:bg-secondary-600 shadow-sm"}`}
+            >
+              {generating ? (
+                <>
+                  <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+                  </svg>
+                  {generatingLabel ?? "생성 중…"}
+                </>
+              ) : (
+                <>
+                  <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                      d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                  </svg>
+                  보고서 생성
+                </>
+              )}
+            </button>
+          )}
+          {onSave && (
+            <button
+              onClick={onSave}
+              disabled={generating}
+              title="가장 최근에 생성된 PDF 를 선택한 월로 History 에 저장합니다."
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all
+                ${!generating
+                  ? "border border-secondary text-secondary bg-white hover:bg-secondary-50"
+                  : "bg-gray-100 text-gray-400 cursor-not-allowed border border-gray-200"}`}
+            >
+              <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+              </svg>
+              보고서 저장
             </button>
           )}
         </div>
@@ -357,7 +411,7 @@ function SystemCard({
       {/* 마지막 수집일시 + 미리보기 */}
       <div className="flex items-center justify-between pt-1 border-t border-gray-100 mt-auto">
         <span className="text-[11px] text-gray-400">
-          {task.updatedAt ? fmtDatetime(task.updatedAt) : "수집 전"}
+          {task.updatedAt ? fmtDatetime(task.updatedAt) : dataCollectedAt ? fmtDatetime(dataCollectedAt) : "수집 전"}
         </span>
         {task.status === "COMPLETED" && (
           <button
@@ -369,45 +423,16 @@ function SystemCard({
         )}
       </div>
 
-      {/* 대시보드 캡처 결과 — 라이브 캡처 완료 또는 이전에 저장된 이미지(새로고침 후에도 유지) */}
-      {(() => {
-        const freshUrl =
-          dashboardTask?.status === "COMPLETED" && dashboardTask.filePaths.length > 0
-            ? toUploadUrl(dashboardTask.filePaths[0])
-            : null;
-        const url   = freshUrl ?? dashboardSavedFile?.url ?? null;
-        if (!url) return null;
-        const fname = dashboardSavedFile?.name ?? "Systemusage.png";
-        const label = freshUrl ? "대시보드 캡처 완료" : "대시보드 이미지 저장됨";
-        return (
-          <div className="flex items-center justify-between pt-1 border-t border-amber-100 bg-amber-50/60 -mx-4 px-4 pb-1 rounded-b-xl mt-1">
-            <span className="text-[11px] text-amber-700 font-medium">
-              {label}
-              {!freshUrl && dashboardSavedFile && (
-                <span className="text-amber-500 font-normal"> · {fmtDatetime(dashboardSavedFile.updatedAt)}</span>
-              )}
-            </span>
-            <a
-              href={url}
-              download={fname}
-              target="_blank"
-              rel="noreferrer"
-              className="text-[11px] text-amber-600 hover:text-amber-800 hover:underline font-semibold flex items-center gap-1"
-            >
-              <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                  d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-              </svg>
-              이미지 다운로드
-            </a>
-          </div>
-        );
-      })()}
-      {dashboardTask?.status === "FAILED" && dashboardTask.error && (
-        <p className="text-[11px] text-red-500 bg-red-50 rounded px-2 py-1 truncate mt-1" title={dashboardTask.error}>
-          캡처 실패: {dashboardTask.error}
-        </p>
+      {/* 데이터 수집 완료 표시 — 수집된 파일 목록 기반(새로고침 후에도 유지) */}
+      {dataCollectedAt && (
+        <div className="flex items-center justify-between pt-1 border-t border-sky-100 bg-sky-50/60 -mx-4 px-4 pb-1 rounded-b-xl mt-1">
+          <span className="text-[11px] text-sky-700 font-medium">
+            데이터 수집 완료
+            <span className="text-sky-500 font-normal"> · {fmtDatetime(dataCollectedAt)}</span>
+          </span>
+        </div>
       )}
+
     </div>
   );
 }
@@ -579,9 +604,8 @@ function FileDropzonePanel({
               </svg>
               <div>
                 <p className="text-sm font-medium text-gray-600">
-                  {isDragActive ? "여기에 놓으세요" : "파일을 드래그하거나 클릭하여 업로드"}
+                  파일을 드래그하거나 클릭하여 업로드
                 </p>
-                <p className="text-xs text-gray-400">Excel · CSV · PDF · 이미지 지원</p>
               </div>
             </div>
           )}
@@ -664,7 +688,7 @@ const LHOUSE_SLOTS: Array<{
 
 function SingleNamedDropzone({
   slot, label, savedAs, accept, hint, icon, iconColor, jobId, divisionCode, onUploadDone, serverFile, onLog,
-  onCrawl, crawlActive,
+  onCrawl, crawlActive, collapsibleUpload, crawlTask,
 }: {
   slot:         string;
   label:        string;
@@ -683,11 +707,17 @@ function SingleNamedDropzone({
   /** 선택: 헤더에 "시스템 조회" 버튼 표시 (해당 파일을 자동 수집하는 슬롯 전용) */
   onCrawl?:     () => void;
   crawlActive?: boolean;
+  /** 선택: 업로드 드롭존을 기본 숨김 처리하고 "수동 업로드" 토글로만 노출 (시스템 조회가 주 경로인 슬롯 전용) */
+  collapsibleUpload?: boolean;
+  /** 선택: 헤더에 시스템 조회(크롤) 진행 상태 표시 (버튼 대신 원클릭 통합 수집이 대행하는 슬롯 전용) */
+  crawlTask?:   TaskState | null;
 }) {
   const { success, error: toastError } = useToast();
   const [uploading,  setUploading]  = useState(false);
   const [deleting,   setDeleting]   = useState(false);
   const [currentFile, setCurrentFile] = useState<{ name: string; size: number; updatedAt: string } | null>(null);
+  // collapsibleUpload 슬롯: 드롭존을 기본 숨김. "수동 업로드" 토글로만 노출.
+  const [showUpload, setShowUpload] = useState(false);
 
   // 서버 파일 정보를 로컬 상태로 반영 (새로고침 후 복원)
   const displayFile = currentFile ?? (serverFile
@@ -795,6 +825,22 @@ function SingleNamedDropzone({
               )}
             </button>
           )}
+          {/* 버튼 대신: 원클릭 통합 수집이 대행하는 슬롯의 시스템 조회 진행 표시 */}
+          {!onCrawl && crawlTask && crawlTask.status !== "PENDING" && (
+            crawlTask.status === "RUNNING" ? (
+              <span className="flex items-center gap-1.5 text-xs font-medium text-secondary">
+                <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+                </svg>
+                조회 중{crawlTask.progress ? ` ${crawlTask.progress}%` : "…"}
+              </span>
+            ) : crawlTask.status === "COMPLETED" ? (
+              <span className="text-[10px] text-green-600 font-semibold bg-green-50 px-2 py-0.5 rounded">조회 완료</span>
+            ) : (
+              <span className="text-[10px] text-red-500 font-semibold bg-red-50 px-2 py-0.5 rounded" title={crawlTask.error ?? undefined}>조회 실패</span>
+            )
+          )}
         </div>
       </div>
 
@@ -831,42 +877,62 @@ function SingleNamedDropzone({
           </div>
         )}
 
-        {/* 드롭존 */}
-        <div
-          {...getRootProps()}
-          className={`border-2 border-dashed rounded-xl py-4 px-6 text-center cursor-pointer transition-colors
-            ${isDragActive
-              ? "border-secondary bg-secondary/5"
-              : "border-gray-200 hover:border-secondary/60 hover:bg-gray-50"}
-            ${uploading ? "opacity-50 cursor-not-allowed" : ""}`}
-        >
-          <input {...getInputProps()} />
-          {uploading ? (
-            <LoadingSpinner centered size="sm" label="업로드 중…" />
-          ) : (
-            <div className="flex items-center justify-center gap-3">
-              <svg
-                className={`w-6 h-6 flex-shrink-0 ${isDragActive ? "text-secondary" : "text-gray-300"}`}
-                fill="none" viewBox="0 0 24 24" stroke="currentColor"
-              >
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5}
-                  d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
-              </svg>
-              <div>
-                <p className="text-sm font-medium text-gray-600">
-                  {isDragActive ? "여기에 놓으세요" : displayFile ? "파일을 교체하려면 클릭 또는 드래그" : "파일을 드래그하거나 클릭하여 업로드"}
-                </p>
-                <p className="text-xs text-gray-400">{hint} · {savedAs} 로 저장</p>
-              </div>
-            </div>
-          )}
-        </div>
+        {/* collapsibleUpload 슬롯: "수동 업로드" 토글 (시스템 조회가 실패했을 때만 사용하는 보조 경로) */}
+        {collapsibleUpload && (
+          <button
+            type="button"
+            onClick={() => setShowUpload((v) => !v)}
+            className="flex items-center gap-1 text-xs font-medium text-gray-400 hover:text-gray-600 transition-colors"
+          >
+            <svg
+              className={`w-3 h-3 transition-transform ${showUpload ? "rotate-180" : ""}`}
+              fill="none" viewBox="0 0 24 24" stroke="currentColor"
+            >
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+            </svg>
+            수동 업로드
+          </button>
+        )}
 
-        {/* 거부된 파일 오류 */}
-        {fileRejections.length > 0 && (
-          <p className="text-xs text-red-500">
-            {fileRejections[0].file.name}: {fileRejections[0].errors.map((e) => e.message).join(", ")}
-          </p>
+        {/* 드롭존 — collapsibleUpload 슬롯에서는 토글이 열렸을 때만 노출 */}
+        {(!collapsibleUpload || showUpload) && (
+          <>
+            <div
+              {...getRootProps()}
+              className={`border-2 border-dashed rounded-xl py-4 px-6 text-center cursor-pointer transition-colors
+                ${isDragActive
+                  ? "border-secondary bg-secondary/5"
+                  : "border-gray-200 hover:border-secondary/60 hover:bg-gray-50"}
+                ${uploading ? "opacity-50 cursor-not-allowed" : ""}`}
+            >
+              <input {...getInputProps()} />
+              {uploading ? (
+                <LoadingSpinner centered size="sm" label="업로드 중…" />
+              ) : (
+                <div className="flex items-center justify-center gap-3">
+                  <svg
+                    className={`w-6 h-6 flex-shrink-0 ${isDragActive ? "text-secondary" : "text-gray-300"}`}
+                    fill="none" viewBox="0 0 24 24" stroke="currentColor"
+                  >
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5}
+                      d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+                  </svg>
+                  <div>
+                    <p className="text-sm font-medium text-gray-600">
+                      파일을 드래그하거나 클릭하여 업로드
+                    </p>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* 거부된 파일 오류 */}
+            {fileRejections.length > 0 && (
+              <p className="text-xs text-red-500">
+                {fileRejections[0].file.name}: {fileRejections[0].errors.map((e) => e.message).join(", ")}
+              </p>
+            )}
+          </>
         )}
       </div>
     </div>
@@ -879,17 +945,15 @@ function LhouseNamedUploadPanel({
   onUploadDone,
   fileList,
   onLog,
-  onCrawl,
-  crawlActive,
+  activityTask,
 }: {
   jobId:        string;
   divisionCode: string;
   onUploadDone: () => void;
   fileList:     UploadedFileRow[];
   onLog?:       (systemName: string, msg: string, kind: LogEntry["kind"]) => void;
-  /** "Activity (Task) Count" 슬롯 헤더의 시스템 조회 버튼 핸들러 */
-  onCrawl?:     () => void;
-  crawlActive?: boolean;
+  /** "Activity (Task) Count" 슬롯의 시스템 조회 진행 상태 (원클릭 통합 수집이 대행) */
+  activityTask?: TaskState | null;
 }) {
   return (
     <section className="space-y-4">
@@ -902,8 +966,8 @@ function LhouseNamedUploadPanel({
           onUploadDone={onUploadDone}
           serverFile={fileList.find((f) => f.original_name === s.savedAs) ?? null}
           onLog={onLog}
-          onCrawl={s.slot === "activity" ? onCrawl : undefined}
-          crawlActive={crawlActive}
+          crawlTask={s.slot === "activity" ? activityTask : undefined}
+          collapsibleUpload={s.slot === "activity"}
         />
       ))}
     </section>
@@ -952,17 +1016,15 @@ function DevNamedUploadPanel({
   onUploadDone,
   fileList,
   onLog,
-  onCrawl,
-  crawlActive,
+  activityTask,
 }: {
   jobId:        string;
   divisionCode: string;
   onUploadDone: () => void;
   fileList:     UploadedFileRow[];
   onLog?:       (systemName: string, msg: string, kind: LogEntry["kind"]) => void;
-  /** "Activity (Task) Count - GCP Quality System" 슬롯 헤더의 시스템 조회 버튼 */
-  onCrawl?:     () => void;
-  crawlActive?: boolean;
+  /** "Activity (Task) Count - GCP Quality System" 슬롯의 시스템 조회 진행 상태 (원클릭 통합 수집이 대행) */
+  activityTask?: TaskState | null;
 }) {
   return (
     <section className="space-y-4">
@@ -980,8 +1042,8 @@ function DevNamedUploadPanel({
         onUploadDone={onUploadDone}
         serverFile={fileList.find((f) => f.original_name === "Activity_GCP.xlsx") ?? null}
         onLog={onLog}
-        onCrawl={onCrawl}
-        crawlActive={crawlActive}
+        crawlTask={activityTask}
+        collapsibleUpload
       />
 
       {/* 시스템별 대시보드 이미지 (3개) */}
@@ -1051,15 +1113,7 @@ interface BioReportSection {
 }
 
 const BIO_REPORT_SECTIONS: BioReportSection[] = [
-  {
-    sectionTitle: "1. Veeva System",
-    endpoint:     "/report/generate-bio",
-    filename:     "Bio연구본부 Veeva System Report.pdf",
-    reportType:   "bio_veeva",
-    reportLabel:  "Bio연구본부 Veeva System",
-    color:        "border-blue-400 text-blue-700 bg-blue-50",
-    files: [],
-  },
+  // "1. Veeva System" 은 시스템 카드(eDMS) 의 데이터 수집 영역으로 이동 (보고서 생성/저장 버튼)
   {
     sectionTitle: "2. 임검분 LIMS",
     endpoint:     "/report/generate-bio-lims",
@@ -1085,15 +1139,15 @@ const BIO_REPORT_SECTIONS: BioReportSection[] = [
       },
       {
         slot:      "lims_image",
-        label:     "LIMS 사용 현황 (Excel — Dash Board 시트)",
-        savedAs:   "LIMS.png",
+        label:     "LIMS 사용 현황 (Excel — Dashboard)",
+        savedAs:   "LIMS_Dashboard.xlsx",
         accept:    {
           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": [".xlsx"],
           "application/vnd.ms-excel": [".xls"],
           "application/x-zip-compressed": [".xlsx"],
           "application/octet-stream": [".xlsx", ".xls"],
         },
-        hint:      "LIMS Hub 사용성 지표_x월 Dashboard_yyyymmdd.xlsx 업로드 → \"Dash Board\" 시트가 자동으로 LIMS.png 로 변환됨",
+        hint:      "LIMS Hub 사용성 지표_x월 Dashboard_yyyymmdd.xlsx 업로드 → LIMS_Dashboard.xlsx 로 저장 (PreprocessdData 시트가 차트에 사용됨)",
         icon:      "X",
         iconColor: "text-emerald-600",
       },
@@ -1595,40 +1649,28 @@ export function DivisionReportPage({
     return newId;
   });
 
+  // ※ jobId 는 보고서 생성 후에도 유지한다.
+  //   Systemusage_*.png 등 일부 보고서 입력이 UPLOAD_DIR/{jobId}/uploads 에 남아 있어
+  //   jobId 를 교체하면 유실된다. 재실행 시 이전 결과가 되살아나는 문제는
+  //   서버가 수집 시작 시 SSE 히스토리를 비우는 것으로 해결한다(jobEventBus.resetHistory).
+
   // ── 크롤 활성 상태 (버튼 클릭 후 SSE 연결) ──────────────────────────────────
   const [crawlActive, setCrawlActive] = useState(false);
 
-  // ── LHOUSE VEEVA 전용: 대시보드 캡처 상태 (시스템 조회와 독립) ─────────────────
-  const [dashboardCapturing, setDashboardCapturing] = useState(false);
-  const [dashboardActive,    setDashboardActive]    = useState(false);
+  // ── DEV 원클릭: 통합 수집(데이터 3종 + 시스템 조회 1종) 진행 상태 ─────────────────
+  //   개별 수집/조회 버튼은 원클릭 "보고서 생성"이 대행하므로 별도 상태를 두지 않는다.
+  //   보고서 생성 버튼 하나로 4개 수집을 순차 실행 → 완료 시 자동 PDF 생성.
+  const [devCollecting, setDevCollecting] = useState(false);
 
-  // ── DEV GCP 전용: 대시보드 캡처 상태 ──────────────────────────────────────────
-  const [gcpDashboardCapturing, setGcpDashboardCapturing] = useState(false);
-  const [gcpDashboardActive,    setGcpDashboardActive]    = useState(false);
+  // ── LHOUSE 원클릭: 통합 수집(데이터 + 시스템 조회) 진행 상태 ─────────────────────
+  const [lhouseCollecting, setLhouseCollecting] = useState(false);
 
-  // ── DEV GCP 전용: Activity 리포트 조회(Export) 상태 ───────────────────────────
-  const [gcpActivityExporting, setGcpActivityExporting] = useState(false);
-  const [gcpActivityActive,    setGcpActivityActive]    = useState(false);
-
-  // ── DEV GCP 전용: 보고서 데이터 수집(3개 리포트 Excel) 상태 ────────────────────
-  const [gcpDataCollecting, setGcpDataCollecting] = useState(false);
-  const [gcpDataActive,     setGcpDataActive]     = useState(false);
-
-  // ── DEV Medcomms 전용: 대시보드 캡처 상태 ─────────────────────────────────────
-  const [medcommsDashboardCapturing, setMedcommsDashboardCapturing] = useState(false);
-  const [medcommsDashboardActive,    setMedcommsDashboardActive]    = useState(false);
-
-  // ── DEV Clinical(CTMS) 전용: 대시보드 캡처 상태 ───────────────────────────────
-  const [clinicalDashboardCapturing, setClinicalDashboardCapturing] = useState(false);
-  const [clinicalDashboardActive,    setClinicalDashboardActive]    = useState(false);
-
-  // ── BIO R&D 전용: 대시보드 캡처 상태 ──────────────────────────────────────────
-  const [bioRdDashboardCapturing, setBioRdDashboardCapturing] = useState(false);
-  const [bioRdDashboardActive,    setBioRdDashboardActive]    = useState(false);
+  // ── BIO 연구본부 Veeva(eDMS) 원클릭: 통합 수집(BIO_DATA) 진행 상태 ─────────────────
+  const [bioCollecting, setBioCollecting] = useState(false);
 
   // ── SSE ──────────────────────────────────────────────────────────────────────
   const systemCodes = systems.map((s) => s.code);
-  const sse = useCrawlSSE(jobId, systemCodes, crawlActive || dashboardActive || gcpDashboardActive || gcpActivityActive || gcpDataActive || medcommsDashboardActive || clinicalDashboardActive || bioRdDashboardActive);
+  const sse = useCrawlSSE(jobId, systemCodes, crawlActive || devCollecting || lhouseCollecting || bioCollecting);
 
   // ── 로컬 진행 로그 (업로드·PDF생성 이벤트) ────────────────────────────────────
   const [localLogs, setLocalLogs] = useState<LogEntry[]>([]);
@@ -1679,180 +1721,6 @@ export function DivisionReportPage({
     }
   }, [sse.phase, crawlActive]);
 
-  // ── LHOUSE 전용: Veeva 대시보드 캡처 ─────────────────────────────────────────
-  const handleDashboardCapture = useCallback(async () => {
-    if (dashboardCapturing) return;
-    sse.resetTask("VEEVA_DASHBOARD");
-    setDashboardCapturing(true);
-    setDashboardActive(true);
-    addLocalLog("VEEVA Dashboard", "대시보드 캡처 시작 (로그인 중…)", "info");
-    try {
-      await apiClient.post("/crawl/veeva-dashboard", {
-        jobId,
-        userId: user?.id,
-      });
-    } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { error?: string } } })
-          ?.response?.data?.error ?? "대시보드 캡처 요청에 실패했습니다.";
-      toastError(msg);
-      addLocalLog("VEEVA Dashboard", `캡처 요청 실패: ${msg}`, "error");
-      setDashboardCapturing(false);
-      setDashboardActive(false);
-    }
-  }, [dashboardCapturing, addLocalLog, jobId, user, toastError]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // VEEVA_DASHBOARD 태스크 완료/실패 시 dashboardCapturing · dashboardActive 해제
-  useEffect(() => {
-    if (!dashboardCapturing) return;
-    const dashTask = sse.taskMap["VEEVA_DASHBOARD"];
-    if (dashTask?.status === "COMPLETED" || dashTask?.status === "FAILED") {
-      setDashboardCapturing(false);
-      setDashboardActive(false);
-      if (dashTask.status === "COMPLETED") {
-        addLocalLog("VEEVA Dashboard", "대시보드 캡처 완료 — 이미지 다운로드 버튼을 확인하세요.", "success");
-      }
-    }
-  }, [sse.taskMap, dashboardCapturing, addLocalLog]);
-
-  // ── DEV GCP 전용: GCP Quality System 대시보드 캡처 ───────────────────────────
-  const handleGcpDashboardCapture = useCallback(async () => {
-    if (gcpDashboardCapturing) return;
-    sse.resetTask("GCP_DASHBOARD");
-    setGcpDashboardCapturing(true);
-    setGcpDashboardActive(true);
-    addLocalLog("GCP Dashboard", "GCP 대시보드 캡처 시작 (로그인 중…)", "info");
-    try {
-      await apiClient.post("/crawl/gcp-dashboard", {
-        jobId,
-        userId: user?.id,
-      });
-    } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { error?: string } } })
-          ?.response?.data?.error ?? "GCP 대시보드 캡처 요청에 실패했습니다.";
-      toastError(msg);
-      addLocalLog("GCP Dashboard", `캡처 요청 실패: ${msg}`, "error");
-      setGcpDashboardCapturing(false);
-      setGcpDashboardActive(false);
-    }
-  }, [gcpDashboardCapturing, addLocalLog, jobId, user, toastError]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // ── DEV GCP 전용: Activity (Task) Count 리포트 조회(Export) ─────────────────────
-  const handleGcpActivityExport = useCallback(async () => {
-    if (gcpActivityExporting) return;
-    sse.resetTask("GCP_ACTIVITY");
-    setGcpActivityExporting(true);
-    setGcpActivityActive(true);
-    addLocalLog("GCP Activity", "GCP Activity 리포트 조회 시작 (로그인 중…)", "info");
-    try {
-      await apiClient.post("/crawl/gcp-activity", {
-        jobId,
-        userId: user?.id,
-      });
-    } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { error?: string } } })
-          ?.response?.data?.error ?? "GCP Activity 리포트 조회 요청에 실패했습니다.";
-      toastError(msg);
-      addLocalLog("GCP Activity", `조회 요청 실패: ${msg}`, "error");
-      setGcpActivityExporting(false);
-      setGcpActivityActive(false);
-    }
-  }, [gcpActivityExporting, addLocalLog, jobId, user, toastError]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // ── DEV GCP 전용: 보고서 데이터 수집 (3개 리포트 Excel export) ──────────────────
-  const handleGcpDataCollect = useCallback(async () => {
-    if (gcpDataCollecting) return;
-    sse.resetTask("GCP_DATA");
-    setGcpDataCollecting(true);
-    setGcpDataActive(true);
-    addLocalLog("GCP Data", "GCP 보고서 데이터 수집 시작 (3개 리포트 export…)", "info");
-    try {
-      await apiClient.post("/crawl/gcp-data", {
-        jobId,
-        userId: user?.id,
-      });
-    } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { error?: string } } })
-          ?.response?.data?.error ?? "GCP 데이터 수집 요청에 실패했습니다.";
-      toastError(msg);
-      addLocalLog("GCP Data", `수집 요청 실패: ${msg}`, "error");
-      setGcpDataCollecting(false);
-      setGcpDataActive(false);
-    }
-  }, [gcpDataCollecting, addLocalLog, jobId, user, toastError]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // ── DEV Medcomms 전용: Medcomms 대시보드 캡처 ─────────────────────────────────
-  const handleMedcommsDashboardCapture = useCallback(async () => {
-    if (medcommsDashboardCapturing) return;
-    sse.resetTask("MEDCOMMS_DASHBOARD");
-    setMedcommsDashboardCapturing(true);
-    setMedcommsDashboardActive(true);
-    addLocalLog("Medcomms Dashboard", "Medcomms 대시보드 캡처 시작 (로그인 중…)", "info");
-    try {
-      await apiClient.post("/crawl/medcomms-dashboard", {
-        jobId,
-        userId: user?.id,
-      });
-    } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { error?: string } } })
-          ?.response?.data?.error ?? "Medcomms 대시보드 캡처 요청에 실패했습니다.";
-      toastError(msg);
-      addLocalLog("Medcomms Dashboard", `캡처 요청 실패: ${msg}`, "error");
-      setMedcommsDashboardCapturing(false);
-      setMedcommsDashboardActive(false);
-    }
-  }, [medcommsDashboardCapturing, addLocalLog, jobId, user, toastError]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // ── DEV Clinical(CTMS) 전용: Clinical 대시보드 캡처 ───────────────────────────
-  const handleClinicalDashboardCapture = useCallback(async () => {
-    if (clinicalDashboardCapturing) return;
-    sse.resetTask("CLINICAL_DASHBOARD");
-    setClinicalDashboardCapturing(true);
-    setClinicalDashboardActive(true);
-    addLocalLog("Clinical Dashboard", "Clinical 대시보드 캡처 시작 (로그인 중…)", "info");
-    try {
-      await apiClient.post("/crawl/clinical-dashboard", {
-        jobId,
-        userId: user?.id,
-      });
-    } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { error?: string } } })
-          ?.response?.data?.error ?? "Clinical 대시보드 캡처 요청에 실패했습니다.";
-      toastError(msg);
-      addLocalLog("Clinical Dashboard", `캡처 요청 실패: ${msg}`, "error");
-      setClinicalDashboardCapturing(false);
-      setClinicalDashboardActive(false);
-    }
-  }, [clinicalDashboardCapturing, addLocalLog, jobId, user, toastError]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // ── BIO 연구본부 전용: R&D 대시보드 캡처 ──────────────────────────────────────
-  const handleBioRdDashboardCapture = useCallback(async () => {
-    if (bioRdDashboardCapturing) return;
-    sse.resetTask("BIO_RD_DASHBOARD");
-    setBioRdDashboardCapturing(true);
-    setBioRdDashboardActive(true);
-    addLocalLog("BIO R&D Dashboard", "BIO R&D 대시보드 캡처 시작 (로그인 중…)", "info");
-    try {
-      await apiClient.post("/crawl/bio-rd-dashboard", {
-        jobId,
-        userId: user?.id,
-      });
-    } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { error?: string } } })
-          ?.response?.data?.error ?? "BIO R&D 대시보드 캡처 요청에 실패했습니다.";
-      toastError(msg);
-      addLocalLog("BIO R&D Dashboard", `캡처 요청 실패: ${msg}`, "error");
-      setBioRdDashboardCapturing(false);
-      setBioRdDashboardActive(false);
-    }
-  }, [bioRdDashboardCapturing, addLocalLog, jobId, user, toastError]); // eslint-disable-line react-hooks/exhaustive-deps
-
   // ── PDF 생성 뮤테이션 (BIO / DEV 공용) ──────────────────────────────────────
   const generatePdf = useMutation({
     mutationFn: () =>
@@ -1893,78 +1761,6 @@ export function DivisionReportPage({
     refetchInterval: 5_000,
   });
 
-  // GCP_DASHBOARD 태스크 완료/실패 시 상태 해제 + 파일 목록 즉시 갱신
-  useEffect(() => {
-    if (!gcpDashboardCapturing) return;
-    const gcpTask = sse.taskMap["GCP_DASHBOARD"];
-    if (gcpTask?.status === "COMPLETED" || gcpTask?.status === "FAILED") {
-      setGcpDashboardCapturing(false);
-      setGcpDashboardActive(false);
-      if (gcpTask.status === "COMPLETED") {
-        addLocalLog("GCP Dashboard", "대시보드 캡처 완료 — Systemusage_GCP.png 로 저장되었습니다.", "success");
-        void refetchDevFiles();
-      }
-    }
-  }, [sse.taskMap, gcpDashboardCapturing, addLocalLog, refetchDevFiles]);
-
-  // GCP_ACTIVITY 태스크 완료/실패 시 상태 해제 + 파일 목록 즉시 갱신 (버튼 '조회중' 복구)
-  useEffect(() => {
-    if (!gcpActivityExporting) return;
-    const actTask = sse.taskMap["GCP_ACTIVITY"];
-    if (actTask?.status === "COMPLETED" || actTask?.status === "FAILED") {
-      setGcpActivityExporting(false);
-      setGcpActivityActive(false);
-      if (actTask.status === "COMPLETED") {
-        addLocalLog("GCP Activity", "리포트 조회 완료 — Activity_GCP.xlsx 로 저장되었습니다.", "success");
-        void refetchDevFiles();
-      }
-    }
-  }, [sse.taskMap, gcpActivityExporting, addLocalLog, refetchDevFiles]);
-
-  // GCP_DATA(보고서 데이터 수집) 완료/실패 시 상태 해제 + 파일 목록 즉시 갱신
-  useEffect(() => {
-    if (!gcpDataCollecting) return;
-    const dataTask = sse.taskMap["GCP_DATA"];
-    if (dataTask?.status === "COMPLETED" || dataTask?.status === "FAILED") {
-      setGcpDataCollecting(false);
-      setGcpDataActive(false);
-      if (dataTask.status === "COMPLETED") {
-        addLocalLog("GCP Data", "데이터 수집 완료 — GCP_PerfStats/Quality/Training.xlsx 저장됨.", "success");
-        void refetchDevFiles();
-      } else {
-        addLocalLog("GCP Data", `데이터 수집 실패: ${dataTask.error ?? ""}`, "error");
-      }
-    }
-  }, [sse.taskMap, gcpDataCollecting, addLocalLog, refetchDevFiles]);
-
-  // MEDCOMMS_DASHBOARD 태스크 완료/실패 시 상태 해제 + 파일 목록 즉시 갱신
-  useEffect(() => {
-    if (!medcommsDashboardCapturing) return;
-    const medcommsTask = sse.taskMap["MEDCOMMS_DASHBOARD"];
-    if (medcommsTask?.status === "COMPLETED" || medcommsTask?.status === "FAILED") {
-      setMedcommsDashboardCapturing(false);
-      setMedcommsDashboardActive(false);
-      if (medcommsTask.status === "COMPLETED") {
-        addLocalLog("Medcomms Dashboard", "대시보드 캡처 완료 — Systemusage_Medcomms.png 로 저장되었습니다.", "success");
-        void refetchDevFiles();
-      }
-    }
-  }, [sse.taskMap, medcommsDashboardCapturing, addLocalLog, refetchDevFiles]);
-
-  // CLINICAL_DASHBOARD 태스크 완료/실패 시 상태 해제 + 파일 목록 즉시 갱신
-  useEffect(() => {
-    if (!clinicalDashboardCapturing) return;
-    const clinicalTask = sse.taskMap["CLINICAL_DASHBOARD"];
-    if (clinicalTask?.status === "COMPLETED" || clinicalTask?.status === "FAILED") {
-      setClinicalDashboardCapturing(false);
-      setClinicalDashboardActive(false);
-      if (clinicalTask.status === "COMPLETED") {
-        addLocalLog("Clinical Dashboard", "대시보드 캡처 완료 — Systemusage_Clinical1.png / Systemusage_Clinical2.png 로 저장되었습니다.", "success");
-        void refetchDevFiles();
-      }
-    }
-  }, [sse.taskMap, clinicalDashboardCapturing, addLocalLog, refetchDevFiles]);
-
   // ── BIO 전용: 업로드 파일 목록 조회 (5초 폴링) ───────────────────────────────
   const { data: bioFileList = [], refetch: refetchBioFiles } = useQuery({
     queryKey:        ["files", jobId, "bio"],
@@ -1976,25 +1772,9 @@ export function DivisionReportPage({
     refetchInterval: 5_000,
   });
 
-  // BIO_RD_DASHBOARD 태스크 완료/실패 시 상태 해제 + 파일 목록 즉시 갱신
-  useEffect(() => {
-    if (!bioRdDashboardCapturing) return;
-    const bioTask = sse.taskMap["BIO_RD_DASHBOARD"];
-    if (bioTask?.status === "COMPLETED" || bioTask?.status === "FAILED") {
-      setBioRdDashboardCapturing(false);
-      setBioRdDashboardActive(false);
-      if (bioTask.status === "COMPLETED") {
-        addLocalLog("BIO R&D Dashboard", "대시보드 캡처 완료 — Systemusage_RD.png 로 저장되었습니다.", "success");
-        void refetchBioFiles();
-      }
-    }
-  }, [sse.taskMap, bioRdDashboardCapturing, addLocalLog, refetchBioFiles]);
 
-  const hasActivityFile      = lhouseFileList.some((f) => f.original_name === "Activity_LHOUSE.xlsx");
-  const hasSystemusageFile   = lhouseFileList.some(
-    (f) => f.original_name === "Systemusage_LHOUSE.jpg" || f.original_name === "Systemusage_LHOUSE.png"
-  );
-  const canGenerateLhousePdf = hasActivityFile && hasSystemusageFile;
+
+  // (LHOUSE 보고서 생성은 원클릭이 수집을 대행하므로 사전 업로드 게이트를 두지 않는다)
 
   // 현재 사업부의 파일 목록에서, 시스템별 저장된 대시보드 이미지를 찾아 반환.
   // (캡처 완료 후 새로고침/재방문해도 카드에 "저장됨"으로 계속 표시되도록)
@@ -2003,16 +1783,16 @@ export function DivisionReportPage({
     divisionCode === "DEV"    ? devFileList :
     divisionCode === "BIO"    ? bioFileList :
     [];
-  const dashboardSavedFor = (
-    sysCode: string,
-  ): { name: string; url: string; updatedAt: string } | null => {
-    const names = DASHBOARD_IMG_NAMES[`${divisionCode}:${sysCode}`];
+  // 데이터 수집 완료 시각 — 해당 시스템의 수집 파일 중 가장 최근 created_at (없으면 null)
+  const dataCollectedFor = (sysCode: string): string | null => {
+    const names = DATA_COLLECTED_FILES[`${divisionCode}:${sysCode}`];
     if (!names) return null;
+    let latest: string | null = null;
     for (const n of names) {
       const row = activeFileList.find((f) => f.original_name === n);
-      if (row) return { name: n, url: `/uploads/${jobId}/uploads/${n}`, updatedAt: row.created_at };
+      if (row && (!latest || row.created_at > latest)) latest = row.created_at;
     }
-    return null;
+    return latest;
   };
 
   // ── 직접 다운로드 공통 헬퍼 ──────────────────────────────────────────────────
@@ -2111,50 +1891,218 @@ export function DivisionReportPage({
   // ── LHOUSE 전용: 보고서 생성 (직접 다운로드) ─────────────────────────────────
   const [lhouseGenerating, setLhouseGenerating] = useState(false);
 
+  // 원클릭: 데이터 수집 + 시스템 조회(VEEVA → Activity)를 순차 실행하도록 백엔드에 요청.
+  //   진행 상태는 SSE 로 전달되고, 2개 태스크가 모두 완료되면 아래 완료 감지 useEffect 에서
+  //   자동으로 PDF 를 생성한다. 하나라도 실패하면 중단.
   const handleLhouseGenerate = useCallback(async () => {
-    if (!canGenerateLhousePdf || lhouseGenerating) return;
+    if (lhouseGenerating || lhouseCollecting) return;
+    LHOUSE_COLLECT_SYSTEMS.forEach((s) => sse.resetTask(s));
     setLhouseGenerating(true);
-    addLocalLog("보고서", "PDF 보고서 생성 시작…", "info");
+    addLocalLog("보고서", "데이터 수집 시작 — Veeva 데이터 + 시스템 조회 (순차)…", "info");
     try {
-      const { y, m } = prevMonth();
-      const filename = `${y}.${String(m).padStart(2, "0")} L HOUSE Veeva System Report.pdf`;
-      await downloadPdfBlob("/report/generate-lhouse", filename);
-      success("보고서 PDF가 다운로드되었습니다.");
-      addLocalLog("보고서", `${filename} 다운로드 완료`, "success");
+      await apiClient.post("/crawl/lhouse-collect-all", {
+        jobId,
+        userId: user?.id,
+      });
+      // SSE 연결은 서버가 이전 실행 히스토리를 비운 뒤에 연다 (replay 로 옛 실패 되살아남 방지)
+      setLhouseCollecting(true);
     } catch (err: unknown) {
       const msg =
         (err as { response?: { data?: { error?: string } } })
-          ?.response?.data?.error ?? "보고서 생성에 실패했습니다.";
+          ?.response?.data?.error ?? "수집 시작에 실패했습니다.";
       toastError(msg);
-      addLocalLog("보고서", `PDF 생성 실패: ${msg}`, "error");
-    } finally {
+      addLocalLog("보고서", `수집 시작 실패: ${msg}`, "error");
       setLhouseGenerating(false);
+      setLhouseCollecting(false);
     }
-  }, [canGenerateLhousePdf, lhouseGenerating, addLocalLog, jobId, success, toastError]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [lhouseGenerating, lhouseCollecting, addLocalLog, jobId, user, toastError]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // 통합 수집 완료 감지 (taskMap 기반) → 2개 모두 COMPLETED 면 PDF 자동 생성.
+  //   순차 + 실패 시 중단이므로: 하나라도 FAILED = 중단됨, 모두 COMPLETED = 성공.
+  useEffect(() => {
+    if (!lhouseCollecting) return;
+
+    const statuses  = LHOUSE_COLLECT_SYSTEMS.map((s) => sse.taskMap[s]?.status);
+    const anyFailed = statuses.some((st) => st === "FAILED");
+    const allDone   = statuses.every((st) => st === "COMPLETED");
+    if (!anyFailed && !allDone) return; // 아직 진행 중
+
+    setLhouseCollecting(false);
+
+    if (anyFailed || !allDone) {
+      const failed = LHOUSE_COLLECT_SYSTEMS.filter((s) => sse.taskMap[s]?.status !== "COMPLETED");
+      const label  = failed.map((s) => LHOUSE_SYSTEM_LABELS[s] ?? s).join(", ");
+      toastError(`수집이 완료되지 않아 보고서를 생성하지 않았습니다: ${label}`);
+      addLocalLog("보고서", `수집 미완료로 PDF 생성 중단 — ${label}`, "error");
+      setLhouseGenerating(false);
+      void refetchLhouseFiles();
+      return;
+    }
+
+    // 2개 모두 완료 → PDF 생성 + 다운로드
+    void (async () => {
+      addLocalLog("보고서", "수집 완료 — PDF 보고서 생성 시작…", "success");
+      try {
+        const { y, m } = prevMonth();
+        const filename = `${y}.${String(m).padStart(2, "0")} L HOUSE Veeva System Report.pdf`;
+        await downloadPdfBlob("/report/generate-lhouse", filename);
+        success("보고서 PDF가 다운로드되었습니다.");
+        addLocalLog("보고서", `${filename} 다운로드 완료`, "success");
+      } catch (err: unknown) {
+        const msg =
+          (err as { response?: { data?: { error?: string } } })
+            ?.response?.data?.error ?? "보고서 생성에 실패했습니다.";
+        toastError(msg);
+        addLocalLog("보고서", `PDF 생성 실패: ${msg}`, "error");
+      } finally {
+        setLhouseGenerating(false);
+        void refetchLhouseFiles();
+      }
+    })();
+  }, [lhouseCollecting, sse.taskMap, addLocalLog, success, toastError, refetchLhouseFiles]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── DEV 전용: 보고서 생성 (직접 다운로드) ────────────────────────────────────
   const [devGenerating, setDevGenerating] = useState(false);
 
+  // 원클릭: 데이터 수집 3종 + 시스템 조회 1종을 순차 실행하도록 백엔드에 요청.
+  //   진행 상태는 SSE(카드/슬롯 진행 표시)로 전달되고, 4개 태스크가 모두 완료되면
+  //   아래 완료 감지 useEffect 에서 자동으로 PDF 를 생성한다. 하나라도 실패하면 중단.
   const handleDevGenerate = useCallback(async () => {
-    if (devGenerating) return;
+    if (devGenerating || devCollecting) return;
+    // 이전 실행의 잔존 상태가 새 실행의 완료로 오인되지 않도록 4개 태스크 초기화
+    DEV_COLLECT_SYSTEMS.forEach((s) => sse.resetTask(s));
     setDevGenerating(true);
-    addLocalLog("보고서", "PDF 보고서 생성 시작…", "info");
+    addLocalLog("보고서", "데이터 수집 시작 — 데이터 3종 + 시스템 조회 1종 (순차)…", "info");
     try {
-      const { y, m } = prevMonth();
-      const filename = `${y}.${String(m).padStart(2, "0")} 개발본부 시스템 운영 현황 Report.pdf`;
-      await downloadPdfBlob("/report/generate-dev", filename);
-      success("보고서 PDF가 다운로드되었습니다.");
-      addLocalLog("보고서", `${filename} 다운로드 완료`, "success");
+      await apiClient.post("/crawl/dev-collect-all", {
+        jobId,
+        userId: user?.id,
+      });
+      // SSE 연결은 서버가 이전 실행 히스토리를 비운 뒤(POST 완료 후)에 연다.
+      // 먼저 열면 replay 로 옛 실패 이벤트가 들어와 즉시 중단된다.
+      setDevCollecting(true);
     } catch (err: unknown) {
       const msg =
         (err as { response?: { data?: { error?: string } } })
-          ?.response?.data?.error ?? "보고서 생성에 실패했습니다.";
+          ?.response?.data?.error ?? "수집 시작에 실패했습니다.";
       toastError(msg);
-      addLocalLog("보고서", `PDF 생성 실패: ${msg}`, "error");
-    } finally {
+      addLocalLog("보고서", `수집 시작 실패: ${msg}`, "error");
       setDevGenerating(false);
+      setDevCollecting(false);
     }
-  }, [devGenerating, addLocalLog, jobId, success, toastError]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [devGenerating, devCollecting, addLocalLog, jobId, user, toastError]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // 통합 수집 완료 감지 (taskMap 기반) → 4개 모두 COMPLETED 면 PDF 자동 생성.
+  //   순차 + 실패 시 중단이므로: 하나라도 FAILED = 중단됨(나머지는 PENDING), 모두 COMPLETED = 성공.
+  useEffect(() => {
+    if (!devCollecting) return;
+
+    const statuses  = DEV_COLLECT_SYSTEMS.map((s) => sse.taskMap[s]?.status);
+    const anyFailed = statuses.some((st) => st === "FAILED");
+    const allDone   = statuses.every((st) => st === "COMPLETED");
+    if (!anyFailed && !allDone) return; // 아직 진행 중
+
+    setDevCollecting(false);
+
+    if (anyFailed || !allDone) {
+      const failed = DEV_COLLECT_SYSTEMS.filter((s) => sse.taskMap[s]?.status !== "COMPLETED");
+      const label  = failed.map((s) => DEV_SYSTEM_LABELS[s] ?? s).join(", ");
+      toastError(`수집이 완료되지 않아 보고서를 생성하지 않았습니다: ${label}`);
+      addLocalLog("보고서", `수집 미완료로 PDF 생성 중단 — ${label}`, "error");
+      setDevGenerating(false);
+      void refetchDevFiles();
+      return;
+    }
+
+    // 4개 모두 완료 → PDF 생성 + 다운로드
+    void (async () => {
+      addLocalLog("보고서", "수집 완료 — PDF 보고서 생성 시작…", "success");
+      try {
+        const { y, m } = prevMonth();
+        const filename = `${y}.${String(m).padStart(2, "0")} 개발본부 시스템 운영 현황 Report.pdf`;
+        await downloadPdfBlob("/report/generate-dev", filename);
+        success("보고서 PDF가 다운로드되었습니다.");
+        addLocalLog("보고서", `${filename} 다운로드 완료`, "success");
+      } catch (err: unknown) {
+        const msg =
+          (err as { response?: { data?: { error?: string } } })
+            ?.response?.data?.error ?? "보고서 생성에 실패했습니다.";
+        toastError(msg);
+        addLocalLog("보고서", `PDF 생성 실패: ${msg}`, "error");
+      } finally {
+        setDevGenerating(false);
+        void refetchDevFiles();
+      }
+    })();
+  }, [devCollecting, sse.phase, sse.taskMap, addLocalLog, success, toastError, refetchDevFiles]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── BIO 연구본부 Veeva System 전용: 보고서 생성 (직접 다운로드) ─────────────────
+  const [bioVeevaGenerating, setBioVeevaGenerating] = useState(false);
+
+  // 원클릭: BIO_DATA 수집(Activity/PerfStats/DocType)을 실행하도록 백엔드에 요청.
+  //   수집 완료(taskMap) 시 아래 완료 감지 useEffect 에서 자동으로 PDF 를 생성한다. 실패 시 중단.
+  const handleBioVeevaGenerate = useCallback(async () => {
+    if (bioVeevaGenerating || bioCollecting) return;
+    sse.resetTask("BIO_DATA");
+    setBioVeevaGenerating(true);
+    addLocalLog("보고서", "데이터 수집 시작 — Veeva(eDMS) Activity/PerfStats/DocType…", "info");
+    try {
+      await apiClient.post("/crawl/bio-data", {
+        jobId,
+        userId: user?.id,
+      });
+      // SSE 연결은 서버가 이전 실행 히스토리를 비운 뒤에 연다 (replay 로 옛 실패 되살아남 방지)
+      setBioCollecting(true);
+    } catch (err: unknown) {
+      const msg =
+        (err as { response?: { data?: { error?: string } } })
+          ?.response?.data?.error ?? "수집 시작에 실패했습니다.";
+      toastError(msg);
+      addLocalLog("보고서", `수집 시작 실패: ${msg}`, "error");
+      setBioVeevaGenerating(false);
+      setBioCollecting(false);
+    }
+  }, [bioVeevaGenerating, bioCollecting, addLocalLog, jobId, user, toastError]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // BIO 통합 수집 완료 감지 (taskMap) → BIO_DATA 완료 시 PDF 자동 생성, 실패 시 중단.
+  useEffect(() => {
+    if (!bioCollecting) return;
+
+    const status = sse.taskMap["BIO_DATA"]?.status;
+    if (status !== "COMPLETED" && status !== "FAILED") return; // 아직 진행 중
+
+    setBioCollecting(false);
+
+    if (status !== "COMPLETED") {
+      const err = sse.taskMap["BIO_DATA"]?.error ?? "";
+      toastError(`수집이 완료되지 않아 보고서를 생성하지 않았습니다. ${err}`);
+      addLocalLog("보고서", `수집 실패로 PDF 생성 중단 — ${err}`, "error");
+      setBioVeevaGenerating(false);
+      void refetchBioFiles();
+      return;
+    }
+
+    // 수집 완료 → PDF 생성 + 다운로드
+    void (async () => {
+      addLocalLog("보고서", "수집 완료 — PDF 보고서 생성 시작…", "success");
+      try {
+        const { y, m } = prevMonth();
+        const filename = `${y}.${String(m).padStart(2, "0")} Bio연구본부 Veeva System Report.pdf`;
+        await downloadPdfBlob("/report/generate-bio", filename);
+        success("보고서 PDF가 다운로드되었습니다.");
+        addLocalLog("보고서", `${filename} 다운로드 완료`, "success");
+      } catch (err: unknown) {
+        const msg =
+          (err as { response?: { data?: { error?: string } } })
+            ?.response?.data?.error ?? "보고서 생성에 실패했습니다.";
+        toastError(msg);
+        addLocalLog("보고서", `PDF 생성 실패: ${msg}`, "error");
+      } finally {
+        setBioVeevaGenerating(false);
+        void refetchBioFiles();
+      }
+    })();
+  }, [bioCollecting, sse.taskMap, addLocalLog, success, toastError, refetchBioFiles]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── 진행 현황 집계 ────────────────────────────────────────────────────────────
   const totalCount     = systems.length;
@@ -2203,14 +2151,10 @@ export function DivisionReportPage({
             <>
               <button
                 onClick={() => void handleLhouseGenerate()}
-                disabled={!canGenerateLhousePdf || lhouseGenerating}
-                title={
-                  !hasActivityFile    ? "Activity_LHOUSE.xlsx 를 업로드해야 합니다." :
-                  !hasSystemusageFile ? "대시보드 캡처를 먼저 수행해야 합니다." :
-                  ""
-                }
+                disabled={lhouseGenerating}
+                title="데이터 수집 + 시스템 조회(Activity)를 순차 실행한 뒤 자동으로 PDF 보고서를 생성합니다. Veeva MS Timesheet 은 현재 업로드된 파일을 사용합니다."
                 className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition-all
-                  ${canGenerateLhousePdf && !lhouseGenerating
+                  ${!lhouseGenerating
                     ? "bg-secondary text-white hover:bg-secondary-600 shadow-sm"
                     : "bg-gray-100 text-gray-400 cursor-not-allowed"}`}
               >
@@ -2225,15 +2169,15 @@ export function DivisionReportPage({
                       d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                   </svg>
                 )}
-                {lhouseGenerating ? "생성 중…" : "보고서 생성"}
+                {lhouseCollecting ? "수집 중…" : lhouseGenerating ? "생성 중…" : "보고서 생성"}
               </button>
 
               <button
                 onClick={() => openSaveModal("LHOUSE", "lhouse", "L HOUSE Veeva System")}
-                disabled={!canGenerateLhousePdf || lhouseGenerating}
+                disabled={lhouseGenerating}
                 title="가장 최근에 생성된 PDF 를 선택한 월로 History 에 저장합니다."
                 className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition-all
-                  ${canGenerateLhousePdf && !lhouseGenerating
+                  ${!lhouseGenerating
                     ? "border border-secondary text-secondary bg-white hover:bg-secondary-50"
                     : "bg-gray-100 text-gray-400 cursor-not-allowed border border-gray-200"}`}
               >
@@ -2250,6 +2194,7 @@ export function DivisionReportPage({
               <button
                 onClick={() => void handleDevGenerate()}
                 disabled={devGenerating}
+                title="데이터 수집(3종) + 시스템 조회(1종)를 순차 실행한 뒤 자동으로 PDF 보고서를 생성합니다. Veeva MS Timesheet 은 현재 업로드된 파일을 사용합니다."
                 className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition-all
                   ${!devGenerating
                     ? "bg-secondary text-white hover:bg-secondary-600 shadow-sm"
@@ -2266,7 +2211,7 @@ export function DivisionReportPage({
                       d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                   </svg>
                 )}
-                {devGenerating ? "생성 중…" : "보고서 생성"}
+                {devCollecting ? "수집 중…" : devGenerating ? "생성 중…" : "보고서 생성"}
               </button>
 
               <button
@@ -2332,53 +2277,50 @@ export function DivisionReportPage({
                 <SystemCard
                   key={sys.code}
                   config={sys}
-                  task={sse.taskMap[sys.code] ?? {
+                  task={sse.taskMap[
+                    divisionCode === "DEV"    ? (DEV_CARD_TASK_KEY[sys.code]    ?? sys.code) :
+                    divisionCode === "LHOUSE" ? (LHOUSE_CARD_TASK_KEY[sys.code] ?? sys.code) :
+                    divisionCode === "BIO"    ? (BIO_CARD_TASK_KEY[sys.code]    ?? sys.code) :
+                    sys.code
+                  ] ?? {
                     status: "PENDING", progress: 0, error: null,
                     updatedAt: null, screenshot: null, filePaths: [],
                   }}
                   onPreview={setPreviewCode}
                   onCrawl={
-                    // GCP/Medcomms/CTMS 는 대시보드 캡처만 사용 — 시스템 조회 버튼 제거
+                    // GCP/Medcomms/CTMS 는 보고서 데이터 수집만 사용 — 시스템 조회 버튼 제거
                     divisionCode === "DEV" &&
                     !["GCP_QUALITY", "MEDCOMMS", "CTMS"].includes(sys.code)
                       ? () => startCrawl.mutate()
                       : undefined
                   }
                   crawlActive={crawlActive || startCrawl.isPending}
-                  onDashboardCapture={
-                    (divisionCode === "LHOUSE" && sys.code === "VEEVA")         ? handleDashboardCapture :
-                    (divisionCode === "DEV"    && sys.code === "GCP_QUALITY")   ? handleGcpDashboardCapture :
-                    (divisionCode === "DEV"    && sys.code === "MEDCOMMS")      ? handleMedcommsDashboardCapture :
-                    (divisionCode === "DEV"    && sys.code === "CTMS")          ? handleClinicalDashboardCapture :
-                    (divisionCode === "BIO"    && sys.code === "EDMS")          ? handleBioRdDashboardCapture :
-                    undefined
+                  dataCollectedAt={dataCollectedFor(sys.code)}
+                  onGenerate={
+                    // DEV·LHOUSE·BIO 모두 "보고서 생성" 원클릭이 수집을 대행 (카드 내 데이터 수집 버튼 제거)
+                    (divisionCode === "BIO" && sys.code === "EDMS") ? handleBioVeevaGenerate : undefined
                   }
-                  dashboardCapturing={
-                    (divisionCode === "LHOUSE" && sys.code === "VEEVA")         ? dashboardCapturing :
-                    (divisionCode === "DEV"    && sys.code === "GCP_QUALITY")   ? gcpDashboardCapturing :
-                    (divisionCode === "DEV"    && sys.code === "MEDCOMMS")      ? medcommsDashboardCapturing :
-                    (divisionCode === "DEV"    && sys.code === "CTMS")          ? clinicalDashboardCapturing :
-                    (divisionCode === "BIO"    && sys.code === "EDMS")          ? bioRdDashboardCapturing :
-                    undefined
+                  generating={
+                    (divisionCode === "BIO" && sys.code === "EDMS") ? bioVeevaGenerating : undefined
                   }
-                  dashboardTask={
-                    (divisionCode === "LHOUSE" && sys.code === "VEEVA")         ? (sse.taskMap["VEEVA_DASHBOARD"]    ?? null) :
-                    (divisionCode === "DEV"    && sys.code === "GCP_QUALITY")   ? (sse.taskMap["GCP_DASHBOARD"]      ?? null) :
-                    (divisionCode === "DEV"    && sys.code === "MEDCOMMS")      ? (sse.taskMap["MEDCOMMS_DASHBOARD"] ?? null) :
-                    (divisionCode === "DEV"    && sys.code === "CTMS")          ? (sse.taskMap["CLINICAL_DASHBOARD"] ?? null) :
-                    (divisionCode === "BIO"    && sys.code === "EDMS")          ? (sse.taskMap["BIO_RD_DASHBOARD"]   ?? null) :
-                    undefined
+                  generatingLabel={
+                    (divisionCode === "BIO" && sys.code === "EDMS" && bioCollecting) ? "수집 중…" : undefined
                   }
-                  dashboardSavedFile={dashboardSavedFor(sys.code)}
-                  onDataCollect={
-                    (divisionCode === "DEV" && sys.code === "GCP_QUALITY") ? handleGcpDataCollect : undefined
-                  }
-                  dataCollecting={
-                    (divisionCode === "DEV" && sys.code === "GCP_QUALITY") ? gcpDataCollecting : undefined
+                  onSave={
+                    (divisionCode === "BIO" && sys.code === "EDMS")
+                      ? () => openSaveModal("BIO", "bio_veeva", "Bio연구본부 Veeva System")
+                      : undefined
                   }
                 />
               ))}
             </div>
+
+            {/* BIO: 공유 파일(Veeva MS Timesheet) 영역을 Veeva(eDMS) 밑에 배치 */}
+            {divisionCode === "BIO" && (
+              <div className="mt-4">
+                <SharedTimesheetPanel />
+              </div>
+            )}
           </section>
 
           {/* 우: 파일 업로드 */}
@@ -2390,8 +2332,7 @@ export function DivisionReportPage({
                 fileList={lhouseFileList}
                 onUploadDone={() => void refetchLhouseFiles()}
                 onLog={addLocalLog}
-                onCrawl={() => startCrawl.mutate()}
-                crawlActive={crawlActive || startCrawl.isPending}
+                activityTask={sse.taskMap["VEEVA"]}
               />
             ) : divisionCode === "DEV" ? (
               <DevNamedUploadPanel
@@ -2400,8 +2341,7 @@ export function DivisionReportPage({
                 fileList={devFileList}
                 onUploadDone={() => void refetchDevFiles()}
                 onLog={addLocalLog}
-                onCrawl={handleGcpActivityExport}
-                crawlActive={gcpActivityExporting}
+                activityTask={sse.taskMap["GCP_ACTIVITY"]}
               />
             ) : divisionCode === "BIO" ? (
               <BioNamedUploadPanel
@@ -2420,7 +2360,8 @@ export function DivisionReportPage({
                 onLog={addLocalLog}
               />
             )}
-            <SharedTimesheetPanel />
+            {/* BIO 는 공유 파일 영역을 좌측(Veeva eDMS 밑)에 배치하므로 우측에서는 제외 */}
+            {divisionCode !== "BIO" && <SharedTimesheetPanel />}
           </div>
         </div>
       ) : (
@@ -2455,8 +2396,7 @@ export function DivisionReportPage({
                 fileList={lhouseFileList}
                 onUploadDone={() => void refetchLhouseFiles()}
                 onLog={addLocalLog}
-                onCrawl={() => startCrawl.mutate()}
-                crawlActive={crawlActive || startCrawl.isPending}
+                activityTask={sse.taskMap["VEEVA"]}
               />
             ) : divisionCode === "DEV" ? (
               <DevNamedUploadPanel
@@ -2465,8 +2405,7 @@ export function DivisionReportPage({
                 fileList={devFileList}
                 onUploadDone={() => void refetchDevFiles()}
                 onLog={addLocalLog}
-                onCrawl={handleGcpActivityExport}
-                crawlActive={gcpActivityExporting}
+                activityTask={sse.taskMap["GCP_ACTIVITY"]}
               />
             ) : divisionCode === "BIO" ? (
               <BioNamedUploadPanel

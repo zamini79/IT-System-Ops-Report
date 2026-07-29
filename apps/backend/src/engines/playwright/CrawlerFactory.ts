@@ -29,17 +29,16 @@ import { DevJiraCrawler }          from "./crawlers/dev/DevJiraCrawler";
 
 // ── LHOUSE 크롤러 ─────────────────────────────────────────────────────────────
 import { LhouseVeevaCrawler }           from "./crawlers/lhouse/LhouseVeevaCrawler";
-import { LhouseVeevaDashboardCrawler }  from "./crawlers/lhouse/LhouseVeevaDashboardCrawler";
+import { LhouseVeevaPerfStatsCrawler, LhouseVeevaQualityCrawler, LhouseVeevaTrainingCrawler } from "./crawlers/lhouse/LhouseVeevaReportCrawlers";
 
-// ── DEV 대시보드 전용 크롤러 ──────────────────────────────────────────────────
-import { DevGcpDashboardCrawler }       from "./crawlers/dev/DevGcpDashboardCrawler";
+// ── DEV 데이터 수집 전용 크롤러 ───────────────────────────────────────────────
 import { DevGcpActivityCrawler }        from "./crawlers/dev/DevGcpActivityCrawler";
 import { DevGcpPerfStatsCrawler, DevGcpQualityCrawler, DevGcpTrainingCrawler } from "./crawlers/dev/DevGcpReportCrawlers";
-import { DevMedcommsDashboardCrawler }  from "./crawlers/dev/DevMedcommsDashboardCrawler";
-import { DevClinicalDashboardCrawler }  from "./crawlers/dev/DevClinicalDashboardCrawler";
+import { DevMedcommsDocTypeCrawler, DevMedcommsPerfStatsCrawler, DevMedcommsActivityCrawler, DevMedcommsReviewCrawler } from "./crawlers/dev/DevMedcommsReportCrawlers";
+import { DevCtmsPerfStatsCrawler, DevCtmsStudyCrawler } from "./crawlers/dev/DevCtmsReportCrawlers";
 
-// ── BIO 대시보드 전용 크롤러 ──────────────────────────────────────────────────
-import { BioRdDashboardCrawler }        from "./crawlers/bio/BioRdDashboardCrawler";
+// ── BIO 데이터 수집 전용 크롤러 ───────────────────────────────────────────────
+import { BioRdActivityCrawler, BioRdPerfStatsCrawler, BioRdDocTypeCrawler } from "./crawlers/bio/BioRdReportCrawlers";
 
 // ── 크롤러 레지스트리 ─────────────────────────────────────────────────────────
 // 새 크롤러 추가 시 이 맵에만 등록하면 됩니다.
@@ -70,15 +69,22 @@ const REGISTRY: Record<DivisionCode, Record<string, CrawlerCtor>> = {
 
 // 전체 크롤 대상에는 포함되지 않는 단일 실행 전용 크롤러
 const SINGLE_REGISTRY: Record<string, CrawlerCtor> = {
-  VEEVA_DASHBOARD:    LhouseVeevaDashboardCrawler,
-  GCP_DASHBOARD:      DevGcpDashboardCrawler,
-  MEDCOMMS_DASHBOARD: DevMedcommsDashboardCrawler,
-  CLINICAL_DASHBOARD: DevClinicalDashboardCrawler,
-  BIO_RD_DASHBOARD:   BioRdDashboardCrawler,
   GCP_ACTIVITY:       DevGcpActivityCrawler,
   GCP_PERFSTATS:      DevGcpPerfStatsCrawler,
   GCP_QUALITY:        DevGcpQualityCrawler,
   GCP_TRAINING:       DevGcpTrainingCrawler,
+  MEDCOMMS_DOCTYPE:   DevMedcommsDocTypeCrawler,
+  MEDCOMMS_PERFSTATS: DevMedcommsPerfStatsCrawler,
+  MEDCOMMS_ACTIVITY:  DevMedcommsActivityCrawler,
+  MEDCOMMS_REVIEW:    DevMedcommsReviewCrawler,
+  CTMS_PERFSTATS:     DevCtmsPerfStatsCrawler,
+  CTMS_STUDY:         DevCtmsStudyCrawler,
+  LHOUSE_PERFSTATS:   LhouseVeevaPerfStatsCrawler,
+  LHOUSE_QUALITY:     LhouseVeevaQualityCrawler,
+  LHOUSE_TRAINING:    LhouseVeevaTrainingCrawler,
+  BIO_ACTIVITY:       BioRdActivityCrawler,
+  BIO_PERFSTATS:      BioRdPerfStatsCrawler,
+  BIO_DOCTYPE:        BioRdDocTypeCrawler,
 };
 
 // ── 팩토리 ───────────────────────────────────────────────────────────────────
@@ -232,7 +238,7 @@ export class CrawlerFactory {
    * SINGLE_REGISTRY 에 등록된 단일 크롤러를 실행합니다.
    * 전체 사업부 크롤 잡(listAvailable)과 독립적으로 동작합니다.
    *
-   * @param systemName  SINGLE_REGISTRY 키 (예: "VEEVA_DASHBOARD")
+   * @param systemName  SINGLE_REGISTRY 키 (예: "GCP_PERFSTATS")
    * @param jobId       저장 디렉토리 구분자
    * @param onProgress  진행 상태 콜백
    */

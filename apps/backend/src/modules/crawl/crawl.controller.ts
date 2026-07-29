@@ -9,7 +9,7 @@ import { Request, Response, NextFunction } from "express";
 import type { AuthRequest }  from "../auth/auth.types";
 import { AppError }          from "../../utils/errors";
 import { respond }           from "../../utils/response";
-import { startCrawlJob, getCrawlJobStatus, takeScreenshotJob, startDashboardCapture, startGcpDashboardCapture, startGcpActivityExport, startGcpDataCollection, startMedcommsDashboardCapture, startClinicalDashboardCapture, startBioRdDashboardCapture, type ScreenshotConfig } from "./crawl.service";
+import { startCrawlJob, getCrawlJobStatus, takeScreenshotJob, startGcpActivityExport, startGcpDataCollection, startLhouseDataCollection, startBioDataCollection, startMedcommsDataCollection, startCtmsDataCollection, startDevCollectAll, startLhouseCollectAll, type ScreenshotConfig } from "./crawl.service";
 import { jobEventBus }       from "./crawl.events";
 import type { DivisionCode } from "../../engines/playwright/types";
 import { logger }            from "../../utils/logger";
@@ -225,74 +225,6 @@ export async function screenshotHandler(
   }
 }
 
-// ── POST /api/crawl/veeva-dashboard ──────────────────────────────────────────
-
-/**
- * Veeva 대시보드 스크린샷 캡처 (임시 기능).
- *
- * 로그인 → SKY QMS Production Vault 선택 → 대시보드 접속 →
- * 차트 6개 렌더링 대기 → 전체 화면 스크린샷 1장 저장
- *
- * Request body: { jobId, userId? }
- * 응답: 202 Accepted + { taskId }
- * SSE: GET /:jobId/stream 에서 진행 상태 수신
- */
-export async function veevaDashboardHandler(
-  req: Request,
-  res: Response,
-  next: NextFunction
-): Promise<void> {
-  try {
-    const { jobId } = req.body as { jobId?: string };
-
-    if (!jobId) throw new AppError(400, "jobId 는 필수입니다.");
-
-    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-    if (!UUID_RE.test(jobId)) throw new AppError(400, "jobId 는 UUID 형식이어야 합니다.");
-
-    const user = (req as AuthRequest).user!;
-
-    const { taskId } = await startDashboardCapture({ jobId, userId: user.sub });
-
-    res.status(202).json({
-      success: true,
-      data:    { taskId, jobId },
-      message: "대시보드 캡처가 시작되었습니다. SSE 스트림에서 진행 상태를 확인하세요.",
-    });
-  } catch (err) {
-    next(err);
-  }
-}
-
-// ── POST /api/crawl/gcp-dashboard ────────────────────────────────────────────
-
-export async function gcpDashboardHandler(
-  req: Request,
-  res: Response,
-  next: NextFunction
-): Promise<void> {
-  try {
-    const { jobId } = req.body as { jobId?: string };
-
-    if (!jobId) throw new AppError(400, "jobId 는 필수입니다.");
-
-    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-    if (!UUID_RE.test(jobId)) throw new AppError(400, "jobId 는 UUID 형식이어야 합니다.");
-
-    const user = (req as AuthRequest).user!;
-
-    const { taskId } = await startGcpDashboardCapture({ jobId, userId: user.sub });
-
-    res.status(202).json({
-      success: true,
-      data:    { taskId, jobId },
-      message: "GCP 대시보드 캡처가 시작되었습니다. SSE 스트림에서 진행 상태를 확인하세요.",
-    });
-  } catch (err) {
-    next(err);
-  }
-}
-
 // ── POST /api/crawl/gcp-activity ─────────────────────────────────────────────
 
 export async function gcpActivityHandler(
@@ -316,6 +248,68 @@ export async function gcpActivityHandler(
       success: true,
       data:    { taskId, jobId },
       message: "GCP Activity 리포트 조회가 시작되었습니다. SSE 스트림에서 진행 상태를 확인하세요.",
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── POST /api/crawl/dev-collect-all ──────────────────────────────────────────
+// DEV(개발본부) 원클릭: 데이터 수집 3종 + 시스템 조회 1종을 순차 실행.
+// 하나라도 실패하면 중단되며, 진행 상태는 SSE 스트림으로 전달된다.
+
+export async function devCollectAllHandler(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
+  try {
+    const { jobId } = req.body as { jobId?: string };
+
+    if (!jobId) throw new AppError(400, "jobId 는 필수입니다.");
+
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!UUID_RE.test(jobId)) throw new AppError(400, "jobId 는 UUID 형식이어야 합니다.");
+
+    const user = (req as AuthRequest).user!;
+
+    await startDevCollectAll({ jobId, userId: user.sub });
+
+    res.status(202).json({
+      success: true,
+      data:    { jobId },
+      message: "개발본부 통합 수집(데이터 3종 + 시스템 조회 1종)이 시작되었습니다. SSE 스트림에서 진행 상태를 확인하세요.",
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── POST /api/crawl/lhouse-collect-all ───────────────────────────────────────
+// L HOUSE 원클릭: 데이터 수집(LHOUSE_DATA) + 시스템 조회(VEEVA → Activity)를 순차 실행.
+// 하나라도 실패하면 중단되며, 진행 상태는 SSE 스트림으로 전달된다.
+
+export async function lhouseCollectAllHandler(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
+  try {
+    const { jobId } = req.body as { jobId?: string };
+
+    if (!jobId) throw new AppError(400, "jobId 는 필수입니다.");
+
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!UUID_RE.test(jobId)) throw new AppError(400, "jobId 는 UUID 형식이어야 합니다.");
+
+    const user = (req as AuthRequest).user!;
+
+    await startLhouseCollectAll({ jobId, userId: user.sub });
+
+    res.status(202).json({
+      success: true,
+      data:    { jobId },
+      message: "L HOUSE 통합 수집(데이터 + 시스템 조회)이 시작되었습니다. SSE 스트림에서 진행 상태를 확인하세요.",
     });
   } catch (err) {
     next(err);
@@ -351,9 +345,9 @@ export async function gcpDataHandler(
   }
 }
 
-// ── POST /api/crawl/medcomms-dashboard ───────────────────────────────────────
+// ── POST /api/crawl/lhouse-data ──────────────────────────────────────────────
 
-export async function medcommsDashboardHandler(
+export async function lhouseDataHandler(
   req: Request,
   res: Response,
   next: NextFunction
@@ -368,21 +362,21 @@ export async function medcommsDashboardHandler(
 
     const user = (req as AuthRequest).user!;
 
-    const { taskId } = await startMedcommsDashboardCapture({ jobId, userId: user.sub });
+    const { taskId } = await startLhouseDataCollection({ jobId, userId: user.sub });
 
     res.status(202).json({
       success: true,
       data:    { taskId, jobId },
-      message: "Medcomms 대시보드 캡처가 시작되었습니다. SSE 스트림에서 진행 상태를 확인하세요.",
+      message: "L HOUSE 데이터 수집(3개 리포트)이 시작되었습니다. SSE 스트림에서 진행 상태를 확인하세요.",
     });
   } catch (err) {
     next(err);
   }
 }
 
-// ── POST /api/crawl/bio-rd-dashboard ─────────────────────────────────────────
+// ── POST /api/crawl/bio-data ─────────────────────────────────────────────────
 
-export async function bioRdDashboardHandler(
+export async function bioDataHandler(
   req: Request,
   res: Response,
   next: NextFunction
@@ -397,21 +391,21 @@ export async function bioRdDashboardHandler(
 
     const user = (req as AuthRequest).user!;
 
-    const { taskId } = await startBioRdDashboardCapture({ jobId, userId: user.sub });
+    const { taskId } = await startBioDataCollection({ jobId, userId: user.sub });
 
     res.status(202).json({
       success: true,
       data:    { taskId, jobId },
-      message: "BIO R&D 대시보드 캡처가 시작되었습니다. SSE 스트림에서 진행 상태를 확인하세요.",
+      message: "BIO 데이터 수집(3개 리포트)이 시작되었습니다. SSE 스트림에서 진행 상태를 확인하세요.",
     });
   } catch (err) {
     next(err);
   }
 }
 
-// ── POST /api/crawl/clinical-dashboard ───────────────────────────────────────
+// ── POST /api/crawl/medcomms-data ────────────────────────────────────────────
 
-export async function clinicalDashboardHandler(
+export async function medcommsDataHandler(
   req: Request,
   res: Response,
   next: NextFunction
@@ -426,12 +420,41 @@ export async function clinicalDashboardHandler(
 
     const user = (req as AuthRequest).user!;
 
-    const { taskId } = await startClinicalDashboardCapture({ jobId, userId: user.sub });
+    const { taskId } = await startMedcommsDataCollection({ jobId, userId: user.sub });
 
     res.status(202).json({
       success: true,
       data:    { taskId, jobId },
-      message: "Clinical 대시보드 캡처가 시작되었습니다. SSE 스트림에서 진행 상태를 확인하세요.",
+      message: "Medcomms 데이터 수집(4개 리포트)이 시작되었습니다. SSE 스트림에서 진행 상태를 확인하세요.",
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── POST /api/crawl/ctms-data ────────────────────────────────────────────────
+
+export async function ctmsDataHandler(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
+  try {
+    const { jobId } = req.body as { jobId?: string };
+
+    if (!jobId) throw new AppError(400, "jobId 는 필수입니다.");
+
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!UUID_RE.test(jobId)) throw new AppError(400, "jobId 는 UUID 형식이어야 합니다.");
+
+    const user = (req as AuthRequest).user!;
+
+    const { taskId } = await startCtmsDataCollection({ jobId, userId: user.sub });
+
+    res.status(202).json({
+      success: true,
+      data:    { taskId, jobId },
+      message: "CTMS 데이터 수집(2개 리포트)이 시작되었습니다. SSE 스트림에서 진행 상태를 확인하세요.",
     });
   } catch (err) {
     next(err);

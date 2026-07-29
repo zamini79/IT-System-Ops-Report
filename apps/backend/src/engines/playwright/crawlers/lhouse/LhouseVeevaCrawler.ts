@@ -1,5 +1,6 @@
 import fs                      from "fs";
 import path                    from "path";
+import { openVeevaReportUrl }  from "../veeva/veevaNavigation";
 import { BaseCrawler }         from "../../BaseCrawler";
 import type { CrawlerContext } from "../../types";
 
@@ -159,6 +160,7 @@ export class LhouseVeevaCrawler extends BaseCrawler {
 
     // 3) anchorText가 visible 요소에 나타날 때까지 폴링 (최대 60초)
     this.emit("navigating", `'${anchorText}' 콘텐츠 확인 중…`, 39);
+    let anchorFound = false;
     const deadline = Date.now() + CONTENT_TIMEOUT;
     while (Date.now() < deadline) {
       const found = await this.page.evaluate((text) => {
@@ -172,7 +174,7 @@ export class LhouseVeevaCrawler extends BaseCrawler {
         }
         return false;
       }, anchorText);
-      if (found) break;
+      if (found) { anchorFound = true; break; }
       await this.page.waitForTimeout(1_000);
     }
 
@@ -196,7 +198,14 @@ export class LhouseVeevaCrawler extends BaseCrawler {
     // 5) 디버그 스크린샷 (viewport만 — 현재 보이는 상태 확인용)
     const shotPath = `${this.downloadDir}/debug_loaded_${Date.now()}.png`;
     await this.page.screenshot({ path: shotPath, fullPage: false }).catch(() => {});
-    this.emit("navigating", `페이지 로딩 완료 (스크린샷: ${shotPath})`, 40);
+    if (anchorFound) {
+      this.emit("navigating", `페이지 로딩 완료 (스크린샷: ${shotPath})`, 40);
+    } else {
+      // 리포트 라우트 검증은 이동 단계에서 이미 통과했으므로 여기서 예외를 던지지는 않는다.
+      // 다만 "완료" 로 오인되지 않도록 경고로 남긴다(과거 오진의 원인).
+      this.emit("navigating",
+        `'${anchorText}' 텍스트를 확인하지 못했습니다 — 계속 진행합니다. (스크린샷: ${shotPath})`, 40);
+    }
   }
 
   // ── 헬퍼: "Running report …" 배너(=리포트 실행 중) 가시 여부 ───────────────────
@@ -693,27 +702,12 @@ export class LhouseVeevaCrawler extends BaseCrawler {
     // ── Step 3. 리포트 URL 직접 접속 + 완전 로딩 대기 ──────────────────────────────
     this.emit("navigating", "리포트 페이지 접속 중…", 30);
 
-    // Vault(SKY QMS Production) 선택 후 이미 sk-qms.veevavault.com/ui/ 에 와 있으면,
-    // 해시(#reporting/...)만 다른 URL로의 goto는 same-document 이동이라 net::ERR_ABORTED
-    // 가 발생한다. 같은 문서면 in-page 해시 변경으로 라우팅하고, 다른 문서일 때만 goto 한다.
+    // 이동 + 리포트 라우트 유지 검증 (공용 헬퍼) — 해시만 바꿀 때 SPA 부팅 라우팅과
+    //   경쟁해 Home 으로 튕기던 문제를 강제 재로딩 + URL 검증으로 해결한다.
     const targetUrl = LhouseVeevaCrawler.REPORT_URL;
-    const sameDoc   = this.page.url().split("#")[0] === targetUrl.split("#")[0];
-
-    if (sameDoc) {
-      await this.page.evaluate((u) => { window.location.href = u; }, targetUrl);
-      await this.page.waitForTimeout(2_000);
-    } else {
-      try {
-        await this.page.goto(targetUrl, {
-          waitUntil: "domcontentloaded", // SPA는 networkidle이 오래 걸리므로 DOM 기준으로 먼저
-          timeout:   60_000,
-        });
-      } catch (e: any) {
-        // SPA 해시 네비게이션이 same-document 로 처리되어 ABORT 되는 경우는 무시
-        if (!String(e?.message ?? e).includes("ERR_ABORTED")) throw e;
-      }
-    }
-    await this.page.waitForLoadState("domcontentloaded").catch(() => {});
+    await openVeevaReportUrl(this.page, targetUrl, {
+      emit: (m) => this.emit("navigating", m, 31),
+    });
 
     this.emit("navigating", "리포트 페이지 렌더링 대기 중…", 33);
     await this._waitForReportReady("월간 현황 지표");

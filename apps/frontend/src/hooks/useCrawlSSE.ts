@@ -125,7 +125,7 @@ export function useCrawlSSE(
   systems: string[],
   /** crawling 페이즈일 때만 연결 */
   active: boolean
-): CrawlSSEState & { reset: () => void } {
+): CrawlSSEState & { reset: () => void; resetTask: (systemName: string) => void } {
   const initialMap = useRef(makeInitialTaskMap(systems));
 
   const [phase,       setPhase]       = useState<CrawlPhase>("idle");

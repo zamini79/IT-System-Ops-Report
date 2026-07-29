@@ -21,6 +21,7 @@ import { Routes, Route, Navigate } from "react-router-dom";
 import { PrivateRoute }         from "./components/PrivateRoute";
 import { LoginPage }            from "./pages/LoginPage";
 import { DashboardPage }        from "./pages/DashboardPage";
+import { OpsDashboardPage }     from "./pages/OpsDashboardPage";
 import { BioResearchPage }      from "./pages/BioResearchPage";
 import { DevDivisionPage }      from "./pages/DevDivisionPage";
 import { LhousePage }           from "./pages/LhousePage";
@@ -39,6 +40,8 @@ export default function App() {
       <Route element={<PrivateRoute />}>
         <Route path="/"               element={<Navigate to="/dashboard" replace />} />
         <Route path="/dashboard"      element={<DashboardPage />} />
+        {/* 본부별 운영 현황 대시보드 (매일 새벽 자동 수집된 스냅샷 조회) */}
+        <Route path="/ops/:divisionCode" element={<OpsDashboardPage />} />
         <Route path="/bio-research"   element={<BioResearchPage />} />
         <Route path="/dev-division"   element={<DevDivisionPage />} />
         <Route path="/lhouse"         element={<LhousePage />} />
