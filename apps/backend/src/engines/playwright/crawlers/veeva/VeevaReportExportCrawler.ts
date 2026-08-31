@@ -1,6 +1,6 @@
 import fs                      from "fs";
 import path                    from "path";
-import { openVeevaReportUrl } from "./veevaNavigation";
+import { openVeevaReportUrl, dismissVeevaCallouts } from "./veevaNavigation";
 import { BaseCrawler }         from "../../BaseCrawler";
 import type { CrawlerContext } from "../../types";
 
@@ -277,6 +277,29 @@ export abstract class VeevaReportExportCrawler extends BaseCrawler {
     //    (한 번 잘못 열리면 보고서 헤더 우측을 가려 이후 시도가 모두 막힘)
     await this.page.mouse.click(450, 320).catch(() => {});
     await this.page.waitForTimeout(200);
+
+    // 안내 콜아웃이 헤더를 덮고 있으면 어떤 클릭도 통하지 않는다.
+    await dismissVeevaCallouts(this.page);
+
+    // ⓪-b Veeva 자체 클래스로 "…"(More Actions) 버튼을 먼저 노린다.
+    //   아래 ①~③ 은 제목 위치를 기준으로 오른쪽 아이콘을 추정하는 기하학적 휴리스틱이라
+    //   헤더 레이아웃이 바뀌면 조용히 어긋난다. Veeva 는 리포트 뷰어 헤더의 "…" 를
+    //   `.actionMenuContainer`(= .vv-action-menu-button-container) 안의 버튼으로
+    //   렌더링하므로, 이 쪽이 훨씬 안정적이다. (2026-08-31 라이브 확인:
+    //   이 셀렉터로 메뉴가 열려 Export to Excel 까지 노출됨)
+    for (const sel of [
+      ".actionMenuContainer button",
+      ".vv-action-menu-button-container button",
+      ".vv_page_header_actions .actionMenuContainer",
+    ]) {
+      const loc = this.page.locator(sel).first();
+      if (await loc.count() === 0) continue;
+      if (!await loc.isVisible().catch(() => false)) continue;
+      try {
+        await loc.click({ timeout: 5_000 });
+        return true;
+      } catch { /* 다음 후보 / 휴리스틱으로 폴백 */ }
+    }
 
     // ① 제목 요소를 태깅하고 Playwright 로 hover → GCP 리포트 헤더는 hover 시
     //    ↻ ✎ ⋯ 액션 아이콘이 나타나는 경우가 있어 hover 후 탐색한다.
@@ -727,6 +750,9 @@ export abstract class VeevaReportExportCrawler extends BaseCrawler {
     this.emit("navigating", "Vault 드롭다운 탐색 중…", 22);
     await this.page.waitForTimeout(2_000);
 
+    // Vault 업그레이드 안내 콜아웃이 화면 전체를 덮어 클릭을 가로채므로 먼저 닫는다.
+    await dismissVeevaCallouts(this.page, (m) => this.emit("navigating", m, 22));
+
     const vaultSel = await this.waitForVisible(
       [
         "[data-testid='vault-selector']",
@@ -739,15 +765,21 @@ export abstract class VeevaReportExportCrawler extends BaseCrawler {
       10_000, true,
     );
 
-    if (vaultSel) {
-      await this.page.click(vaultSel);
-    } else {
-      const btn = this.page.getByText("Select a vault", { exact: false });
-      if (await btn.count() > 0 && await btn.first().isVisible().catch(() => false)) {
-        await btn.first().click();
+    try {
+      if (vaultSel) {
+        await this.page.click(vaultSel, { timeout: 10_000 });
       } else {
-        this.emit("navigating", "Vault 드롭다운 미발견 — 현재 Vault로 계속합니다.", 23);
+        const btn = this.page.getByText("Select a vault", { exact: false });
+        if (await btn.count() > 0 && await btn.first().isVisible().catch(() => false)) {
+          await btn.first().click({ timeout: 10_000 });
+        } else {
+          this.emit("navigating", "Vault 드롭다운 미발견 — 현재 Vault로 계속합니다.", 23);
+        }
       }
+    } catch (e) {
+      // 리포트는 아래에서 URL 로 직접 여므로 드롭다운을 못 열어도 계속 진행한다.
+      this.emit("navigating",
+        `Vault 드롭다운 클릭 실패 — 현재 Vault로 계속합니다. (${(e as Error).message.split("\n")[0]})`, 23);
     }
 
     await this.page.waitForTimeout(1_000);
@@ -778,6 +810,9 @@ export abstract class VeevaReportExportCrawler extends BaseCrawler {
     await openVeevaReportUrl(this.page, targetUrl, {
       emit: (m) => this.emit("navigating", m, 31),
     });
+
+    // 재로딩 뒤 콜아웃이 다시 뜰 수 있다 — "…" 메뉴 클릭이 막히지 않도록 한 번 더 닫는다.
+    await dismissVeevaCallouts(this.page, (m) => this.emit("navigating", m, 32));
 
     this.emit("navigating", "리포트 페이지 렌더링 대기 중…", 33);
     await this._waitForReportReady(this.titlePrefix || "Back to reports");

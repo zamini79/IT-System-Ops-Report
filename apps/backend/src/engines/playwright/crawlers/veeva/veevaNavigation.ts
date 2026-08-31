@@ -127,3 +127,63 @@ export async function openVeevaReportUrl(
     `현재 URL: ${lastUrl}`
   );
 }
+
+/**
+ * Veeva 콜아웃(안내 말풍선) 해제
+ *
+ * ─ 왜 필요한가 ───────────────────────────────────────────────────────────────
+ *  Vault 업그레이드 안내("Your Vault has been upgraded to 26R2…")가 뜨면 Veeva 는
+ *  말풍선 뒤에 **화면 전체를 덮는** `.vv-callout-background` + `.vv-callout-focus-trap`
+ *  (0,0 ~ 뷰포트 전체)을 깔아 다른 요소의 클릭을 모두 가로챈다.
+ *  이 상태에서 Vault 드롭다운을 클릭하면 Playwright 가
+ *  "<div class='vv-callout-background'> … intercepts pointer events" 로 30초를
+ *  소진하고 타임아웃 실패한다. (실측: 2026-08-31 GCP 3개 리포트 동시 실패)
+ *
+ *  해제 순서 — 부작용이 작은 것부터:
+ *   1) 콜아웃의 "Dismiss" 버튼 클릭 (Veeva 가 의도한 정상 경로. 서버에 읽음 처리)
+ *   2) Escape 키
+ *   3) 그래도 남으면 오버레이 DOM 을 직접 제거 (콜아웃 종류가 달라 1·2가 안 먹는 경우)
+ *
+ *  콜아웃은 로그인 직후뿐 아니라 페이지 전환 뒤에도 뜰 수 있으므로 클릭 전 매번 호출한다.
+ *  콜아웃이 없으면 즉시 반환하므로(있는지 먼저 확인) 상시 호출해도 비용이 거의 없다.
+ */
+export async function dismissVeevaCallouts(
+  page: Page, emit: (message: string) => void = () => {}
+): Promise<boolean> {
+  const BLOCKERS = ".vv-callout-background, .vv-callout-focus-trap, .vv-callout-content-overlay";
+
+  const blockerCount = async (): Promise<number> =>
+    page.evaluate((sel) => document.querySelectorAll(sel).length, BLOCKERS).catch(() => 0);
+
+  if (await blockerCount() === 0) return false;
+  emit("Veeva 안내 팝업 감지 — 닫는 중…");
+
+  // 1) Dismiss 버튼 (여러 개가 쌓여 있을 수 있어 최대 3회)
+  for (let i = 0; i < 3; i++) {
+    const btn = page.locator(".vv-callout-content-dismiss").first();
+    const visible = await btn.isVisible().catch(() => false);
+    if (!visible) break;
+    // force: 콜아웃 배경이 자기 자신의 Dismiss 버튼까지 가리는 경우가 있다
+    await btn.click({ timeout: 3_000, force: true }).catch(() => {});
+    await page.waitForTimeout(400);
+    if (await blockerCount() === 0) break;
+  }
+
+  // 2) Escape
+  if (await blockerCount() > 0) {
+    await page.keyboard.press("Escape").catch(() => {});
+    await page.waitForTimeout(400);
+  }
+
+  // 3) 최후 수단 — 오버레이 DOM 제거 (말풍선 자체는 남겨도 클릭은 통과한다)
+  const remaining = await blockerCount();
+  if (remaining > 0) {
+    await page.evaluate((sel) => {
+      document.querySelectorAll(sel).forEach((el) => el.remove());
+    }, BLOCKERS).catch(() => {});
+    emit(`Veeva 안내 팝업 오버레이 ${remaining}개 강제 제거`);
+  } else {
+    emit("Veeva 안내 팝업 닫음");
+  }
+  return true;
+}

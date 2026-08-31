@@ -352,6 +352,29 @@ export abstract class BaseCrawler {
       ignoreHTTPSErrors: true,
       viewport:          { width: 1280, height: 900 },
     });
+
+    // ── esbuild 헬퍼 shim ──────────────────────────────────────────────────────
+    //  백엔드는 tsx(=esbuild) 로 실행되고, esbuild 는 `keepNames` 때문에 **이름이 붙은
+    //  함수**를 `__name(fn, "fn")` 으로 감싼다. 이 변환은 page.evaluate() 에 넘기는
+    //  콜백 안의 중첩 함수에도 적용되는데, Playwright 는 콜백을 fn.toString() 으로
+    //  직렬화해 브라우저에서 실행하므로 브라우저에는 `__name` 이 없어
+    //    ReferenceError: __name is not defined
+    //  로 죽는다. evaluate 호출부 대부분이 `.catch(() => false)` 로 감싸여 있어
+    //  에러가 삼켜지고 "메뉴를 찾을 수 없습니다" 같은 **엉뚱한 증상**으로 나타난다.
+    //  (실측 2026-08-31: 이 한 가지 원인으로 GCP/LHOUSE 리포트 5건 + 표 스크래핑 2건 실패)
+    //
+    //  esbuild 원본과 동일하게 name 을 실제로 심어 두면 동작 차이도 없다.
+    await context.addInitScript(() => {
+      const g = globalThis as unknown as Record<string, unknown>;
+      if (typeof g.__name === "function") return;
+      g.__name = (target: unknown, value: string) => {
+        try {
+          Object.defineProperty(target as object, "name", { value, configurable: true });
+        } catch { /* 심을 수 없는 대상이면 그대로 둔다 */ }
+        return target;
+      };
+    });
+
     const page = await context.newPage();
 
     page.on("console", (msg) => {
