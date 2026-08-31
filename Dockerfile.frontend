@@ -1,0 +1,37 @@
+# ── 프론트엔드 배포용 Dockerfile ──────────────────────────────────────────────
+# 빌드 컨텍스트: 리포지토리 루트 (모노레포 전체)
+#
+# 루트 컨텍스트를 쓰는 이유:
+#   apps/frontend 는 워크스페이스 패키지 `@skbs/shared` 에 의존하고,
+#   vite.config.ts 가 이를 ../../packages/shared/src 로 alias 한다.
+#   따라서 apps/frontend 만 컨텍스트로 잡으면 의존성 설치와 빌드가 모두 실패한다.
+#   (구 apps/frontend/Dockerfile 이 그 구조여서 동작하지 않았다)
+
+# ── 1단계: 빌드 ──────────────────────────────────────────────────────────────
+FROM node:20-slim AS builder
+
+WORKDIR /app
+
+COPY package*.json ./
+COPY packages/shared/package*.json ./packages/shared/
+COPY apps/frontend/package*.json ./apps/frontend/
+
+RUN npm ci --workspace=packages/shared --workspace=apps/frontend --include-workspace-root
+
+COPY packages/      ./packages/
+COPY apps/frontend/ ./apps/frontend/
+
+# vite 는 alias 로 shared 소스를 직접 참조하므로 shared 빌드는 불필요하다.
+RUN npm run build --workspace=apps/frontend
+
+# ── 2단계: 정적 서빙 ─────────────────────────────────────────────────────────
+FROM nginx:alpine
+
+COPY --from=builder /app/apps/frontend/dist /usr/share/nginx/html
+
+# SSE 버퍼링 비활성화 · /uploads 프록시 · gzip 이 포함된 프로덕션 설정을 쓴다.
+# (nginx.conf 는 SSE 를 고려하지 않아 수집 진행 로그가 실시간으로 흐르지 않는다)
+COPY apps/frontend/nginx.prod.conf /etc/nginx/conf.d/default.conf
+
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]

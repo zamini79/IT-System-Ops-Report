@@ -1,4 +1,8 @@
-version: "3.9"
+# 로컬/온프레미스 전체 스택 실행
+#   docker compose up --build
+#
+# 두 앱 모두 **리포지토리 루트를 빌드 컨텍스트**로 쓴다. npm workspaces 구조라
+# 각 앱 디렉터리만으로는 `@skbs/shared` 의존성을 해석할 수 없기 때문이다.
 
 services:
   db:
@@ -6,33 +10,42 @@ services:
     container_name: skbs-db
     restart: unless-stopped
     environment:
-      POSTGRES_DB: ${DB_NAME:-skbs_it_report}
-      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_DB:       ${DB_NAME:-skbs_it_report}
+      POSTGRES_USER:     ${DB_USER:-postgres}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
     ports:
       - "${DB_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test:     ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-skbs_it_report}"]
+      interval: 5s
+      timeout:  3s
+      retries:  10
 
   backend:
     build:
-      context: ./apps/backend
-      dockerfile: Dockerfile
+      context:    .
+      dockerfile: Dockerfile.railway
     container_name: skbs-backend
     restart: unless-stopped
     depends_on:
-      - db
+      db:
+        condition: service_healthy   # 마이그레이션이 DB 기동보다 먼저 돌지 않도록
     env_file:
       - .env
     ports:
       - "${PORT:-4000}:4000"
     volumes:
+      # 수집한 엑셀·캡처가 재시작 후에도 남아야 한다. 대시보드는 이 파일들을
+      # 다시 읽어 스냅샷을 만들므로, 유실되면 다음 수집 전까지 값이 빈다.
       - ./apps/backend/uploads:/app/uploads
+      - ./apps/backend/outputs:/app/outputs
 
   frontend:
     build:
-      context: ./apps/frontend
-      dockerfile: Dockerfile
+      context:    .
+      dockerfile: Dockerfile.frontend
     container_name: skbs-frontend
     restart: unless-stopped
     depends_on:
