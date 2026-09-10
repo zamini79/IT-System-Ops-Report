@@ -1,4 +1,6 @@
-import "dotenv/config";
+// ⚠️ 반드시 첫 줄 — 다른 모듈이 process.env 를 읽기 전에 .env 를 적재한다.
+//    (cwd 가 아니라 리포지토리 루트에서 찾는다. config/env.ts 주석 참고)
+import "./config/env";
 import path from "path";
 import fs from "fs";
 import app from "./app";
