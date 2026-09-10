@@ -131,7 +131,7 @@ export async function listReportHistory(params: {
               d.name AS division_name
        FROM report_jobs rj
        JOIN divisions   d ON rj.division_id = d.id
-       WHERE ($1::text IS NULL OR d.code::text = $1::text)
+       WHERE ($1 IS NULL OR d.code = $1)
        ORDER BY rj.created_at DESC
        LIMIT $2 OFFSET $3`,
       [division ?? null, limit, offset]
@@ -140,7 +140,7 @@ export async function listReportHistory(params: {
       `SELECT COUNT(*) AS count
        FROM report_jobs rj
        JOIN divisions   d ON rj.division_id = d.id
-       WHERE ($1::text IS NULL OR d.code::text = $1::text)`,
+       WHERE ($1 IS NULL OR d.code = $1)`,
       [division ?? null]
     ),
   ]);

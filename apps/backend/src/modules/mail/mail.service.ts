@@ -158,7 +158,7 @@ export async function generateDraft(jobId: string): Promise<DraftRow> {
     `INSERT INTO mail_drafts (report_job_id, recipients, subject, body_html)
      VALUES ($1, $2, $3, $4)
      RETURNING id, report_job_id, recipients, cc, subject, body_html, created_at, updated_at`,
-    [jobId, defaultRecipients, subject, bodyHtml]
+    [jobId, JSON.stringify(defaultRecipients), subject, bodyHtml]
   );
 
   return inserted[0];
@@ -215,16 +215,23 @@ export async function updateDraft(
     body_html:  string;
   }
 ): Promise<DraftRow> {
-  const rows = await query<DraftRow>(
+  // MariaDB 는 UPDATE … RETURNING 을 지원하지 않아 UPDATE 후 SELECT 로 나눈다.
+  // recipients/cc 는 구 TEXT[] → JSON 컬럼이라 배열을 문자열로 직렬화해 넘긴다.
+  await query(
     `UPDATE mail_drafts
      SET recipients = $1,
          cc         = $2,
          subject    = $3,
          body_html  = $4,
          updated_at = NOW()
-     WHERE id = $5
-     RETURNING id, report_job_id, recipients, cc, subject, body_html, created_at, updated_at`,
-    [data.recipients, data.cc, data.subject, data.body_html, draftId]
+     WHERE id = $5`,
+    [JSON.stringify(data.recipients), JSON.stringify(data.cc),
+     data.subject, data.body_html, draftId]
+  );
+  const rows = await query<DraftRow>(
+    `SELECT id, report_job_id, recipients, cc, subject, body_html, created_at, updated_at
+     FROM mail_drafts WHERE id = $1`,
+    [draftId]
   );
   if (!rows.length) throw new AppError(404, `메일 초안을 찾을 수 없습니다: ${draftId}`);
   return rows[0];
@@ -249,7 +256,7 @@ export async function listGroups(
   return query<RecipientGroupRow>(
     `SELECT id, division_code, name, emails, created_at
      FROM mail_recipient_groups
-     WHERE ($1::text IS NULL OR division_code = $1)
+     WHERE ($1 IS NULL OR division_code = $1)
      ORDER BY division_code, created_at`,
     [divisionCode ?? null]
   );
@@ -263,7 +270,7 @@ export async function createGroup(data: {
 }): Promise<RecipientGroupRow> {
   const rows = await query<RecipientGroupRow>(
     `INSERT INTO mail_recipient_groups (division_code, name, emails)
-     VALUES ($1, $2, $3::jsonb)
+     VALUES ($1, $2, $3)
      RETURNING id, division_code, name, emails, created_at`,
     [data.division_code, data.name, JSON.stringify(data.emails)]
   );
@@ -275,17 +282,22 @@ export async function updateGroup(
   groupId: string,
   data: { name?: string; emails?: string[] }
 ): Promise<RecipientGroupRow> {
-  const rows = await query<RecipientGroupRow>(
+  // MariaDB 는 UPDATE … RETURNING 을 지원하지 않아 UPDATE 후 SELECT 로 나눈다.
+  await query(
     `UPDATE mail_recipient_groups
      SET name   = COALESCE($1, name),
-         emails = COALESCE($2::jsonb, emails)
-     WHERE id = $3
-     RETURNING id, division_code, name, emails, created_at`,
+         emails = COALESCE($2, emails)
+     WHERE id = $3`,
     [
       data.name ?? null,
       data.emails !== undefined ? JSON.stringify(data.emails) : null,
       groupId,
     ]
+  );
+  const rows = await query<RecipientGroupRow>(
+    `SELECT id, division_code, name, emails, created_at
+     FROM mail_recipient_groups WHERE id = $1`,
+    [groupId]
   );
   if (!rows.length) throw new AppError(404, `수신자 그룹을 찾을 수 없습니다: ${groupId}`);
   return rows[0];

@@ -70,9 +70,9 @@ export async function refreshSnapshot(
 
   await query(
     `INSERT INTO dashboard_snapshots (division_code, captured_date, data, sources)
-     VALUES ($1, $2, $3::json, $4::json)
-     ON CONFLICT (division_code, captured_date) DO UPDATE
-       SET data = EXCLUDED.data, sources = EXCLUDED.sources, updated_at = NOW()`,
+     VALUES ($1, $2, $3, $4)
+     ON DUPLICATE KEY UPDATE
+       data = VALUES(data), sources = VALUES(sources), updated_at = NOW()`,
     [divisionCode, capturedDate, JSON.stringify(payload), JSON.stringify(built.sources)]
   );
 
@@ -114,7 +114,7 @@ export async function getDashboard(
   );
 
   const runRows = await query<RunRow>(
-    `SELECT trigger, status, started_at, finished_at, detail
+    `SELECT \`trigger\`, status, started_at, finished_at, detail
      FROM collection_runs
      WHERE division_code = $1
      ORDER BY started_at DESC
@@ -183,7 +183,7 @@ export async function getTrend(
     `SELECT captured_date, data
      FROM dashboard_snapshots
      WHERE division_code = $1
-       AND captured_date >= (CURRENT_DATE - $2::int)
+       AND captured_date >= DATE_SUB(CURRENT_DATE, INTERVAL $2 DAY)
      ORDER BY captured_date ASC`,
     [divisionCode, days]
   );
@@ -207,7 +207,7 @@ export async function startCollectionRun(
   trigger:      CollectionTrigger
 ): Promise<string> {
   const rows = await query<{ id: string }>(
-    `INSERT INTO collection_runs (division_code, trigger, status)
+    `INSERT INTO collection_runs (division_code, \`trigger\`, status)
      VALUES ($1, $2, 'RUNNING')
      RETURNING id`,
     [divisionCode, trigger]
@@ -223,7 +223,7 @@ export async function finishCollectionRun(
 ): Promise<void> {
   await query(
     `UPDATE collection_runs
-     SET status = $1, finished_at = NOW(), detail = $2::json
+     SET status = $1, finished_at = NOW(), detail = $2
      WHERE id = $3`,
     [status, JSON.stringify(detail ?? {}), runId]
   ).catch((e: Error) =>

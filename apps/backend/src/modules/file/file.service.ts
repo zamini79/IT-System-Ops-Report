@@ -136,14 +136,19 @@ export async function saveNamedUploadedFile(
   );
 
   if (existing.length) {
-    const rows = await query<UploadedFileRow>(
+    // MariaDB 는 UPDATE … RETURNING 을 지원하지 않아 UPDATE 후 SELECT 로 나눈다.
+    await query(
       `UPDATE uploaded_files
        SET stored_path = $1, file_type = $2, file_size = $3,
-           analysis_result = '{}'::jsonb, created_at = NOW()
-       WHERE id = $4
-       RETURNING id, report_job_id, original_name, stored_path,
-                 file_type, file_size, analysis_result, created_at`,
+           analysis_result = '{}', created_at = NOW()
+       WHERE id = $4`,
       [file.path, file.mimetype, file.size, existing[0].id]
+    );
+    const rows = await query<UploadedFileRow>(
+      `SELECT id, report_job_id, original_name, stored_path,
+              file_type, file_size, analysis_result, created_at
+       FROM uploaded_files WHERE id = $1`,
+      [existing[0].id]
     );
     logger.info(`[FileService] Named file updated: ${savedFilename} (${existing[0].id})`);
     return rows[0];

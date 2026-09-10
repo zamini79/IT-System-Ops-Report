@@ -6,19 +6,26 @@
 
 services:
   db:
-    image: postgres:16-alpine
+    image: mariadb:11.4
     container_name: skbs-db
     restart: unless-stopped
     environment:
-      POSTGRES_DB:       ${DB_NAME:-skbs_it_report}
-      POSTGRES_USER:     ${DB_USER:-postgres}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+      MARIADB_DATABASE:      ${DB_NAME:-skbs_it_report}
+      MARIADB_USER:          ${DB_USER:-skbs}
+      MARIADB_PASSWORD:      ${DB_PASSWORD:-skbs}
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-root}
+    # 시각은 전부 UTC 로 저장한다 (애플리케이션이 KST 로 변환) — config/db.ts 주석 참고
+    command: ["--default-time-zone=+00:00",
+              "--character-set-server=utf8mb4",
+              "--collation-server=utf8mb4_unicode_ci"]
     ports:
-      - "${DB_PORT:-5432}:5432"
+      - "${DB_PORT:-3306}:3306"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - dbdata:/var/lib/mysql
+      # 최초 기동 시 스키마 자동 적용
+      - ./apps/backend/src/config/schema.mariadb.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
     healthcheck:
-      test:     ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-skbs_it_report}"]
+      test:     ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       interval: 5s
       timeout:  3s
       retries:  10
@@ -54,4 +61,4 @@ services:
       - "3000:80"
 
 volumes:
-  pgdata:
+  dbdata:

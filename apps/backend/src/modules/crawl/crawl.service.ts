@@ -192,16 +192,15 @@ export async function takeScreenshotJob(params: {
     await client.query(
       `INSERT INTO report_jobs (id, division_id, status, started_at, created_by)
        VALUES ($1, $2, 'RUNNING', NOW(), $3)
-       ON CONFLICT (id) DO UPDATE
-         SET status = 'RUNNING', updated_at = NOW()`,
+       ON DUPLICATE KEY UPDATE status = 'RUNNING', updated_at = NOW()`,
       [jobId, divisionId, userId]
     );
 
     const { rows } = await client.query<{ id: string }>(
       `INSERT INTO crawl_tasks (report_job_id, system_name, task_type, status)
        VALUES ($1, $2, 'SCREENSHOT', 'PENDING')
-       ON CONFLICT (report_job_id, system_name) DO UPDATE
-         SET task_type = 'SCREENSHOT', status = 'PENDING', updated_at = NOW()
+       ON DUPLICATE KEY UPDATE
+         task_type = 'SCREENSHOT', status = 'PENDING', updated_at = NOW()
        RETURNING id`,
       [jobId, systemName]
     );
@@ -319,15 +318,14 @@ export async function startGcpActivityExport(params: {
   await query(
     `INSERT INTO report_jobs (id, division_id, status, started_at, created_by)
      VALUES ($1, $2, 'RUNNING', NOW(), $3)
-     ON CONFLICT (id) DO UPDATE SET status = 'RUNNING', updated_at = NOW()`,
+     ON DUPLICATE KEY UPDATE status = 'RUNNING', updated_at = NOW()`,
     [jobId, divisionId, userId]
   );
 
   const crawlTaskResult = await query<{ id: string }>(
     `INSERT INTO crawl_tasks (report_job_id, system_name, task_type, status)
      VALUES ($1, $2, 'DOWNLOAD', 'PENDING')
-     ON CONFLICT (report_job_id, system_name) DO UPDATE
-       SET task_type = 'DOWNLOAD', status = 'PENDING', updated_at = NOW()
+     ON DUPLICATE KEY UPDATE task_type = 'DOWNLOAD', status = 'PENDING', updated_at = NOW()
      RETURNING id`,
     [jobId, GCP_ACTIVITY_SYSTEM]
   );
@@ -381,7 +379,7 @@ async function runGcpActivityInBackground(jobId: string, taskId: string): Promis
           await query(
             `UPDATE uploaded_files
              SET stored_path = $1, file_type = $2, file_size = $3,
-                 analysis_result = '{}'::jsonb, created_at = NOW()
+                 analysis_result = '{}', created_at = NOW()
              WHERE id = $4`,
             [resultPath, mime, fileSize, existing[0].id]
           );
@@ -449,15 +447,14 @@ export async function startGcpDataCollection(params: {
   await query(
     `INSERT INTO report_jobs (id, division_id, status, started_at, created_by)
      VALUES ($1, $2, 'RUNNING', NOW(), $3)
-     ON CONFLICT (id) DO UPDATE SET status = 'RUNNING', updated_at = NOW()`,
+     ON DUPLICATE KEY UPDATE status = 'RUNNING', updated_at = NOW()`,
     [jobId, divRows[0].id, userId]
   );
 
   const taskRows = await query<{ id: string }>(
     `INSERT INTO crawl_tasks (report_job_id, system_name, task_type, status)
      VALUES ($1, $2, 'DOWNLOAD', 'PENDING')
-     ON CONFLICT (report_job_id, system_name) DO UPDATE
-       SET task_type = 'DOWNLOAD', status = 'PENDING', updated_at = NOW()
+     ON DUPLICATE KEY UPDATE task_type = 'DOWNLOAD', status = 'PENDING', updated_at = NOW()
      RETURNING id`,
     [jobId, GCP_DATA_SYSTEM]
   );
@@ -482,7 +479,7 @@ async function registerGcpNamedFile(jobId: string, file: string): Promise<void> 
   if (existing.length) {
     await query(
       `UPDATE uploaded_files
-       SET stored_path = $1, file_type = $2, file_size = $3, analysis_result = '{}'::jsonb, created_at = NOW()
+       SET stored_path = $1, file_type = $2, file_size = $3, analysis_result = '{}', created_at = NOW()
        WHERE id = $4`,
       [filePath, GCP_XLSX_MIME, fileSize, existing[0].id]
     );
@@ -574,15 +571,14 @@ export async function startLhouseDataCollection(params: {
   await query(
     `INSERT INTO report_jobs (id, division_id, status, started_at, created_by)
      VALUES ($1, $2, 'RUNNING', NOW(), $3)
-     ON CONFLICT (id) DO UPDATE SET status = 'RUNNING', updated_at = NOW()`,
+     ON DUPLICATE KEY UPDATE status = 'RUNNING', updated_at = NOW()`,
     [jobId, divRows[0].id, userId]
   );
 
   const taskRows = await query<{ id: string }>(
     `INSERT INTO crawl_tasks (report_job_id, system_name, task_type, status)
      VALUES ($1, $2, 'DOWNLOAD', 'PENDING')
-     ON CONFLICT (report_job_id, system_name) DO UPDATE
-       SET task_type = 'DOWNLOAD', status = 'PENDING', updated_at = NOW()
+     ON DUPLICATE KEY UPDATE task_type = 'DOWNLOAD', status = 'PENDING', updated_at = NOW()
      RETURNING id`,
     [jobId, LHOUSE_DATA_SYSTEM]
   );
@@ -608,7 +604,7 @@ async function registerLhouseNamedFile(jobId: string, file: string): Promise<voi
   if (existing.length) {
     await query(
       `UPDATE uploaded_files
-       SET stored_path = $1, file_type = $2, file_size = $3, analysis_result = '{}'::jsonb, created_at = NOW()
+       SET stored_path = $1, file_type = $2, file_size = $3, analysis_result = '{}', created_at = NOW()
        WHERE id = $4`,
       [filePath, mime, fileSize, existing[0].id]
     );
@@ -703,15 +699,14 @@ export async function startBioDataCollection(params: {
   await query(
     `INSERT INTO report_jobs (id, division_id, status, started_at, created_by)
      VALUES ($1, $2, 'RUNNING', NOW(), $3)
-     ON CONFLICT (id) DO UPDATE SET status = 'RUNNING', updated_at = NOW()`,
+     ON DUPLICATE KEY UPDATE status = 'RUNNING', updated_at = NOW()`,
     [jobId, divRows[0].id, userId]
   );
 
   const taskRows = await query<{ id: string }>(
     `INSERT INTO crawl_tasks (report_job_id, system_name, task_type, status)
      VALUES ($1, $2, 'DOWNLOAD', 'PENDING')
-     ON CONFLICT (report_job_id, system_name) DO UPDATE
-       SET task_type = 'DOWNLOAD', status = 'PENDING', updated_at = NOW()
+     ON DUPLICATE KEY UPDATE task_type = 'DOWNLOAD', status = 'PENDING', updated_at = NOW()
      RETURNING id`,
     [jobId, BIO_DATA_SYSTEM]
   );
@@ -737,7 +732,7 @@ async function registerBioNamedFile(jobId: string, file: string): Promise<void> 
   if (existing.length) {
     await query(
       `UPDATE uploaded_files
-       SET stored_path = $1, file_type = $2, file_size = $3, analysis_result = '{}'::jsonb, created_at = NOW()
+       SET stored_path = $1, file_type = $2, file_size = $3, analysis_result = '{}', created_at = NOW()
        WHERE id = $4`,
       [filePath, mime, fileSize, existing[0].id]
     );
@@ -820,15 +815,14 @@ export async function runBioCollectAwait(params: {
   await query(
     `INSERT INTO report_jobs (id, division_id, status, started_at, created_by)
      VALUES ($1, $2, 'RUNNING', NOW(), $3)
-     ON CONFLICT (id) DO UPDATE SET status = 'RUNNING', updated_at = NOW()`,
+     ON DUPLICATE KEY UPDATE status = 'RUNNING', updated_at = NOW()`,
     [jobId, divRows[0].id, userId]
   );
 
   const taskRows = await query<{ id: string }>(
     `INSERT INTO crawl_tasks (report_job_id, system_name, task_type, status)
      VALUES ($1, $2, 'DOWNLOAD', 'PENDING')
-     ON CONFLICT (report_job_id, system_name) DO UPDATE
-       SET task_type = 'DOWNLOAD', status = 'PENDING', updated_at = NOW()
+     ON DUPLICATE KEY UPDATE task_type = 'DOWNLOAD', status = 'PENDING', updated_at = NOW()
      RETURNING id`,
     [jobId, BIO_DATA_SYSTEM]
   );
@@ -861,15 +855,14 @@ export async function startMedcommsDataCollection(params: {
   await query(
     `INSERT INTO report_jobs (id, division_id, status, started_at, created_by)
      VALUES ($1, $2, 'RUNNING', NOW(), $3)
-     ON CONFLICT (id) DO UPDATE SET status = 'RUNNING', updated_at = NOW()`,
+     ON DUPLICATE KEY UPDATE status = 'RUNNING', updated_at = NOW()`,
     [jobId, divRows[0].id, userId]
   );
 
   const taskRows = await query<{ id: string }>(
     `INSERT INTO crawl_tasks (report_job_id, system_name, task_type, status)
      VALUES ($1, $2, 'DOWNLOAD', 'PENDING')
-     ON CONFLICT (report_job_id, system_name) DO UPDATE
-       SET task_type = 'DOWNLOAD', status = 'PENDING', updated_at = NOW()
+     ON DUPLICATE KEY UPDATE task_type = 'DOWNLOAD', status = 'PENDING', updated_at = NOW()
      RETURNING id`,
     [jobId, MEDCOMMS_DATA_SYSTEM]
   );
@@ -954,15 +947,14 @@ export async function startCtmsDataCollection(params: {
   await query(
     `INSERT INTO report_jobs (id, division_id, status, started_at, created_by)
      VALUES ($1, $2, 'RUNNING', NOW(), $3)
-     ON CONFLICT (id) DO UPDATE SET status = 'RUNNING', updated_at = NOW()`,
+     ON DUPLICATE KEY UPDATE status = 'RUNNING', updated_at = NOW()`,
     [jobId, divRows[0].id, userId]
   );
 
   const taskRows = await query<{ id: string }>(
     `INSERT INTO crawl_tasks (report_job_id, system_name, task_type, status)
      VALUES ($1, $2, 'DOWNLOAD', 'PENDING')
-     ON CONFLICT (report_job_id, system_name) DO UPDATE
-       SET task_type = 'DOWNLOAD', status = 'PENDING', updated_at = NOW()
+     ON DUPLICATE KEY UPDATE task_type = 'DOWNLOAD', status = 'PENDING', updated_at = NOW()
      RETURNING id`,
     [jobId, CTMS_DATA_SYSTEM]
   );
@@ -1043,7 +1035,7 @@ async function prepareDevCollectAll(jobId: string, userId: string): Promise<Reco
   await query(
     `INSERT INTO report_jobs (id, division_id, status, started_at, created_by)
      VALUES ($1, $2, 'RUNNING', NOW(), $3)
-     ON CONFLICT (id) DO UPDATE SET status = 'RUNNING', updated_at = NOW()`,
+     ON DUPLICATE KEY UPDATE status = 'RUNNING', updated_at = NOW()`,
     [jobId, divRows[0].id, userId]
   );
 
@@ -1052,8 +1044,8 @@ async function prepareDevCollectAll(jobId: string, userId: string): Promise<Reco
     const rows = await query<{ id: string }>(
       `INSERT INTO crawl_tasks (report_job_id, system_name, task_type, status)
        VALUES ($1, $2, 'DOWNLOAD', 'PENDING')
-       ON CONFLICT (report_job_id, system_name) DO UPDATE
-         SET task_type = 'DOWNLOAD', status = 'PENDING', updated_at = NOW()
+       ON DUPLICATE KEY UPDATE
+         task_type = 'DOWNLOAD', status = 'PENDING', updated_at = NOW()
        RETURNING id`,
       [jobId, system]
     );
@@ -1153,7 +1145,7 @@ async function prepareLhouseCollectAll(jobId: string, userId: string): Promise<R
   await query(
     `INSERT INTO report_jobs (id, division_id, status, started_at, created_by)
      VALUES ($1, $2, 'RUNNING', NOW(), $3)
-     ON CONFLICT (id) DO UPDATE SET status = 'RUNNING', updated_at = NOW()`,
+     ON DUPLICATE KEY UPDATE status = 'RUNNING', updated_at = NOW()`,
     [jobId, divRows[0].id, userId]
   );
 
@@ -1162,8 +1154,8 @@ async function prepareLhouseCollectAll(jobId: string, userId: string): Promise<R
     const rows = await query<{ id: string }>(
       `INSERT INTO crawl_tasks (report_job_id, system_name, task_type, status)
        VALUES ($1, $2, 'DOWNLOAD', 'PENDING')
-       ON CONFLICT (report_job_id, system_name) DO UPDATE
-         SET task_type = 'DOWNLOAD', status = 'PENDING', updated_at = NOW()
+       ON DUPLICATE KEY UPDATE
+         task_type = 'DOWNLOAD', status = 'PENDING', updated_at = NOW()
        RETURNING id`,
       [jobId, system]
     );
@@ -1261,7 +1253,7 @@ async function runLhouseVeevaCrawl(jobId: string, taskId: string): Promise<boole
           await query(
             `UPDATE uploaded_files
              SET stored_path = $1, file_type = $2, file_size = $3,
-                 analysis_result = '{}'::jsonb, created_at = NOW()
+                 analysis_result = '{}', created_at = NOW()
              WHERE id = $4`,
             [resultPath, GCP_XLSX_MIME, fileSize, existing[0].id]
           );
@@ -1398,7 +1390,7 @@ async function runInBackground(
               await query(
                 `UPDATE uploaded_files
                  SET stored_path = $1, file_type = $2, file_size = $3,
-                     analysis_result = '{}'::jsonb, created_at = NOW()
+                     analysis_result = '{}', created_at = NOW()
                  WHERE id = $4`,
                 [resultPath, named.mime, fileSize, existing[0].id]
               );

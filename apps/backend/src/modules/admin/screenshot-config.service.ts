@@ -116,7 +116,7 @@ export async function saveScreenshotConfig(
 
   await query(
     `UPDATE divisions
-     SET system_configs = system_configs || jsonb_build_object('screenshotTargets', $1::jsonb)
+     SET system_configs = system_configs || jsonb_build_object('screenshotTargets', $1)
      WHERE id = $2`,
     [JSON.stringify(serialized), divisionId]
   );

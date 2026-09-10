@@ -45,8 +45,8 @@ adminRouter.get("/users", async (req: Request, res: Response, next: NextFunction
                 d.code AS division_code, d.name AS division_name
          FROM users u
          LEFT JOIN divisions d ON d.id = u.division_id
-         WHERE ($1::text IS NULL OR u.role::text = $1)
-           AND ($2::text IS NULL OR d.code::text = $2)
+         WHERE ($1 IS NULL OR u.role = $1)
+           AND ($2 IS NULL OR d.code = $2)
          ORDER BY u.created_at DESC
          LIMIT $3 OFFSET $4`,
         [role ?? null, division ?? null, limit, offset]
@@ -54,8 +54,8 @@ adminRouter.get("/users", async (req: Request, res: Response, next: NextFunction
       query<{ count: string }>(
         `SELECT COUNT(*) AS count FROM users u
          LEFT JOIN divisions d ON d.id = u.division_id
-         WHERE ($1::text IS NULL OR u.role::text = $1)
-           AND ($2::text IS NULL OR d.code::text = $2)`,
+         WHERE ($1 IS NULL OR u.role = $1)
+           AND ($2 IS NULL OR d.code = $2)`,
         [role ?? null, division ?? null]
       ),
     ]);
@@ -273,7 +273,7 @@ adminRouter.patch("/divisions/:divisionId/config", async (req: Request, res: Res
 
     await query(
       `UPDATE divisions
-       SET system_configs = system_configs || jsonb_build_object('systems', $1::jsonb)
+       SET system_configs = system_configs || jsonb_build_object('systems', $1)
        WHERE id = $2`,
       [JSON.stringify(updated), divisionId]
     );

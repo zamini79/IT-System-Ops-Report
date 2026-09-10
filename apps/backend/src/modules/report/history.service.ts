@@ -103,12 +103,11 @@ export async function saveReportToHistory(params: {
     `INSERT INTO saved_reports
        (division_code, report_type, year, month, source_job_id, filename, stored_path, file_size, saved_by)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-     ON CONFLICT (division_code, report_type, year, month) DO UPDATE
-       SET source_job_id = EXCLUDED.source_job_id,
-           filename      = EXCLUDED.filename,
-           stored_path   = EXCLUDED.stored_path,
-           file_size     = EXCLUDED.file_size,
-           saved_by      = EXCLUDED.saved_by,
+     ON DUPLICATE KEY UPDATE source_job_id = VALUES(source_job_id),
+           filename      = VALUES(filename),
+           stored_path   = VALUES(stored_path),
+           file_size     = VALUES(file_size),
+           saved_by      = VALUES(saved_by),
            saved_at      = NOW()
      RETURNING *`,
     [divisionCode, reportType, year, month, sourceJobId ?? null, filename, destPath, fileSize, userId]

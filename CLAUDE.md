@@ -78,10 +78,24 @@ cp .env.example .env
 
 ## Database
 
-PostgreSQL 연결은 `apps/backend/src/config/db.ts`의 `pool`. 스키마 초기화:
+MariaDB 연결은 `apps/backend/src/config/db.ts`의 `pool` (드라이버 `mysql2/promise`). 스키마 초기화:
 ```bash
-psql -U postgres -d skbs_it_report -f apps/backend/src/config/schema.sql
+mariadb -e "CREATE DATABASE skbs_it_report CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+mariadb skbs_it_report < apps/backend/src/config/schema.mariadb.sql
 ```
+
+**시각 처리 규칙** — MariaDB 에는 `TIMESTAMPTZ` 가 없다. 모든 DATETIME 컬럼에 **UTC 만**
+저장하고, 커넥션마다 `SET time_zone='+00:00'` 을 걸어 `NOW()`/기본값도 UTC 가 되게 한다
+(`config/db.ts`). KST 변환은 애플리케이션(`kstDateString`)이 담당한다. 이 규칙을 어기면
+새벽 자동 수집의 날짜 경계가 어긋나 스냅샷이 엉뚱한 날짜로 저장된다.
+
+**쿼리 작성** — SQL 은 `$1` 스타일 플레이스홀더를 그대로 쓴다. `query()` 헬퍼가
+`?` 로 바꾸고 파라미터를 재배열한다(`toMariaPlaceholders`). MariaDB 는
+`UPDATE … RETURNING` 을 지원하지 않으므로 UPDATE 후 SELECT 로 나눈다.
+`trigger` 는 예약어이므로 SQL 안에서 백틱으로 인용한다.
+
+구 PostgreSQL 스키마는 `config/schema.sql` 에 이관 참고용으로 남겨 두었다.
+Postgres → MariaDB 데이터 이관은 `src/scripts/migrate-pg-to-mariadb.ts`.
 
 Docker로 DB만 띄울 경우:
 ```bash
@@ -94,4 +108,4 @@ docker compose up db -d
 ```bash
 docker compose up --build
 ```
-프론트는 nginx(포트 3000), 백엔드는 4000, DB는 5432.
+프론트는 nginx(포트 3000), 백엔드는 4000, DB는 3306.
