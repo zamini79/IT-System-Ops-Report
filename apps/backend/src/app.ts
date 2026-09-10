@@ -24,6 +24,14 @@ const app: Application = express();
 app.use(helmet());
 
 
+// ── Health check ───────────────────────────────────────────────────────────────
+// 어떤 미들웨어보다 먼저 등록한다. ALB/ECS 헬스체크가 CORS·helmet 에 걸려
+// 실패하면 태스크가 unhealthy 로 계속 교체된다.
+app.get("/health", (_req: Request, res: Response) => {
+  res.json({ status: "ok", timestamp: new Date().toISOString() });
+});
+
+
 // ── CORS ───────────────────────────────────────────────────────────────────────
 const allowedOrigins = (process.env.CORS_ORIGIN ?? "http://localhost:5173")
   .split(",")
@@ -41,8 +49,16 @@ const isAllowedOrigin = (origin: string | undefined): boolean => {
 app.use(
   cors({
     origin: (origin, callback) => {
-      // curl / Postman 등 origin 없는 요청은 개발 환경에서만 허용
-      if (!origin && process.env.NODE_ENV !== "production") return callback(null, true);
+      // Origin 헤더가 없는 요청은 허용한다.
+      //   CORS 는 브라우저의 교차 출처 요청을 막는 장치다. Origin 이 없는 요청은
+      //   애초에 교차 출처 브라우저 요청이 아니므로 막아도 얻는 보안 이득이 없고,
+      //   대신 아래가 전부 깨진다:
+      //     · ALB/ECS 헬스체크 (Origin 을 보내지 않음) → 태스크가 계속 재시작
+      //     · nginx 가 /api 를 같은 출처로 프록시하는 구성에서 브라우저 GET
+      //       (같은 출처 요청은 Origin 을 붙이지 않는다) → 앱 전체가 동작 불가
+      //     · 서버 간 호출 / curl / 모니터링
+      //   인증은 JWT 가, CSRF 는 쿠키의 SameSite 가 담당한다.
+      if (!origin) return callback(null, true);
       if (isAllowedOrigin(origin)) return callback(null, true);
       callback(new Error(`CORS: origin '${origin}' not allowed`));
     },
@@ -81,12 +97,6 @@ const outputDir = path.resolve(process.env.OUTPUT_DIR ?? "outputs");
 
 app.use("/uploads", express.static(uploadDir));
 app.use("/outputs", express.static(outputDir));
-
-
-// ── Health check ───────────────────────────────────────────────────────────────
-app.get("/health", (_req: Request, res: Response) => {
-  res.json({ status: "ok", timestamp: new Date().toISOString() });
-});
 
 
 // ── API 라우터 ─────────────────────────────────────────────────────────────────

@@ -28,12 +28,15 @@ const q = (c: string) => "`" + c + "`";   // trigger 등 예약어 대응
 
 (async () => {
   const pg = new Pool({ connectionString: PG_URL });
-  const my = await mysql.createConnection({
-    socketPath: process.env.DB_SOCKET ?? "/tmp/mysql.sock",
-    user:       process.env.DB_USER   ?? process.env.USER,
-    database:   process.env.DB_NAME   ?? "skbs_it_report_my",
-    timezone:   "Z", multipleStatements: false,
-  });
+  // 대상 MariaDB: MARIA_URL 이 있으면 TCP(컨테이너·RDS), 없으면 로컬 소켓
+  const my = process.env.MARIA_URL
+    ? await mysql.createConnection({ uri: process.env.MARIA_URL, timezone: "Z" })
+    : await mysql.createConnection({
+        socketPath: process.env.DB_SOCKET ?? "/tmp/mysql.sock",
+        user:       process.env.DB_USER   ?? process.env.USER,
+        database:   process.env.DB_NAME   ?? "skbs_it_report_my",
+        timezone:   "Z", multipleStatements: false,
+      });
   await my.query("SET time_zone='+00:00'");
   await my.query("SET FOREIGN_KEY_CHECKS=0");
 

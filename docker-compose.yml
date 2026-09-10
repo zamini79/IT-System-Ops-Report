@@ -19,7 +19,10 @@ services:
               "--character-set-server=utf8mb4",
               "--collation-server=utf8mb4_unicode_ci"]
     ports:
-      - "${DB_PORT:-3306}:3306"
+      # 호스트 3306 은 로컬 MariaDB/MySQL 이 이미 점유하는 경우가 많다.
+      # 점유되어 있으면 이 매핑이 조용히 가려져 엉뚱한 DB 에 붙게 되므로
+      # 기본을 3307 로 둔다. (컨테이너 사이 통신은 db:3306 이라 영향 없음)
+      - "${DB_PORT:-3307}:3306"
     volumes:
       - dbdata:/var/lib/mysql
       # 최초 기동 시 스키마 자동 적용
@@ -41,13 +44,33 @@ services:
         condition: service_healthy   # 마이그레이션이 DB 기동보다 먼저 돌지 않도록
     env_file:
       - .env
+    # ⚠️ env_file 은 이미지의 ENV 를 덮어쓴다. 아래 environment 가 최우선이므로
+    #    컨테이너에서만 달라야 하는 값은 반드시 여기에 둔다.
+    environment:
+      # .env 의 NODE_ENV=development 가 이미지의 ENV NODE_ENV=production 을 덮어써
+      # 프로덕션 이미지가 development 로 도는 문제가 있었다. 여기서 되돌린다.
+      #   (평문 http 로 로컬 테스트할 때는 리프레시 쿠키의 Secure 플래그 때문에
+      #    세션 갱신이 안 될 수 있다. 그때만 이 줄을 잠시 주석 처리한다)
+      NODE_ENV: production
+      # 컨테이너에서는 호스트의 유닉스 소켓에 닿을 수 없으므로 TCP 로 db 에 붙는다.
+      # (config/db.ts 는 DATABASE_URL 이 있으면 그것을 우선한다)
+      DATABASE_URL: mysql://${DB_USER:-skbs}:${DB_PASSWORD:-skbs}@db:3306/${DB_NAME:-skbs_it_report}
+      UPLOAD_DIR: /app/uploads
+      # nginx 가 서비스하는 출처. 같은 출처 프록시라 대부분의 요청에는 Origin 이
+      # 붙지 않지만, 붙는 요청(POST 등)도 통과해야 한다.
+      #   `${VAR:-기본값}` 는 .env 값으로 보간되므로(compose 가 .env 를 먼저 읽는다)
+      #   .env 의 개발용 5173 이 그대로 들어온다. 컨테이너가 실제로 서비스하는
+      #   출처를 **항상 덧붙여** 두어야 한다. 운영 도메인은 PUBLIC_ORIGIN 으로 추가.
+      CORS_ORIGIN: http://localhost:3000,http://127.0.0.1:3000${PUBLIC_ORIGIN:+,${PUBLIC_ORIGIN}}
     ports:
       - "${PORT:-4000}:4000"
     volumes:
       # 수집한 엑셀·캡처가 재시작 후에도 남아야 한다. 대시보드는 이 파일들을
       # 다시 읽어 스냅샷을 만들므로, 유실되면 다음 수집 전까지 값이 빈다.
-      - ./apps/backend/uploads:/app/uploads
-      - ./apps/backend/outputs:/app/outputs
+      #   리포지토리 루트의 uploads/ 가 실제 수집 산출물 위치다
+      #   (UPLOAD_DIR 이 상대경로여서 루트에서 실행할 때 여기에 쌓였다)
+      - ./uploads:/app/uploads
+      - ./outputs:/app/outputs
 
   frontend:
     build:
