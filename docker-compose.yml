@@ -62,6 +62,13 @@ services:
       #   .env 의 개발용 5173 이 그대로 들어온다. 컨테이너가 실제로 서비스하는
       #   출처를 **항상 덧붙여** 두어야 한다. 운영 도메인은 PUBLIC_ORIGIN 으로 추가.
       CORS_ORIGIN: http://localhost:3000,http://127.0.0.1:3000${PUBLIC_ORIGIN:+,${PUBLIC_ORIGIN}}
+      # ⚠️ 리프레시 쿠키 플래그 — 평문 http 기준 기본값이다.
+      #    HTTPS(ALB·리버스프록시 TLS)로 서비스하면 반드시 COOKIE_SECURE=true 로 올린다.
+      #    Secure 쿠키를 평문 http 로 내려보내면 브라우저가 조용히 버려서
+      #    로그인은 된 것처럼 보이다가 세션 갱신이 401 로 실패한다.
+      #    프론트와 API 가 다른 사이트인 배포에서만 COOKIE_SAMESITE=none.
+      COOKIE_SECURE:   ${COOKIE_SECURE:-false}
+      COOKIE_SAMESITE: ${COOKIE_SAMESITE:-lax}
     ports:
       - "${PORT:-4000}:4000"
     volumes:

@@ -6,12 +6,36 @@ import type { AccessPayload, AuthRequest, DivisionCode } from "./auth.types";
 export const REFRESH_COOKIE = "skbs_rt";
 
 // Refresh Token 쿠키 공통 옵션
+//
+// ── 왜 NODE_ENV 에 직결하지 않는가 ────────────────────────────────────────────
+//  예전에는 `secure: isProd`, `sameSite: isProd ? "none" : "strict"` 였다.
+//  프론트(Vercel)와 백엔드(Railway)가 **다른 도메인**인 구성을 전제한 값이다.
+//  그런데 쿠키 플래그를 결정하는 것은 배포 모드가 아니라 두 가지 사실이다:
+//    · HTTPS 로 서비스하는가            → Secure
+//    · 프론트와 API 가 다른 사이트인가  → SameSite=None
+//  nginx 가 /api 를 같은 출처로 프록시하는 구성(ECS·온프레미스)에서는
+//  SameSite=Lax 로 충분하고 None 보다 안전하다. 또 평문 http 로 띄우면
+//  Secure 쿠키는 브라우저가 조용히 버려서 로그인이 되는 것처럼 보이다가
+//  세션 갱신이 401 로 실패한다(실제로 로컬 컨테이너에서 겪었다).
+//  그래서 두 값을 각각 환경변수로 분리한다.
+//
+//  COOKIE_SECURE    기본값: 프로덕션이면 true. 평문 http 로 띄울 때만 false
+//  COOKIE_SAMESITE  기본값: lax(같은 출처). 프론트/API 가 다른 사이트면 none
 const isProd = process.env.NODE_ENV === "production";
+
+const sameSiteEnv = (process.env.COOKIE_SAMESITE ?? (isProd ? "lax" : "strict"))
+  .toLowerCase() as "none" | "lax" | "strict";
+
+// SameSite=None 은 Secure 없이는 브라우저가 거부하므로 함께 강제한다.
+const secure =
+  sameSiteEnv === "none" ? true
+  : process.env.COOKIE_SECURE !== undefined ? process.env.COOKIE_SECURE === "true"
+  : isProd;
+
 export const refreshCookieOptions = {
   httpOnly: true,
-  secure:   isProd,
-  // 프론트(Vercel)와 백엔드(Railway)가 다른 도메인 → 프로덕션에서 none 필요
-  sameSite: (isProd ? "none" : "strict") as "none" | "strict",
+  secure,
+  sameSite: sameSiteEnv,
   maxAge:   7 * 24 * 60 * 60 * 1000,   // 7일 (ms)
   path:     "/api/auth",                 // refresh·logout 엔드포인트에만 전송
 };
