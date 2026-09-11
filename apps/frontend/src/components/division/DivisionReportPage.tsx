@@ -1624,6 +1624,13 @@ function InfoRow({ label, children }: { label: string; children: ReactNode }) {
 // 메인 컴포넌트
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** 본부 → /report/generate-async 의 variant */
+const PDF_VARIANT: Record<"BIO" | "DEV" | "LHOUSE", string> = {
+  DEV:    "dev",
+  LHOUSE: "lhouse",
+  BIO:    "bio",
+};
+
 export function DivisionReportPage({
   divisionCode,
   divisionName,
@@ -1656,12 +1663,24 @@ export function DivisionReportPage({
   //  이제 Routes 밖의 JobProgressProvider 가 구독을 유지하므로, 화면을 옮겨도
   //  수집이 계속되고 복귀 시 로그가 그대로 보인다.
   const systemCodes = systems.map((s) => s.code);
-  const { run, sse, localLogs, addLocalLog, startRun, endRun } = useJobProgress();
+  const { run, sse, localLogs, addLocalLog, startRun, endRun, watch } = useJobProgress();
 
-  // 이 페이지의 작업이 진행 중인가 — run 에서 파생하므로 이동·새로고침에도 유지된다.
-  const runningHere = run?.jobId === jobId && sse.phase !== "done" && sse.phase !== "error";
-  const collecting  = runningHere && run?.kind === "collect";
-  const crawlActive = runningHere && run?.kind === "crawl";
+  // 이 화면의 작업공간 스트림을 **항상** 구독한다.
+  //   jobId 가 본부별로 고정이라 버튼을 누른 브라우저가 아니어도 같은 스트림에
+  //   붙을 수 있다. 덕분에 새벽 자동 수집이나 다른 사람이 시작한 작업의 로그도
+  //   그대로 흐른다. 서버가 이력을 30분 보관하므로 늦게 접속해도 처음부터 보인다.
+  useEffect(() => {
+    watch({ jobId, divisionCode, systemCodes });
+  }, [jobId, divisionCode, systemCodes.join(","), watch]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // 진행 중 판정 — 내 브라우저의 실행 기록(run)이 없어도 **서버 이벤트**로 알 수 있다.
+  //   원클릭 수집은 all_done 을 발행하지 않으므로(재실행 시 replay 로 옛 실패가
+  //   되살아나는 문제 때문) phase 만으로는 부족하다. 태스크 상태를 함께 본다.
+  const anyTaskRunning = Object.values(sse.taskMap).some((t) => t.status === "RUNNING");
+  const startedHere    = run?.jobId === jobId && sse.phase !== "done" && sse.phase !== "error";
+  const runningHere    = startedHere || anyTaskRunning;
+  const collecting     = runningHere && (run?.kind === "collect" || (!run && anyTaskRunning));
+  const crawlActive    = startedHere && run?.kind === "crawl";
 
   // 본부별 플래그 — divisionCode 는 페이지마다 고정이라 동시에 참이 되지 않는다.
   const devCollecting    = divisionCode === "DEV"    && collecting;
@@ -1949,24 +1968,14 @@ export function DivisionReportPage({
     }
 
     // 2개 모두 완료 → PDF 생성 + 다운로드
-    void (async () => {
-      addLocalLog("보고서", "수집 완료 — PDF 보고서 생성 시작…", "success");
-      try {
-        const { y, m } = prevMonth();
-        const filename = `${y}.${String(m).padStart(2, "0")} L HOUSE Veeva System Report.pdf`;
-        await startPdfBackground("lhouse");
-        addLocalLog("보고서", `${filename} 생성 중 — 다른 메뉴로 이동해도 계속됩니다.`, "info");
-      } catch (err: unknown) {
-        const msg =
-          (err as { response?: { data?: { error?: string } } })
-            ?.response?.data?.error ?? "보고서 생성에 실패했습니다.";
-        toastError(msg);
-        addLocalLog("보고서", `PDF 생성 실패: ${msg}`, "error");
-      } finally {
-        setLhouseGenerating(false);
-        void refetchLhouseFiles();
-      }
-    })();
+    // 수집만 끝낸다. **PDF 생성은 여기서 자동으로 하지 않는다.**
+    //   PDF 에는 Systemusage 이미지·Timesheet 처럼 사람이 올려야 하는 입력이
+    //   섞여 있어, 수집 직후 자동 생성하면 그 항목이 빈 채로 나온다.
+    //   업로드를 마친 뒤 사용자가 "PDF 생성" 을 누르는 시점에 만든다.
+    success("데이터 수집이 완료되었습니다. 업로드 항목을 확인한 뒤 PDF 를 생성하세요.");
+    addLocalLog("보고서", "데이터 수집 완료 — 업로드 확인 후 PDF 생성", "success");
+    setLhouseGenerating(false);
+    void refetchLhouseFiles();
   }, [lhouseCollecting, sse.taskMap, addLocalLog, success, toastError, refetchLhouseFiles]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── DEV 전용: 보고서 생성 (직접 다운로드) ────────────────────────────────────
@@ -2023,24 +2032,14 @@ export function DivisionReportPage({
     }
 
     // 4개 모두 완료 → PDF 생성 + 다운로드
-    void (async () => {
-      addLocalLog("보고서", "수집 완료 — PDF 보고서 생성 시작…", "success");
-      try {
-        const { y, m } = prevMonth();
-        const filename = `${y}.${String(m).padStart(2, "0")} 개발본부 시스템 운영 현황 Report.pdf`;
-        await startPdfBackground("dev");
-        addLocalLog("보고서", `${filename} 생성 중 — 다른 메뉴로 이동해도 계속됩니다.`, "info");
-      } catch (err: unknown) {
-        const msg =
-          (err as { response?: { data?: { error?: string } } })
-            ?.response?.data?.error ?? "보고서 생성에 실패했습니다.";
-        toastError(msg);
-        addLocalLog("보고서", `PDF 생성 실패: ${msg}`, "error");
-      } finally {
-        setDevGenerating(false);
-        void refetchDevFiles();
-      }
-    })();
+    // 수집만 끝낸다. **PDF 생성은 여기서 자동으로 하지 않는다.**
+    //   PDF 에는 Systemusage 이미지·Timesheet 처럼 사람이 올려야 하는 입력이
+    //   섞여 있어, 수집 직후 자동 생성하면 그 항목이 빈 채로 나온다.
+    //   업로드를 마친 뒤 사용자가 "PDF 생성" 을 누르는 시점에 만든다.
+    success("데이터 수집이 완료되었습니다. 업로드 항목을 확인한 뒤 PDF 를 생성하세요.");
+    addLocalLog("보고서", "데이터 수집 완료 — 업로드 확인 후 PDF 생성", "success");
+    setDevGenerating(false);
+    void refetchDevFiles();
   }, [devCollecting, sse.phase, sse.taskMap, addLocalLog, success, toastError, refetchDevFiles]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── BIO 연구본부 Veeva System 전용: 보고서 생성 (직접 다운로드) ─────────────────
@@ -2090,24 +2089,14 @@ export function DivisionReportPage({
     }
 
     // 수집 완료 → PDF 생성 + 다운로드
-    void (async () => {
-      addLocalLog("보고서", "수집 완료 — PDF 보고서 생성 시작…", "success");
-      try {
-        const { y, m } = prevMonth();
-        const filename = `${y}.${String(m).padStart(2, "0")} Bio연구본부 Veeva System Report.pdf`;
-        await startPdfBackground("bio");
-        addLocalLog("보고서", `${filename} 생성 중 — 다른 메뉴로 이동해도 계속됩니다.`, "info");
-      } catch (err: unknown) {
-        const msg =
-          (err as { response?: { data?: { error?: string } } })
-            ?.response?.data?.error ?? "보고서 생성에 실패했습니다.";
-        toastError(msg);
-        addLocalLog("보고서", `PDF 생성 실패: ${msg}`, "error");
-      } finally {
-        setBioVeevaGenerating(false);
-        void refetchBioFiles();
-      }
-    })();
+    // 수집만 끝낸다. **PDF 생성은 여기서 자동으로 하지 않는다.**
+    //   PDF 에는 Systemusage 이미지·Timesheet 처럼 사람이 올려야 하는 입력이
+    //   섞여 있어, 수집 직후 자동 생성하면 그 항목이 빈 채로 나온다.
+    //   업로드를 마친 뒤 사용자가 "PDF 생성" 을 누르는 시점에 만든다.
+    success("데이터 수집이 완료되었습니다. 업로드 항목을 확인한 뒤 PDF 를 생성하세요.");
+    addLocalLog("보고서", "데이터 수집 완료 — 업로드 확인 후 PDF 생성", "success");
+    setBioVeevaGenerating(false);
+    void refetchBioFiles();
   }, [bioCollecting, sse.taskMap, addLocalLog, success, toastError, refetchBioFiles]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── 진행 현황 집계 ────────────────────────────────────────────────────────────
@@ -2117,7 +2106,10 @@ export function DivisionReportPage({
   const overallPct     = totalCount > 0 ? Math.round((completedCount / totalCount) * 100) : 0;
 
   const canStartCrawl  = !crawlActive && sse.phase === "idle" && !startCrawl.isPending;
-  const canGeneratePdf = sse.phase === "done" && !generatePdf.isPending;
+  // PDF 는 수집과 독립이다. 예전에는 `sse.phase === "done"` 을 요구했는데
+  // 원클릭 수집은 all_done 을 발행하지 않아(재실행 시 옛 이벤트 replay 방지)
+  // **버튼이 사실상 항상 비활성**이었다. 지금은 수집이 돌고 있지 않으면 누를 수 있다.
+  const canGeneratePdf = !runningHere;
 
   // 수집 미완료 시스템 목록 (PDF 생성 전 경고용)
   const unfinishedSystems = systems.filter((s) => {
@@ -2175,7 +2167,7 @@ export function DivisionReportPage({
                       d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                   </svg>
                 )}
-                {lhouseCollecting ? "수집 중…" : lhouseGenerating ? "생성 중…" : "보고서 생성"}
+                {lhouseCollecting ? "수집 중…" : lhouseGenerating ? "수집 중…" : "데이터 수집"}
               </button>
 
               <button
@@ -2217,7 +2209,7 @@ export function DivisionReportPage({
                       d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                   </svg>
                 )}
-                {devCollecting ? "수집 중…" : devGenerating ? "생성 중…" : "보고서 생성"}
+                {devCollecting ? "수집 중…" : devGenerating ? "수집 중…" : "데이터 수집"}
               </button>
 
               <button
@@ -2475,13 +2467,17 @@ export function DivisionReportPage({
             {/* PDF 생성 */}
             <button
               onClick={() => {
-                if (unfinishedSystems.length > 0) {
-                  toastError(
-                    `수집이 완료되지 않은 시스템이 있습니다: ${unfinishedSystems.map((s) => s.label).join(", ")}`
-                  );
-                  return;
-                }
-                generatePdf.mutate();
+                // 수집과 분리된 독립 동작. 작업공간(고정 jobId)에 쌓여 있는
+                // 수집물 + 업로드 파일로 즉시 만든다 — 이번 접속에서 수집을
+                // 하지 않았어도(새벽 자동 수집분) 그대로 생성할 수 있다.
+                void startPdfBackground(PDF_VARIANT[divisionCode]).catch((err: unknown) => {
+                  const msg =
+                    (err as { response?: { data?: { error?: string } } })
+                      ?.response?.data?.error ?? "보고서 생성에 실패했습니다.";
+                  toastError(msg);
+                  addLocalLog("보고서", `PDF 생성 실패: ${msg}`, "error");
+                });
+                addLocalLog("보고서", "PDF 생성 시작 — 다른 메뉴로 이동해도 계속됩니다.", "info");
               }}
               disabled={!canGeneratePdf}
               className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition-all

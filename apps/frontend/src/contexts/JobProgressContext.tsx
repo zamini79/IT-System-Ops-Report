@@ -59,6 +59,12 @@ type SseState = ReturnType<typeof useCrawlSSE>;
 interface JobProgressValue {
   /** 진행 중인 작업 (없으면 null) */
   run: ActiveRun | null;
+  /**
+   * 이 화면(jobId)의 스트림을 구독한다 — 진행 중 작업을 **내 브라우저에서
+   * 시작했는지와 무관하게** 로그를 받기 위한 것.
+   * 페이지 마운트 시 호출하면 서버 이력(30분)이 replay 되어 진행 상황이 채워진다.
+   */
+  watch: (w: { jobId: string; divisionCode: ActiveRun["divisionCode"]; systemCodes: string[] }) => void;
   /** SSE 상태 — 화면 전환과 무관하게 유지된다 */
   sse: SseState;
   /** 업로드·PDF 등 프론트에서 만든 로그 (SSE 로그와 합쳐 표시) */
@@ -77,9 +83,27 @@ const JobProgressContext = createContext<JobProgressValue | null>(null);
 export function JobProgressProvider({ children }: { children: ReactNode }) {
   const [run, setRun] = useState<ActiveRun | null>(() => loadRun());
   const [localLogs, setLocalLogs] = useState<LogEntry[]>([]);
+  /** 화면이 보고 있는 작업공간 (버튼을 누르지 않아도 구독한다) */
+  const [watched, setWatched] = useState<
+    { jobId: string; divisionCode: ActiveRun["divisionCode"]; systemCodes: string[] } | null
+  >(null);
 
-  // 구독은 Provider 에서 한 번만 — 어느 화면에 있어도 끊기지 않는다.
-  const sse = useCrawlSSE(run?.jobId ?? "", run?.systemCodes ?? [], !!run);
+  const watch = useCallback(
+    (w: { jobId: string; divisionCode: ActiveRun["divisionCode"]; systemCodes: string[] }) => {
+      setWatched((prev) =>
+        prev?.jobId === w.jobId && prev.systemCodes.join(",") === w.systemCodes.join(",")
+          ? prev : w
+      );
+    }, []
+  );
+
+  // 구독 대상: 시작한 작업이 있으면 그것, 없으면 화면이 보고 있는 작업공간.
+  //   jobId 가 본부별로 **고정**이므로 버튼을 누르지 않아도 같은 스트림에 붙을 수 있다.
+  //   그래서 새벽 자동 수집이나 **다른 사람/다른 브라우저가 시작한 작업**의 로그도
+  //   그대로 보인다. (예전에는 실행 기록이 localStorage 에만 있어, 버튼을 누른
+  //   브라우저에서만 로그가 흘렀다)
+  const target = run ?? watched;
+  const sse = useCrawlSSE(target?.jobId ?? "", target?.systemCodes ?? [], !!target);
 
   const startRun = useCallback((r: Omit<ActiveRun, "startedAt">) => {
     const next: ActiveRun = { ...r, startedAt: Date.now() };
@@ -120,8 +144,8 @@ export function JobProgressProvider({ children }: { children: ReactNode }) {
   );
 
   const value = useMemo<JobProgressValue>(
-    () => ({ run, sse, localLogs, addLocalLog, startRun, endRun, isRunning }),
-    [run, sse, localLogs, addLocalLog, startRun, endRun, isRunning]
+    () => ({ run, sse, localLogs, addLocalLog, startRun, endRun, isRunning, watch }),
+    [run, sse, localLogs, addLocalLog, startRun, endRun, isRunning, watch]
   );
 
   return <JobProgressContext.Provider value={value}>{children}</JobProgressContext.Provider>;
