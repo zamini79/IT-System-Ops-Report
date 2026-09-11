@@ -109,6 +109,16 @@ export const DASHBOARD_JOB_IDS: Record<DashboardDivisionCode, string> = {
   BIO:    "00000000-0000-4000-8000-000000000003",
 };
 
+/**
+ * 본부 공통 업로드(공유 Timesheet) 작업공간 jobId.
+ *
+ * Timesheet 은 세 본부가 같은 파일을 쓰므로 특정 본부 폴더에 두지 않는다.
+ * 서버는 이 파일을 jobId 가 아니라 `uploaded_files.original_name` 으로 조회하므로
+ * (대시보드·PDF 양쪽 동일) 실제 저장 위치는 자유롭지만, 브라우저마다 임의
+ * UUID 를 만들면 업로드 상태가 화면에서 보이지 않을 수 있어 고정한다.
+ */
+export const SHARED_UPLOAD_JOB_ID = "00000000-0000-4000-8000-000000000009";
+
 /** 단일 시리즈 (월별 막대 등) */
 export interface DashboardSeries {
   labels: string[];

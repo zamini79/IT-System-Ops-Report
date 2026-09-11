@@ -15,6 +15,7 @@ import path from "path";
 import { Router, Request, Response, NextFunction } from "express";
 import type { AuthRequest } from "../auth/auth.types";
 import { AppError }  from "../../utils/errors";
+import { startDivisionReport, type ReportVariant } from "./division-report.async";
 import { respond }   from "../../utils/response";
 import { logger }    from "../../utils/logger";
 import { jobEventBus } from "../crawl/crawl.events";
@@ -122,6 +123,37 @@ reportRouter.post(
 // POST /api/report/generate-dev
 // DEV 전용 PDF 생성 (동기, 직접 다운로드)
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// POST /api/report/generate-async   { jobId, variant }
+// 본부별 PDF 생성을 **백그라운드**로 시작하고 즉시 202 를 반환한다.
+//   동기 엔드포인트(/generate-dev 등)는 생성이 끝날 때까지 응답을 붙잡으므로,
+//   사용자가 도중에 다른 메뉴로 이동하면 브라우저가 요청을 취소해 **결과 PDF 가
+//   유실된다.** 이 경로는 진행·완료를 SSE(report_generating/report_done)로 알리고,
+//   완성된 파일은 기존 /report/:jobId/download 로 내려받는다.
+//   산출물은 동기 경로와 동일한 본부별 생성기를 그대로 쓴다.
+// ---------------------------------------------------------------------------
+reportRouter.post(
+  "/generate-async",
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { jobId, variant } = req.body as { jobId?: string; variant?: string };
+      if (!jobId)   throw new AppError(400, "jobId 는 필수입니다.");
+      if (!UUID_RE.test(jobId)) throw new AppError(400, "jobId 는 UUID 형식이어야 합니다.");
+      if (!variant) throw new AppError(400, "variant 는 필수입니다.");
+
+      startDivisionReport({ jobId, variant: variant as ReportVariant });
+
+      res.status(202).json({
+        success: true,
+        data:    { jobId, variant },
+        message: "보고서 생성이 시작되었습니다. SSE 스트림에서 진행 상태를 확인하세요.",
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
 reportRouter.post(
   "/generate-dev",
   async (req: Request, res: Response, next: NextFunction) => {

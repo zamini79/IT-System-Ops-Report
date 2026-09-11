@@ -22,8 +22,9 @@ import { useDropzone }                    from "react-dropzone";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { apiClient }                      from "../../api/client";
 import { useAuth }                        from "../../hooks/useAuth";
-import { useCrawlSSE }                    from "../../hooks/useCrawlSSE";
 import type { TaskState, LogEntry }       from "../../hooks/useCrawlSSE";
+import { DASHBOARD_JOB_IDS, SHARED_UPLOAD_JOB_ID } from "@skbs/shared";
+import { useJobProgress }                 from "../../contexts/JobProgressContext";
 import {
   AppLayout,
   StatusBadge,
@@ -634,7 +635,6 @@ function FileDropzonePanel({
  * 세 본부 공유 Timesheet 파일 슬롯 설정.
  * 로컬스토리지 키 "shared_timesheet_jobId" 로 관리하는 공유 jobId 와 함께 사용합니다.
  */
-const SHARED_TIMESHEET_JOB_KEY = "shared_timesheet_jobId";
 
 const TIMESHEET_SLOT: {
   slot:      string;
@@ -1232,13 +1232,12 @@ function BioNamedUploadPanel({
       const { y, m } = prevMonth();
       const mm = String(m).padStart(2, "0");
       const filename = `${y}.${mm} ${section.filename}`;
-      const res = await apiClient.post(section.endpoint, { jobId }, { responseType: "blob" });
-      const url = URL.createObjectURL(new Blob([res.data as BlobPart], { type: "application/pdf" }));
-      const a   = document.createElement("a");
-      a.href = url; a.download = filename; a.click();
-      URL.revokeObjectURL(url);
-      success("보고서 PDF가 다운로드되었습니다.");
-      onLog?.(section.sectionTitle, `${filename} 다운로드 완료`, "success");
+      // 배경 생성으로 전환 — 생성 중 다른 메뉴로 이동해도 유실되지 않는다.
+      //   (동기 경로는 브라우저가 요청을 취소하면 완성된 PDF 가 버려진다)
+      const variant = section.endpoint.replace("/report/generate-", "");
+      await apiClient.post("/report/generate-async", { jobId, variant });
+      success("보고서 생성이 시작되었습니다. 완료되면 자동으로 내려받습니다.");
+      onLog?.(section.sectionTitle, `${filename} 생성 중 — 다른 메뉴로 이동해도 계속됩니다.`, "info");
     } catch (err: unknown) {
       const msg =
         (err as { response?: { data?: { error?: string } } })
@@ -1361,13 +1360,10 @@ function BioNamedUploadPanel({
  *  divisionCode 는 최초 report_jobs 행 생성 시에만 필요하며 "LHOUSE" 를 사용합니다.
  */
 function SharedTimesheetPanel() {
-  const [sharedJobId] = useState<string>(() => {
-    const stored = localStorage.getItem(SHARED_TIMESHEET_JOB_KEY);
-    if (stored) return stored;
-    const id = crypto.randomUUID();
-    localStorage.setItem(SHARED_TIMESHEET_JOB_KEY, id);
-    return id;
-  });
+  // 브라우저마다 임의 UUID 를 만들면 다른 브라우저에서 업로드 상태가 보이지 않는다.
+  // 서버는 Timesheet 을 original_name 으로 조회하므로 위치 자체는 자유롭지만,
+  // 화면 표시를 위해 고정 jobId 를 쓴다.
+  const sharedJobId = SHARED_UPLOAD_JOB_ID;
 
   const { data: fileList = [], refetch } = useQuery({
     queryKey:        ["timesheet-shared", sharedJobId],
@@ -1639,56 +1635,75 @@ export function DivisionReportPage({
   const queryClient    = useQueryClient();
   const { success, error: toastError } = useToast();
 
-  // ── jobId: localStorage에서 복원하거나 새로 생성 (새로고침 후에도 유지) ────────
-  const JOB_STORAGE_KEY = `report_jobId_${divisionCode}`;
-  const [jobId] = useState<string>(() => {
-    const stored = localStorage.getItem(JOB_STORAGE_KEY);
-    if (stored) return stored;
-    const newId = crypto.randomUUID();
-    localStorage.setItem(JOB_STORAGE_KEY, newId);
-    return newId;
-  });
+  // ── jobId: 본부별 **고정** 작업공간 ─────────────────────────────────────────
+  //  예전에는 브라우저마다 crypto.randomUUID() 로 만들어 localStorage 에 넣었다.
+  //  그 결과 같은 데이터를 하루에 두 번 수집하고 있었다:
+  //    · 새벽 3시 자동 수집 → uploads/{고정 대시보드 jobId}/
+  //    · 화면에서 누른 수집 → uploads/{브라우저별 랜덤 UUID}/
+  //  대시보드와 PDF 는 **같은 파일을 같은 파서로** 읽으므로(대시보드 서비스가
+  //  리포트 서비스의 파서를 그대로 import 한다) 폴더만 갈라져 있었을 뿐이다.
+  //  고정 jobId 로 통일하면 새벽에 모아둔 수집물로 낮에 바로 PDF 를 만들 수 있어
+  //  16분 재수집과 Veeva 부하가 사라진다.
+  //
+  //  Systemusage_*.png 등 수동 업로드도 같은 폴더에 쌓이므로 예전처럼
+  //  "jobId 를 바꾸면 유실"되는 문제가 원천적으로 없어진다.
+  const jobId = DASHBOARD_JOB_IDS[divisionCode];
 
-  // ※ jobId 는 보고서 생성 후에도 유지한다.
-  //   Systemusage_*.png 등 일부 보고서 입력이 UPLOAD_DIR/{jobId}/uploads 에 남아 있어
-  //   jobId 를 교체하면 유실된다. 재실행 시 이전 결과가 되살아나는 문제는
-  //   서버가 수집 시작 시 SSE 히스토리를 비우는 것으로 해결한다(jobEventBus.resetHistory).
-
-  // ── 크롤 활성 상태 (버튼 클릭 후 SSE 연결) ──────────────────────────────────
-  const [crawlActive, setCrawlActive] = useState(false);
-
-  // ── DEV 원클릭: 통합 수집(데이터 3종 + 시스템 조회 1종) 진행 상태 ─────────────────
-  //   개별 수집/조회 버튼은 원클릭 "보고서 생성"이 대행하므로 별도 상태를 두지 않는다.
-  //   보고서 생성 버튼 하나로 4개 수집을 순차 실행 → 완료 시 자동 PDF 생성.
-  const [devCollecting, setDevCollecting] = useState(false);
-
-  // ── LHOUSE 원클릭: 통합 수집(데이터 + 시스템 조회) 진행 상태 ─────────────────────
-  const [lhouseCollecting, setLhouseCollecting] = useState(false);
-
-  // ── BIO 연구본부 Veeva(eDMS) 원클릭: 통합 수집(BIO_DATA) 진행 상태 ─────────────────
-  const [bioCollecting, setBioCollecting] = useState(false);
-
-  // ── SSE ──────────────────────────────────────────────────────────────────────
+  // ── 진행 상태 · SSE · 로그: 전역 컨텍스트에서 가져온다 ────────────────────────
+  //  예전에는 이 값들이 모두 이 컴포넌트의 useState 였다. 다른 메뉴로 이동하면
+  //  언마운트되면서 SSE 가 끊기고 플래그가 초기화되어, 돌아와도 재연결하지 않았다.
+  //  (백엔드는 계속 돌고 30분 이력도 남기는데 프론트만 붙어 있지 않았다)
+  //  이제 Routes 밖의 JobProgressProvider 가 구독을 유지하므로, 화면을 옮겨도
+  //  수집이 계속되고 복귀 시 로그가 그대로 보인다.
   const systemCodes = systems.map((s) => s.code);
-  const sse = useCrawlSSE(jobId, systemCodes, crawlActive || devCollecting || lhouseCollecting || bioCollecting);
+  const { run, sse, localLogs, addLocalLog, startRun, endRun } = useJobProgress();
 
-  // ── 로컬 진행 로그 (업로드·PDF생성 이벤트) ────────────────────────────────────
-  const [localLogs, setLocalLogs] = useState<LogEntry[]>([]);
+  // 이 페이지의 작업이 진행 중인가 — run 에서 파생하므로 이동·새로고침에도 유지된다.
+  const runningHere = run?.jobId === jobId && sse.phase !== "done" && sse.phase !== "error";
+  const collecting  = runningHere && run?.kind === "collect";
+  const crawlActive = runningHere && run?.kind === "crawl";
 
-  const addLocalLog = useCallback(
-    (systemName: string, msg: string, kind: LogEntry["kind"] = "info") => {
-      setLocalLogs((prev) => [
-        ...prev,
-        { time: new Date().toISOString(), systemName, message: msg, kind },
-      ]);
+  // 본부별 플래그 — divisionCode 는 페이지마다 고정이라 동시에 참이 되지 않는다.
+  const devCollecting    = divisionCode === "DEV"    && collecting;
+  const lhouseCollecting = divisionCode === "LHOUSE" && collecting;
+  const bioCollecting    = divisionCode === "BIO"    && collecting;
+
+  // 기존 호출부(setDevCollecting(true) 등)를 그대로 쓰기 위한 어댑터.
+  const setRunFlag = useCallback(
+    (kind: "collect" | "crawl") => (on: boolean) => {
+      if (on) startRun({ jobId, divisionCode, systemCodes, kind });
+      else    endRun();
     },
-    []
+    [jobId, divisionCode, startRun, endRun] // eslint-disable-line react-hooks/exhaustive-deps
   );
+  const setDevCollecting    = setRunFlag("collect");
+  const setLhouseCollecting = setRunFlag("collect");
+  const setBioCollecting    = setRunFlag("collect");
+  const setCrawlActive      = setRunFlag("crawl");
 
   // SSE 로그와 로컬 로그를 시간순으로 합산
   const allLogs = [...sse.logs, ...localLogs].sort(
     (a, b) => new Date(a.time).getTime() - new Date(b.time).getTime()
   );
+
+  // ── PDF 생성 완료 → 자동 다운로드 (배경 생성 경로) ──────────────────────────
+  //  화면을 떠나 있었다면 돌아온 시점에 내려받는다. 서버가 report_done 이력을
+  //  30분간 보관하므로 복귀 후에도 완료 사실이 전달된다.
+  const downloadedRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!sse.pdfReady) return;
+    if (run?.kind !== "report") return;
+    if (downloadedRef.current === jobId) return;      // 같은 작업은 한 번만
+    downloadedRef.current = jobId;
+
+    const a = document.createElement("a");
+    a.href = `/api/report/${jobId}/download`;
+    a.download = "";
+    a.click();
+    success("보고서 PDF가 생성되어 다운로드됩니다.");
+    addLocalLog("보고서", "PDF 생성 완료 — 다운로드 시작", "success");
+    endRun();
+  }, [sse.pdfReady, run?.kind, jobId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── 미리보기 패널 상태 ────────────────────────────────────────────────────────
   const [previewCode, setPreviewCode] = useState<string | null>(null);
@@ -1803,27 +1818,21 @@ export function DivisionReportPage({
     return { y, m };
   }
 
-  async function downloadPdfBlob(endpoint: string, filename: string): Promise<void> {
-    let res;
-    try {
-      res = await apiClient.post(endpoint, { jobId }, { responseType: "blob" });
-    } catch (err: unknown) {
-      // responseType:"blob" 이면 에러 응답 바디도 Blob → JSON 으로 파싱해서 재throw
-      const axiosErr = err as { response?: { data?: unknown } };
-      if (axiosErr?.response?.data instanceof Blob) {
-        try {
-          const text = await (axiosErr.response.data as Blob).text();
-          const json = JSON.parse(text) as { error?: string };
-          (axiosErr.response as Record<string, unknown>).data = json;
-        } catch { /* JSON 파싱 실패 시 원본 오류 유지 */ }
-      }
-      throw err;
-    }
-    const url = URL.createObjectURL(new Blob([res.data as BlobPart], { type: "application/pdf" }));
-    const a   = document.createElement("a");
-    a.href = url; a.download = filename; a.click();
-    URL.revokeObjectURL(url);
+  /**
+   * PDF 생성을 **백그라운드**로 시작한다 (동기 다운로드 대체).
+   *
+   *  예전에는 `/report/generate-dev` 등에 요청을 걸어 응답으로 오는 blob 을 그대로
+   *  받았다. 생성에 수십 초가 걸리는데 그 사이 다른 메뉴로 이동하면 브라우저가
+   *  요청을 취소해 **완성된 PDF 가 유실**됐다(서버는 계속 렌더링한다).
+   *  이제 202 로 즉시 반환받고 진행·완료를 SSE 로 받는다. 완료되면 아래
+   *  자동 다운로드 useEffect 가 /report/:jobId/download 로 내려받는다.
+   */
+  async function startPdfBackground(variant: string): Promise<void> {
+    await apiClient.post("/report/generate-async", { jobId, variant });
+    // 화면을 떠나도 진행 상태가 유지되도록 실행 기록을 이어받는다.
+    startRun({ jobId, divisionCode, systemCodes, kind: "report" });
   }
+
 
   // ── 보고서 History 저장 모달 상태 (모든 본부 공용) ──────────────────────────
   const [saveModalState, setSaveModalState] = useState<{
@@ -1945,9 +1954,8 @@ export function DivisionReportPage({
       try {
         const { y, m } = prevMonth();
         const filename = `${y}.${String(m).padStart(2, "0")} L HOUSE Veeva System Report.pdf`;
-        await downloadPdfBlob("/report/generate-lhouse", filename);
-        success("보고서 PDF가 다운로드되었습니다.");
-        addLocalLog("보고서", `${filename} 다운로드 완료`, "success");
+        await startPdfBackground("lhouse");
+        addLocalLog("보고서", `${filename} 생성 중 — 다른 메뉴로 이동해도 계속됩니다.`, "info");
       } catch (err: unknown) {
         const msg =
           (err as { response?: { data?: { error?: string } } })
@@ -2020,9 +2028,8 @@ export function DivisionReportPage({
       try {
         const { y, m } = prevMonth();
         const filename = `${y}.${String(m).padStart(2, "0")} 개발본부 시스템 운영 현황 Report.pdf`;
-        await downloadPdfBlob("/report/generate-dev", filename);
-        success("보고서 PDF가 다운로드되었습니다.");
-        addLocalLog("보고서", `${filename} 다운로드 완료`, "success");
+        await startPdfBackground("dev");
+        addLocalLog("보고서", `${filename} 생성 중 — 다른 메뉴로 이동해도 계속됩니다.`, "info");
       } catch (err: unknown) {
         const msg =
           (err as { response?: { data?: { error?: string } } })
@@ -2088,9 +2095,8 @@ export function DivisionReportPage({
       try {
         const { y, m } = prevMonth();
         const filename = `${y}.${String(m).padStart(2, "0")} Bio연구본부 Veeva System Report.pdf`;
-        await downloadPdfBlob("/report/generate-bio", filename);
-        success("보고서 PDF가 다운로드되었습니다.");
-        addLocalLog("보고서", `${filename} 다운로드 완료`, "success");
+        await startPdfBackground("bio");
+        addLocalLog("보고서", `${filename} 생성 중 — 다른 메뉴로 이동해도 계속됩니다.`, "info");
       } catch (err: unknown) {
         const msg =
           (err as { response?: { data?: { error?: string } } })
@@ -2453,11 +2459,6 @@ export function DivisionReportPage({
                 <a
                   href={`/api/report/${jobId}/download`}
                   download
-                  onClick={() => {
-                    // 다운로드 후 새 사이클을 위해 jobId 초기화
-                    const newId = crypto.randomUUID();
-                    localStorage.setItem(JOB_STORAGE_KEY, newId);
-                  }}
                   className="inline-flex items-center gap-1 px-2.5 py-1 rounded text-xs font-semibold bg-green-600 text-white hover:bg-green-700 transition-colors"
                 >
                   <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">

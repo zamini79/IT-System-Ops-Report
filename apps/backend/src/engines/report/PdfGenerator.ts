@@ -12,12 +12,22 @@
 import fs   from "fs";
 import path from "path";
 import { chromium } from "playwright";
+import { logger } from "../../utils/logger";
 
-// pdf-parse — 이미 설치됨, 페이지 수 추출에 재사용
+// pdf-parse — 페이지 수 추출용.
+//  ⚠️ v2 에서 export 형태가 바뀌었다. 예전 코드는 모듈을 함수로 호출했는데
+//     ("pdfParse is not a function") _countPages 의 catch 가 이를 삼켜
+//     **항상 0 페이지**를 반환하고 있었다. 동기 다운로드 경로에서는 이 값을
+//     쓰지 않아 드러나지 않았고, 배경 생성(SSE report_done)으로 바꾸면서
+//     화면에 "0페이지"로 표시되어 발견됐다.
+//     v2 는 PDFParse 클래스이고 getInfo().total 이 페이지 수다.
 // eslint-disable-next-line @typescript-eslint/no-require-imports
-const pdfParse = require("pdf-parse") as (
-  buf: Buffer
-) => Promise<{ numpages: number }>;
+const { PDFParse } = require("pdf-parse") as {
+  PDFParse: new (opts: { data: Uint8Array }) => {
+    getInfo(): Promise<{ total?: number }>;
+    destroy?(): Promise<void>;
+  };
+};
 
 // ── 타입 ─────────────────────────────────────────────────────────────────────
 
@@ -112,10 +122,17 @@ export class PdfGenerator {
   /** pdf-parse 로 페이지 수를 추출합니다. 실패 시 0 반환. */
   private static async _countPages(pdfPath: string): Promise<number> {
     try {
-      const buf  = fs.readFileSync(pdfPath);
-      const data = await pdfParse(buf);
-      return data.numpages;
-    } catch {
+      const parser = new PDFParse({ data: new Uint8Array(fs.readFileSync(pdfPath)) });
+      try {
+        const info = await parser.getInfo();
+        return info.total ?? 0;
+      } finally {
+        await parser.destroy?.().catch(() => {});
+      }
+    } catch (err) {
+      // 페이지 수는 부가 정보이므로 실패해도 생성 자체는 성공으로 둔다.
+      // 다만 예전처럼 조용히 0 을 반환하지 않고 남긴다(원인 추적용).
+      logger.warn(`[PdfGenerator] 페이지 수 계산 실패: ${(err as Error).message}`);
       return 0;
     }
   }

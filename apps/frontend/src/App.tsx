@@ -29,9 +29,14 @@ import { ReportGeneratePage }   from "./pages/ReportGeneratePage";
 import { ReportHistoryPage }    from "./pages/ReportHistoryPage";
 import { MailCompose }          from "./pages/MailCompose";
 import { Settings }             from "./pages/Settings";
+import { JobProgressProvider }  from "./contexts/JobProgressContext";
 
 export default function App() {
   return (
+    // 수집/보고서 진행 상태를 Routes **밖**에 둔다.
+    //  화면을 전환해도 SSE 구독과 진행 플래그가 유지되어야 하기 때문이다.
+    //  (자세한 이유는 contexts/JobProgressContext.tsx 주석 참고)
+    <JobProgressProvider>
     <Routes>
       {/* 공개 라우트 */}
       <Route path="/login" element={<LoginPage />} />
@@ -58,5 +63,6 @@ export default function App() {
       {/* fallback */}
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
+    </JobProgressProvider>
   );
 }

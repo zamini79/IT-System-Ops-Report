@@ -10,7 +10,7 @@
  *   report_generating · report_done · report_error
  */
 
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useCallback } from "react";
 
 // ── 공개 타입 ─────────────────────────────────────────────────────────────────
 
@@ -126,15 +126,27 @@ export function useCrawlSSE(
   /** crawling 페이즈일 때만 연결 */
   active: boolean
 ): CrawlSSEState & { reset: () => void; resetTask: (systemName: string) => void } {
-  const initialMap = useRef(makeInitialTaskMap(systems));
 
   const [phase,       setPhase]       = useState<CrawlPhase>("idle");
-  const [taskMap,     setTaskMap]     = useState<Record<string, TaskState>>(initialMap.current);
+  const [taskMap,     setTaskMap]     = useState<Record<string, TaskState>>(() => makeInitialTaskMap(systems));
   const [isConnected, setIsConnected] = useState(false);
   const [pdfReady,    setPdfReady]    = useState(false);
   const [pdfInfo,     setPdfInfo]     = useState<PdfInfo | null>(null);
   const [globalError, setGlobalError] = useState<string | null>(null);
   const [logs,        setLogs]        = useState<LogEntry[]>([]);
+
+  // systems 가 바뀌면 빠진 항목을 PENDING 으로 채운다(기존 진행 상태는 보존).
+  //   이 훅은 JobProgressProvider 에서 호출되며, 최초에는 진행 중 작업이 없어
+  //   목록이 비어 있다. 작업이 시작될 때 목록이 생기므로 반응해야 한다.
+  const systemsKey = systems.join(",");
+  useEffect(() => {
+    if (!systems.length) return;
+    setTaskMap((prev) => {
+      const missing = systems.filter((s) => !prev[s]);
+      if (!missing.length) return prev;
+      return { ...prev, ...makeInitialTaskMap(missing) };
+    });
+  }, [systemsKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const addLog = useCallback((systemName: string, message: string, kind: LogEntry["kind"] = "info") => {
     setLogs((prev) => [
