@@ -15,3 +15,7 @@ monthly_data/
 .claude/
 .omc/
 eng.traineddata
+
+# 사내 이관 꾸러미 (DB 덤프·업로드 파일 포함 — 절대 커밋 금지)
+transfer-package/
+transfer-package.tar.gz
