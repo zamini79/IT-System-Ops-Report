@@ -604,7 +604,7 @@ export function OpsDashboardPage() {
                 </h2>
                 <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 items-start">
                   {timesheet.groups.map((g, i) => (
-                    <ChartCard key={g.groupName} title={g.groupName} subtitle="월별 사용 MS">
+                    <ChartCard key={g.groupName} title={g.groupName} subtitle="해당 월 사용 MS (시간)">
                       <MonthlyBar data={g.chart} colorIndex={i} unit=" MS" />
                     </ChartCard>
                   ))}

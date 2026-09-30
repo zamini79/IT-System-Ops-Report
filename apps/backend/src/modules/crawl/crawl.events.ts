@@ -41,6 +41,7 @@ export interface SsePayload {
   screenshotHeight?: number;
   capturedAt?:       string;    // ISO 8601
   // report_done 전용
+  variant?:    string;          // 보고서 종류 (dev · lhouse · bio · bio-lims · bio-eln)
   pdfPath?:    string;
   pageCount?:  number;
   fileSize?:   number;          // bytes

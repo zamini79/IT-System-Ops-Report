@@ -12,12 +12,15 @@ import fs   from "fs";
 import path from "path";
 
 import * as XLSX    from "xlsx";
-import { chromium } from "playwright";
 
 import { logger }       from "../../utils/logger";
+import { captureChartPng } from "../../engines/report/chartCapture";
 import { AppError }     from "../../utils/errors";
 import { PdfGenerator } from "../../engines/report/PdfGenerator";
 import { query }        from "../../config/db";
+import {
+  MsBurnReport, MS_GROUPS_BY_DIVISION, findLatestTimesheet, formatMonthKorean, msSectionsHtml, readMsBurnReport,
+} from "./ms-burn-report";
 import { renderGcpBarToPng, renderGcpGroupedBarToPng, parseGcpMonthGroups } from "./dev.report.service";
 
 // ── 날짜 헬퍼 ─────────────────────────────────────────────────────────────────
@@ -28,35 +31,6 @@ function getLastMonth(): { year: number; month: number } {
   return m === 0
     ? { year: now.getFullYear() - 1, month: 12 }
     : { year: now.getFullYear(),     month: m };
-}
-
-// ── MS Timesheet 데이터 구조 ─────────────────────────────────────────────────
-
-/** YYYY-MM 시트에서 추출한 SKB GMP 1행 요약 (막대 차트용) */
-export interface MsChartRow {
-  month:     string;  // e.g. "2026-03"
-  possible:  number;  // B열 = GMP 가능 MS
-  used:      number;  // C열 = GMP 사용 MS
-  remaining: number;  // D열 = GMP 잔여 MS
-}
-
-/** SKB GMP 그룹 내 세부 작업 행 (테이블용) */
-interface MsTableRow {
-  hours:     string;  // E열
-  system:    string;  // G열
-  category:  string;  // H열
-  subject:   string;  // I열
-  detail:    string;  // J열
-  startDate: string;  // K열 (Excel 시리얼 → YYYY-MM-DD)
-  endDate:   string;  // L열
-  status:    string;  // M열
-}
-
-export interface MsTimesheetData {
-  chartRows:   MsChartRow[];
-  tableRows:   MsTableRow[];
-  latestMonth: string;    // e.g. "2026-03"
-  colHeaders:  string[];  // E,G,H,I,J,K,L,M 열 헤더 (row 0 에서 읽음)
 }
 
 // ── 헬퍼 함수 ─────────────────────────────────────────────────────────────────
@@ -97,14 +71,8 @@ interface BioVeevaStats {
   dailyAvgLogin: number;  // #2: chart5 일일 사용 현황 오른쪽 막대 상단
   taskTotal:     number;  // #3: chart1 업무 활용 현황 10개 바 합산
   taskTop:       number;  // #4: chart1 업무 활용 현황 가장 위 막대 값
-  burnedMs:      number;  // #5: SKB GMP Burned MS (C열)
-}
-
-// ── MS Timesheet 헬퍼 ────────────────────────────────────────────────────────
-
-function formatMonthKorean(yyyymm: string): string {
-  const [y, m] = yyyymm.split("-");
-  return `${y}년 ${m}월`;
+  msCount:       number;  // #5: SKB R&D 작업 건수 (MS Timesheet)
+  burnedMs:      number;  // #5: SKB R&D 사용 시간 (Hours 합계)
 }
 
 // ── Chart.js 로컬 번들 로드 ───────────────────────────────────────────────────
@@ -124,276 +92,6 @@ function loadChartJsScript(): string {
   }
   logger.warn("[BIO Report] Chart.js 로컬 번들 없음 — CDN 사용");
   return "";
-}
-
-// ── MS Timesheet 읽기 ─────────────────────────────────────────────────────────
-
-/**
- * SKB_Quallity_MS_Timesheet.xlsx 에서 막대 차트·표 데이터를 추출합니다.
- *
- * YYYY-MM 시트별:
- *  - A열 = "SKB R&D" 인 첫 행 → B(가능)/C(사용)/D(잔여) 값 수집 (막대 차트용)
- *  - 최신 월 시트의 SKB R&D 그룹 하위 행 → E/G/H/I/J/K/L/M 수집 (표 용)
- */
-export function readMsTimesheetData(xlsxPath: string): MsTimesheetData {
-  let wb: XLSX.WorkBook;
-  try {
-    wb = XLSX.readFile(xlsxPath);
-  } catch (e) {
-    const msg = (e as Error).message ?? "";
-    if (/ecma-376|encrypt|password/i.test(msg)) {
-      throw new AppError(
-        400,
-        "Timesheet 파일이 암호화(비밀번호 보호)되어 있습니다. " +
-        "Excel에서 비밀번호를 제거한 후 다시 업로드해 주세요."
-      );
-    }
-    throw e;
-  }
-
-  // YYYY-MM 시트만 오름차순 정렬
-  const monthSheets = wb.SheetNames
-    .filter((n: string) => /^\d{4}-\d{2}$/.test(n))
-    .sort() as string[];
-
-  const chartRows: MsChartRow[] = [];
-  let   tableRows: MsTableRow[] = [];
-  let   latestMonth              = "";
-  let   colHeaders: string[]     = ["시간(h)", "시스템", "카테고리", "주제", "세부내용", "시작일", "종료일", "상태"];
-
-  for (const sheetName of monthSheets) {
-    const ws = wb.Sheets[sheetName];
-    if (!ws) continue;
-
-    const rows = XLSX.utils.sheet_to_json<unknown[]>(ws, { header: 1, defval: "" }) as unknown[][];
-
-    // row 0 에서 실제 컬럼명 읽기 (최신 시트 기준)
-    if (sheetName === monthSheets[monthSheets.length - 1] && rows.length > 0) {
-      const hdr = rows[0] as unknown[];
-      const h   = [4, 6, 7, 8, 9, 10, 11, 12].map((i) => String(hdr[i] ?? "").trim());
-      if (h.some((v) => v !== "")) {
-        colHeaders = h.map((v, i) => v || colHeaders[i]);
-      }
-    }
-
-    // A열 = "SKB R&D" 인 첫 행 찾기
-    let gmpRowIdx = -1;
-    for (let i = 0; i < rows.length; i++) {
-      if (String((rows[i] as unknown[])[0] ?? "").trim() === "SKB R&D") {
-        gmpRowIdx = i;
-        break;
-      }
-    }
-    if (gmpRowIdx < 0) {
-      logger.warn(`[BIO Report MS] ${sheetName}: SKB R&D 행 없음`);
-      continue;
-    }
-
-    const gmpRow = rows[gmpRowIdx] as unknown[];
-    chartRows.push({
-      month:     sheetName,
-      possible:  Number(gmpRow[1]) || 0,
-      used:      Number(gmpRow[2]) || 0,
-      remaining: Number(gmpRow[3]) || 0,
-    });
-    logger.info(`[BIO Report MS] ${sheetName} SKB R&D — B:${gmpRow[1]}, C:${gmpRow[2]}, D:${gmpRow[3]}`);
-
-    // 최신 월: SKB R&D 작업 행 수집
-    // - row 0(헤더) 제외 후 전체 스캔
-    // - inSKBRD 플래그: A = "SKB R&D" 등장 시 활성, 다른 그룹명 등장 시 종료
-    // - A = "" 하위 행도 inSKBRD 구간이면 포함 (그룹 구조·플랫 구조 모두 대응)
-    // - G열(시스템) 또는 I열(주제) 값이 있는 행만 작업 행으로 판단 (그룹 집계 행 제외)
-    if (sheetName === monthSheets[monthSheets.length - 1]) {
-      latestMonth = sheetName;
-      let inSKBRD = false;
-      for (let i = 1; i < rows.length; i++) {   // i=0 는 헤더 행
-        const row  = rows[i] as unknown[];
-        const aVal = String(row[0] ?? "").trim();
-
-        if (aVal === "SKB R&D") {
-          inSKBRD = true;
-        } else if (aVal !== "") {
-          if (inSKBRD) break;   // 다른 그룹 시작 → SKB R&D 구간 종료
-          continue;
-        }
-        // aVal === "" : 빈 A 열 하위 행 — inSKBRD 가 true 면 포함
-
-        if (!inSKBRD) continue;
-
-        // G열(시스템) 또는 I열(주제) 값 있는 행 = 작업 내역 행
-        const hasContent =
-          String(row[6] ?? "").trim() !== "" ||
-          String(row[8] ?? "").trim() !== "";
-        if (!hasContent) continue;
-
-        tableRows.push({
-          hours:     String(row[4]  ?? ""),
-          system:    String(row[6]  ?? ""),
-          category:  String(row[7]  ?? ""),
-          subject:   String(row[8]  ?? ""),
-          detail:    String(row[9]  ?? ""),
-          startDate: excelDateToStr(row[10]),
-          endDate:   excelDateToStr(row[11]),
-          status:    String(row[12] ?? ""),
-        });
-      }
-      logger.info(`[BIO Report MS] ${sheetName} SKB R&D 테이블 행: ${tableRows.length}개`);
-    }
-  }
-
-  return { chartRows, tableRows, latestMonth, colHeaders };
-}
-
-/**
- * SKB_Quallity_MS_Timesheet.xlsx 최신 YYYY-MM 시트에서
- * SKB GMP 그룹의 Burned MS (C열 = 사용 MS) 값을 반환합니다.
- * Managed Service 진행 현황 헤드라인 #5 에 사용합니다.
- */
-function readBioGmpBurnedMs(xlsxPath: string): number {
-  try {
-    const wb = XLSX.readFile(xlsxPath);
-    const monthSheets = wb.SheetNames
-      .filter((n: string) => /^\d{4}-\d{2}$/.test(n))
-      .sort() as string[];
-    if (monthSheets.length === 0) { logger.warn("[BIO Report MS] readBioGmpBurnedMs: YYYY-MM 시트 없음"); return 0; }
-    const latestSheet = monthSheets[monthSheets.length - 1];
-    const ws = wb.Sheets[latestSheet];
-    if (!ws) return 0;
-    const rows = XLSX.utils.sheet_to_json<unknown[]>(ws, { header: 1, defval: "" }) as unknown[][];
-
-    // 진단용: A열에 있는 모든 비어 있지 않은 값 로그
-    const aColSample = rows.slice(0, 20).map(r => String((r as unknown[])[0] ?? "").trim()).filter(v => v !== "");
-    logger.info(`[BIO Report MS] ${latestSheet} A열 샘플: ${JSON.stringify(aColSample)}`);
-
-    for (let i = 0; i < rows.length; i++) {
-      // 정확한 일치 우선, 공백·대소문자 차이 허용
-      const aVal = String((rows[i] as unknown[])[0] ?? "").trim();
-      if (aVal.toUpperCase() === "SKB GMP") {
-        // C열 (index 2): XLSX 수식 결과값 우선, 없으면 raw 값
-        const cell   = ws[XLSX.utils.encode_cell({ r: i, c: 2 })];
-        const burned = cell ? (Number(cell.v) || 0) : 0;
-        logger.info(`[BIO Report MS] ${latestSheet} row[${i}] SKB GMP C열 raw="${cell?.v}" → ${burned}`);
-        return burned;
-      }
-    }
-    logger.warn(`[BIO Report MS] ${latestSheet}: "SKB GMP" 행 없음 (burnedMs=0). A열값: ${JSON.stringify(aColSample)}`);
-    return 0;
-  } catch (e) {
-    logger.error(`[BIO Report MS] readBioGmpBurnedMs 실패: ${(e as Error).message}`);
-    return 0;
-  }
-}
-
-// ── MS 막대 차트 렌더링 ──────────────────────────────────────────────────────
-
-/**
- * 3개월 SKB R&D MS 현황을 그룹 막대 차트 PNG 로 렌더링합니다.
- * (가능 MS / 사용 MS / 잔여 MS)
- */
-async function renderMsBarChartToPng(chartRows: MsChartRow[], outputPng: string): Promise<void> {
-  const labels    = chartRows.map((r) => r.month.replace("-", "."));  // "2026.03"
-  const possible  = chartRows.map((r) => r.possible);
-  const used      = chartRows.map((r) => r.used);
-  const remaining = chartRows.map((r) => r.remaining);
-
-  const chartJs   = loadChartJsScript();
-  const scriptTag = chartJs
-    ? `<script>${chartJs}</script>`
-    : `<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>`;
-
-  const html = `<!DOCTYPE html>
-<html lang="ko">
-<head>
-<meta charset="utf-8">
-<style>
-  * { margin:0; padding:0; box-sizing:border-box; }
-  body { background:#fff; font-family:"Malgun Gothic",Arial,sans-serif; }
-  #wrap { width:580px; height:340px; }
-</style>
-</head>
-<body>
-<div id="wrap">
-  <canvas id="chart" width="580" height="340"></canvas>
-</div>
-${scriptTag}
-<script>
-(function() {
-  var ctx = document.getElementById('chart').getContext('2d');
-  if (!window.Chart) { ctx.fillStyle='#ef4444'; ctx.font='12px Arial'; ctx.fillText('Chart.js 로드 실패',10,20); return; }
-
-  /* 막대 위 데이터 레이블 플러그인 */
-  var barLabelPlugin = {
-    id: 'barLabels',
-    afterDatasetsDraw: function(chart) {
-      var c = chart.ctx;
-      chart.data.datasets.forEach(function(ds, di) {
-        var meta = chart.getDatasetMeta(di);
-        if (meta.hidden) return;
-        meta.data.forEach(function(bar, bi) {
-          var val = ds.data[bi];
-          if (val === null || val === undefined || val === 0) return;
-          c.save();
-          c.fillStyle = '#1f2937';
-          c.font = 'bold 10px Arial';
-          c.textAlign = 'center';
-          c.textBaseline = 'bottom';
-          c.fillText(String(val), bar.x, bar.y - 2);
-          c.restore();
-        });
-      });
-    }
-  };
-  Chart.register(barLabelPlugin);
-
-  new Chart(ctx, {
-    type: 'bar',
-    data: {
-      labels: ${JSON.stringify(labels)},
-      datasets: [
-        { label: 'R&D 가능 MS', data: ${JSON.stringify(possible)},  backgroundColor: '#4472C4', borderRadius: 3, borderSkipped: false },
-        { label: 'R&D 사용 MS', data: ${JSON.stringify(used)},      backgroundColor: '#A9D18E', borderRadius: 3, borderSkipped: false },
-        { label: 'R&D 잔여 MS', data: ${JSON.stringify(remaining)}, backgroundColor: '#ED7D31', borderRadius: 3, borderSkipped: false },
-      ],
-    },
-    options: {
-      responsive: false,
-      animation: false,
-      layout: { padding: { top: 18 } },
-      plugins: {
-        legend: { position: 'bottom', labels: { font: { size: 11 }, padding: 16, usePointStyle: true } },
-        tooltip: { enabled: false },
-      },
-      scales: {
-        x: { grid: { display: false }, ticks: { font: { size: 12 }, color: '#374151' } },
-        y: {
-          beginAtZero: true,
-          grid: { color: '#f0f4f8' },
-          ticks: { font: { size: 11 }, color: '#6b7280' },
-          title: { display: true, text: '(MD)', font: { size: 10 }, color: '#9ca3af' },
-        },
-      },
-    },
-  });
-})();
-</script>
-</body>
-</html>`;
-
-  const browser = await chromium.launch({ headless: true });
-  try {
-    const page = await browser.newPage();
-    await page.setViewportSize({ width: 580, height: 320 });
-    await page.setContent(html, { waitUntil: "networkidle", timeout: 30_000 });
-    await page.waitForTimeout(400);
-    const loaded = await page.evaluate(
-      () => typeof (window as unknown as Record<string, unknown>).Chart !== "undefined"
-    );
-    logger.info(`[BIO Report MS] Chart.js 로드: ${loaded ? "성공" : "실패"}`);
-    await page.locator("#wrap").screenshot({ path: outputPng, type: "png" });
-    logger.info(`[BIO Report MS] Bar chart PNG: ${outputPng} (${fs.statSync(outputPng).size.toLocaleString()} bytes)`);
-  } finally {
-    await browser.close();
-  }
 }
 
 // ── PDF HTML 빌드 ─────────────────────────────────────────────────────────────
@@ -578,8 +276,7 @@ export function buildBioInsightLines(a: {
 function buildBioReportHtml(
   titleDate:         string,
   veeva:             BioVeevaCharts | null,
-  msData?:           MsTimesheetData | null,
-  msBarChartBase64?: string | null,
+  msData?:           MsBurnReport | null,
   veevaStats?:       BioVeevaStats,
 ): string {
   const today = new Date().toLocaleDateString("ko-KR", {
@@ -602,84 +299,14 @@ function buildBioReportHtml(
   };
 
   // ── 전체 헤드라인 메시지 (OCR 통계 반영) ────────────────────────────────────
-  const st = veevaStats ?? { totalUsers: 0, dailyAvgLogin: 0, taskTotal: 0, taskTop: 0, burnedMs: 0 };
+  const st = veevaStats ?? { totalUsers: 0, dailyAvgLogin: 0, taskTotal: 0, taskTop: 0, msCount: 0, burnedMs: 0 };
   const headlineHtml = `<div class="headline">
     <p>${titleDate} Bio연구본부 Veeva Quality System (eDMS)에 등록된 총 사용자 수는 <strong>${st.totalUsers}</strong> 명이며, 일 평균 <strong>${st.dailyAvgLogin}</strong> 명이 시스템에 접근하여 업무를 진행하였습니다.</p>
-    <p>${monthLabel} 진행된 Managed Service는 <strong>${st.burnedMs}</strong> 건입니다.</p>
+    <p>${monthLabel} 진행된 Managed Service는 <strong>${st.msCount}</strong>건 (<strong>${st.burnedMs}</strong>시간)입니다.</p>
   </div>`;
 
   // ── Page 2 (MS) HTML ──────────────────────────────────────────────────────
   const msPageHtml = msData ? (() => {
-    const latestLabel = msData.latestMonth ? formatMonthKorean(msData.latestMonth) : titleDate;
-
-    const msChartSummaryTable = msData.chartRows.length > 0 ? `
-      <div class="ms-summary-wrap">
-        <table class="ms-summary-table">
-          <thead>
-            <tr>
-              <th>월</th>
-              <th>R&D 가능 MS</th>
-              <th>R&D 사용 MS</th>
-              <th>R&D 잔여 MS</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${msData.chartRows.map((r) => `<tr>
-              <td>${escHtml(formatMonthKorean(r.month))}</td>
-              <td>${r.possible}</td>
-              <td>${r.used}</td>
-              <td>${r.remaining}</td>
-            </tr>`).join("\n")}
-          </tbody>
-        </table>
-      </div>` : "";
-
-    const chartSection = `
-    <div class="ms-section">
-      <div class="ms-section-title">1) 시스템 별 MS 현황</div>
-      <div class="ms-chart-subtitle">Bio연구본부 Quality System Managed Service 현황</div>
-      <div class="ms-chart-wrap">
-        ${msBarChartBase64
-          ? `<img src="data:image/png;base64,${msBarChartBase64}" alt="MS 현황 막대 차트" />`
-          : `<div class="ms-no-data">차트 생성 실패</div>`}
-      </div>
-      ${msChartSummaryTable}
-    </div>`;
-
-    const [hE, hG, hH, hI, hJ, hK, hL, hM] = msData.colHeaders;
-    const tableHeaderRow = `<tr>
-      <th>${escHtml(hG)}</th>
-      <th>${escHtml(hH)}</th>
-      <th style="min-width:80px">${escHtml(hI)}</th>
-      <th>${escHtml(hJ)}</th>
-      <th style="white-space:nowrap">${escHtml(hK)}</th>
-      <th style="white-space:nowrap">${escHtml(hL)}</th>
-      <th style="white-space:nowrap">${escHtml(hM)}</th>
-      <th style="white-space:nowrap">${escHtml(hE)}</th>
-    </tr>`;
-
-    const tableBodyRows = msData.tableRows.map((r) => `<tr>
-      <td class="td-center">${escHtml(r.system)}</td>
-      <td class="td-center">${escHtml(r.category)}</td>
-      <td>${escHtml(r.subject)}</td>
-      <td class="td-detail">${escHtml(r.detail)}</td>
-      <td class="td-nowrap">${escHtml(r.startDate)}</td>
-      <td class="td-nowrap">${escHtml(r.endDate)}</td>
-      <td class="td-nowrap">${escHtml(r.status)}</td>
-      <td class="td-nowrap td-num">${escHtml(r.hours)}</td>
-    </tr>`).join("\n");
-
-    const tableSection = `
-    <div class="ms-section">
-      <div class="ms-table-title">${escHtml(latestLabel)} Managed Service 주요 현황</div>
-      ${msData.tableRows.length > 0
-        ? `<table class="ms-table">
-            <thead>${tableHeaderRow}</thead>
-            <tbody>${tableBodyRows}</tbody>
-           </table>`
-        : `<div class="ms-no-data">해당 월 SKB R&D 세부 데이터가 없습니다.</div>`}
-    </div>`;
-
     return `
   <!-- ── MS 진행 현황 페이지 ── -->
   <div class="page ms-page">
@@ -694,8 +321,7 @@ function buildBioReportHtml(
       </thead>
       <tbody>
         <tr><td>
-          ${chartSection}
-          ${tableSection}
+          ${msSectionsHtml(msData, MS_GROUPS_BY_DIVISION.BIO)}
         </td></tr>
       </tbody>
       <tfoot>
@@ -968,62 +594,34 @@ export async function generateBioReport(jobId: string): Promise<BioReportResult>
     );
   }
 
-  // 헤드라인 통계 — #1~#4 는 수집 데이터, burnedMs(#5)는 아래 MS Timesheet 에서 채움
+  // 헤드라인 통계 — #1~#4 는 수집 데이터, msCount·burnedMs(#5)는 아래 MS Timesheet 에서 채움
   const veevaStats: BioVeevaStats = {
     totalUsers:    veeva.stats.totalUsers,
     dailyAvgLogin: veeva.stats.dailyAvgLogin,
     taskTotal:     veeva.stats.taskTotal,
     taskTop:       veeva.stats.taskTop,
+    msCount:       0,
     burnedMs:      0,
   };
 
-  // MS Timesheet — DB 에서 최신 파일 조회
-  let msData:           MsTimesheetData | null = null;
-  let msBarChartBase64: string | null          = null;
-
-  try {
-    const tsRows = await query<{ stored_path: string }>(
-      `SELECT stored_path FROM uploaded_files
-       WHERE original_name = 'SKB_Quallity_MS_Timesheet.xlsx'
-       ORDER BY created_at DESC LIMIT 1`,
-      []
-    );
-
-    if (tsRows.length && fs.existsSync(tsRows[0].stored_path)) {
-      const tsPath = tsRows[0].stored_path;
-      logger.info(`[BIO Report] Timesheet 파일: ${tsPath}`);
-
-      msData = readMsTimesheetData(tsPath);
-
-      if (msData.chartRows.length > 0) {
-        // #5 — SKB R&D 최신 월 Burned MS (C열 = used)
-        const latestMsRow = msData.chartRows[msData.chartRows.length - 1];
-        veevaStats.burnedMs = latestMsRow.used;
-        logger.info(`[BIO Report] burnedMs(#5) SKB R&D ${latestMsRow.month}: ${veevaStats.burnedMs}`);
-
-        const msChartPng = path.join(uploadPath, `ms_barchart_${Date.now()}.png`);
-        fs.mkdirSync(uploadPath, { recursive: true });
-        await renderMsBarChartToPng(msData.chartRows, msChartPng);
-        if (fs.existsSync(msChartPng)) {
-          msBarChartBase64 = fs.readFileSync(msChartPng).toString("base64");
-        }
-      } else {
-        logger.warn("[BIO Report] Timesheet 에서 YYYY-MM 시트 데이터 없음 — MS 페이지 스킵");
-        msData = null;
-      }
-    } else {
-      logger.info("[BIO Report] Timesheet 파일 없음 — MS 페이지 생략");
-    }
-  } catch (e) {
-    if (e instanceof AppError) throw e;
-    logger.error(`[BIO Report] Timesheet 처리 실패 (무시): ${(e as Error).message}`);
-    msData = null;
+  // MS Timesheet — 최신 업로드 파일 (없으면 MS 페이지 생략, 이전 양식이면 오류)
+  let msData: MsBurnReport | null = null;
+  const ts = await findLatestTimesheet();
+  if (ts) {
+    logger.info(`[BIO Report] Timesheet 파일: ${ts.path}`);
+    msData = readMsBurnReport(ts.path);
+    const rd = msData.groups.get("SKB R&D");
+    veevaStats.msCount  = rd?.rows.length ?? 0;
+    veevaStats.burnedMs = rd?.burned ?? 0;
+    logger.info(`[BIO Report] MS(#5) SKB R&D ${msData.month}: ${veevaStats.msCount}건 ${veevaStats.burnedMs}h`);
+  } else {
+    logger.info("[BIO Report] Timesheet 파일 없음 — MS 페이지 생략");
   }
 
   // HTML → PDF 생성
   const { year, month } = getLastMonth();
   const titleDate  = `${year}년 ${String(month).padStart(2, "0")}월`;
-  const html       = buildBioReportHtml(titleDate, veeva, msData, msBarChartBase64, veevaStats);
+  const html       = buildBioReportHtml(titleDate, veeva, msData, veevaStats);
   const outputDir  = path.resolve(process.env.OUTPUT_DIR ?? "outputs");
   fs.mkdirSync(outputDir, { recursive: true });
 
@@ -1268,16 +866,7 @@ async function renderLimsDonutToPng(dist: { label: string; value: number }[], ou
       options:{responsive:false,animation:false,cutout:'52%',layout:{padding:8},
         plugins:{legend:{display:true,position:'right',labels:{font:{size:10},boxWidth:10,padding:6}},tooltip:{enabled:false}}}});
   })();</script></body></html>`;
-  const browser = await chromium.launch({ headless: true });
-  try {
-    const page = await browser.newPage();
-    await page.setViewportSize({ width: 440, height: 300 });
-    await page.setContent(html, { waitUntil: "networkidle", timeout: 30_000 });
-    await page.waitForTimeout(400);
-    await page.locator("#c").screenshot({ path: outputPng, type: "png" });
-  } finally {
-    await browser.close();
-  }
+  await captureChartPng({ html, width: 440, height: 300, selector: "#c", outputPng, label: "LIMS 도넛" });
 }
 
 /** 임검분 LIMS 데이터 인사이트 (GCP 컨셉) */
@@ -1791,17 +1380,7 @@ ${scriptTag}
 })();
 </script></body></html>`;
 
-  const browser = await chromium.launch({ headless: true });
-  try {
-    const page = await browser.newPage();
-    await page.setViewportSize({ width: 640, height: canvasH });
-    await page.setContent(html, { waitUntil: "networkidle", timeout: 30_000 });
-    await page.waitForTimeout(500);
-    await page.locator("#wrap").screenshot({ path: outputPng, type: "png" });
-    logger.info(`[BIO ELN] Chart1 PNG: ${outputPng} (${fs.statSync(outputPng).size.toLocaleString()} bytes)`);
-  } finally {
-    await browser.close();
-  }
+  await captureChartPng({ html, width: 640, height: canvasH, selector: "#wrap", outputPng, label: "ELN 과제별 차트" });
 }
 
 // ─ Chart 2: 팀별(LASTNAME) 막대 차트 ─────────────────────────────────────────
@@ -1895,17 +1474,7 @@ ${scriptTag}
 })();
 </script></body></html>`;
 
-  const browser = await chromium.launch({ headless: true });
-  try {
-    const page = await browser.newPage();
-    await page.setViewportSize({ width: 640, height: canvasH });
-    await page.setContent(html, { waitUntil: "networkidle", timeout: 30_000 });
-    await page.waitForTimeout(500);
-    await page.locator("#wrap").screenshot({ path: outputPng, type: "png" });
-    logger.info(`[BIO ELN] Chart2 PNG: ${outputPng} (${fs.statSync(outputPng).size.toLocaleString()} bytes)`);
-  } finally {
-    await browser.close();
-  }
+  await captureChartPng({ html, width: 640, height: canvasH, selector: "#wrap", outputPng, label: "ELN 팀별 차트" });
 }
 
 // ─ ELN_service.xlsx 파싱 ──────────────────────────────────────────────────────

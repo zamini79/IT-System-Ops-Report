@@ -15,7 +15,7 @@ import path from "path";
 import { Router, Request, Response, NextFunction } from "express";
 import type { AuthRequest } from "../auth/auth.types";
 import { AppError }  from "../../utils/errors";
-import { startDivisionReport, type ReportVariant } from "./division-report.async";
+import { startDivisionReport, findVariantPdf, isReportVariant, type ReportVariant } from "./division-report.async";
 import { respond }   from "../../utils/response";
 import { logger }    from "../../utils/logger";
 import { jobEventBus } from "../crawl/crawl.events";
@@ -455,7 +455,17 @@ reportRouter.get(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { jobId } = req.params;
-      const pdfPath   = await getPdfPath(jobId);
+      const variant   = req.query.variant;
+      // ?variant= 가 있으면 그 종류의 최신 PDF (BIO 는 한 jobId 에 보고서가 3종)
+      let pdfPath: string;
+      if (variant !== undefined) {
+        if (!isReportVariant(variant)) throw new AppError(400, `알 수 없는 보고서 종류: ${String(variant)}`);
+        const found = findVariantPdf(jobId, variant);
+        if (!found) throw new AppError(404, "아직 생성된 PDF 가 없습니다. 먼저 PDF 를 생성해 주세요.");
+        pdfPath = found;
+      } else {
+        pdfPath = await getPdfPath(jobId);
+      }
       const filename  = path.basename(pdfPath);
 
       res.download(pdfPath, filename, (err) => {

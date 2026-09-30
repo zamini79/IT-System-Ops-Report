@@ -33,6 +33,34 @@ import {
   useToast,
 }                                         from "../common";
 
+// ── PDF 다운로드 ──────────────────────────────────────────────────────────────
+
+/**
+ * 생성된 보고서 PDF 를 내려받는다.
+ * <a href> 로 직접 열면 Authorization 헤더가 붙지 않아 401(JSON)이 download.json 으로
+ * 저장되므로, apiClient(토큰·자동 갱신 포함)로 blob 을 받아 저장한다.
+ */
+async function downloadReportPdf(jobId: string, variant?: string): Promise<void> {
+  // variant 를 주면 그 종류의 최신 PDF — BIO 는 한 jobId 로 eDMS·LIMS·ELN 세 보고서를 만든다
+  const res = await apiClient.get<Blob>(`/report/${jobId}/download`, {
+    responseType: "blob",
+    params:       variant ? { variant } : undefined,
+  });
+  const cd  = String(res.headers["content-disposition"] ?? "");
+  const star  = cd.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+  const plain = cd.match(/filename="?([^";]+)"?/i)?.[1];
+  const filename = star ? decodeURIComponent(star) : plain ?? `report_${jobId}.pdf`;
+
+  const url = URL.createObjectURL(res.data);
+  const a   = document.createElement("a");
+  a.href     = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
 // ── 공개 타입 ─────────────────────────────────────────────────────────────────
 
 export interface SystemConfig {
@@ -253,6 +281,7 @@ function SystemCard({
   onGenerate,
   generating,
   generatingLabel,
+  generateLabel,
   onSave,
 }: {
   config:       SystemConfig;
@@ -271,6 +300,8 @@ function SystemCard({
   generating?:          boolean;
   /** 선택: generating 중 버튼 라벨 (미지정 시 "생성 중…") — 수집·생성 단계 구분용 */
   generatingLabel?:     string;
+  /** 선택: 버튼 라벨 (미지정 시 "보고서 생성") */
+  generateLabel?:       string;
   onSave?:              () => void;
 }) {
   const icon = SYSTEM_ICONS[config.code] ?? DEFAULT_ICON;
@@ -370,7 +401,7 @@ function SystemCard({
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
                       d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                   </svg>
-                  보고서 생성
+                  {generateLabel ?? "보고서 생성"}
                 </>
               )}
             </button>
@@ -655,7 +686,7 @@ const TIMESHEET_SLOT: {
     "application/x-zip-compressed": [".xlsx"],
     "application/octet-stream":     [".xlsx", ".xls"],
   },
-  hint:    "SKB Quality_MS Timesheets_xxxx-xx.xlsx (.xlsx / .xls)",
+  hint:    "SKB MS Burn Report xxxx-xx (Flex).xlsx — 그룹별 시트 양식 (.xlsx / .xls)",
   icon:    "T",
   iconColor: "text-indigo-600",
 };
@@ -1202,6 +1233,7 @@ function BioNamedUploadPanel({
   fileList,
   onLog,
   onRequestSave,
+  onPdfStarted,
 }: {
   jobId:         string;
   divisionCode:  string;
@@ -1209,6 +1241,8 @@ function BioNamedUploadPanel({
   fileList:      UploadedFileRow[];
   onLog?:        (systemName: string, msg: string, kind: LogEntry["kind"]) => void;
   onRequestSave: (reportType: string, label: string) => void;
+  /** PDF 생성이 시작되면 호출 — 메인이 진행을 이어받아 완료 시 자동으로 내려받는다 */
+  onPdfStarted?: () => void;
 }) {
   const { success, error: toastError } = useToast();
 
@@ -1236,6 +1270,7 @@ function BioNamedUploadPanel({
       //   (동기 경로는 브라우저가 요청을 취소하면 완성된 PDF 가 버려진다)
       const variant = section.endpoint.replace("/report/generate-", "");
       await apiClient.post("/report/generate-async", { jobId, variant });
+      onPdfStarted?.();
       success("보고서 생성이 시작되었습니다. 완료되면 자동으로 내려받습니다.");
       onLog?.(section.sectionTitle, `${filename} 생성 중 — 다른 메뉴로 이동해도 계속됩니다.`, "info");
     } catch (err: unknown) {
@@ -1710,18 +1745,19 @@ export function DivisionReportPage({
   //  30분간 보관하므로 복귀 후에도 완료 사실이 전달된다.
   const downloadedRef = useRef<string | null>(null);
   useEffect(() => {
-    if (!sse.pdfReady) return;
+    if (!sse.pdfReady) { downloadedRef.current = null; return; }  // 새 생성이 시작되면 초기화
     if (run?.kind !== "report") return;
-    if (downloadedRef.current === jobId) return;      // 같은 작업은 한 번만
+    if (downloadedRef.current === jobId) return;      // 같은 완료는 한 번만
     downloadedRef.current = jobId;
+    const variant = sse.pdfInfo?.variant;
 
-    const a = document.createElement("a");
-    a.href = `/api/report/${jobId}/download`;
-    a.download = "";
-    a.click();
     success("보고서 PDF가 생성되어 다운로드됩니다.");
     addLocalLog("보고서", "PDF 생성 완료 — 다운로드 시작", "success");
     endRun();
+    downloadReportPdf(jobId, variant).catch(() => {
+      toastError("PDF 다운로드에 실패했습니다. 'PDF 다운로드' 버튼으로 다시 시도해 주세요.");
+      addLocalLog("보고서", "PDF 다운로드 실패", "error");
+    });
   }, [sse.pdfReady, run?.kind, jobId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── 미리보기 패널 상태 ────────────────────────────────────────────────────────
@@ -2304,6 +2340,10 @@ export function DivisionReportPage({
                   generatingLabel={
                     (divisionCode === "BIO" && sys.code === "EDMS" && bioCollecting) ? "수집 중…" : undefined
                   }
+                  generateLabel={
+                    // 수집과 PDF 생성은 분리돼 있다 — eDMS PDF 는 상단 "PDF 생성" 버튼으로 만든다
+                    (divisionCode === "BIO" && sys.code === "EDMS") ? "데이터 수집" : undefined
+                  }
                   onSave={
                     (divisionCode === "BIO" && sys.code === "EDMS")
                       ? () => openSaveModal("BIO", "bio_veeva", "Bio연구본부 Veeva System")
@@ -2349,6 +2389,7 @@ export function DivisionReportPage({
                 onUploadDone={() => void refetchBioFiles()}
                 onLog={addLocalLog}
                 onRequestSave={(reportType, label) => openSaveModal("BIO", reportType, label)}
+                onPdfStarted={() => startRun({ jobId, divisionCode, systemCodes, kind: "report" })}
               />
             ) : (
               <FileDropzonePanel
@@ -2413,6 +2454,7 @@ export function DivisionReportPage({
                 onUploadDone={() => void refetchBioFiles()}
                 onLog={addLocalLog}
                 onRequestSave={(reportType, label) => openSaveModal("BIO", reportType, label)}
+                onPdfStarted={() => startRun({ jobId, divisionCode, systemCodes, kind: "report" })}
               />
             ) : (
               <FileDropzonePanel
@@ -2448,9 +2490,13 @@ export function DivisionReportPage({
                   PDF 생성 완료 — {sse.pdfInfo.pageCount}페이지,{" "}
                   {fmtBytes(sse.pdfInfo.fileSize)}
                 </p>
-                <a
-                  href={`/api/report/${jobId}/download`}
-                  download
+                <button
+                  type="button"
+                  onClick={() => {
+                    downloadReportPdf(jobId, sse.pdfInfo?.variant).catch(() =>
+                      toastError("PDF 다운로드에 실패했습니다. 다시 시도해 주세요.")
+                    );
+                  }}
                   className="inline-flex items-center gap-1 px-2.5 py-1 rounded text-xs font-semibold bg-green-600 text-white hover:bg-green-700 transition-colors"
                 >
                   <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -2458,7 +2504,7 @@ export function DivisionReportPage({
                       d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
                   </svg>
                   PDF 다운로드
-                </a>
+                </button>
               </div>
             )}
           </div>

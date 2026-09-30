@@ -40,6 +40,8 @@ export interface PdfInfo {
   pdfPath:   string;
   pageCount: number;
   fileSize:  number;
+  /** 보고서 종류 (dev · lhouse · bio · bio-lims · bio-eln) */
+  variant?:  string;
 }
 
 export interface LogEntry {
@@ -78,6 +80,7 @@ interface SsePayload {
   capturedAt?:      string;
   pdfPath?:         string;
   pageCount?:       number;
+  variant?:         string;
   fileSize?:        number;
   attempt?:         number;
   maxRetries?:      number;
@@ -281,13 +284,16 @@ export function useCrawlSSE(
 
       case "report_generating":
         addLog("시스템", "PDF 보고서 생성 중…", "info");
+        // 같은 jobId 로 다른 보고서를 이어서 만들 수 있으므로(BIO: eDMS·LIMS·ELN) 이전 완료 상태를 지운다
+        setPdfReady(false);
+        setPdfInfo(null);
         break;
 
       case "report_done":
         addLog("시스템", "PDF 보고서 생성 완료", "success");
         setPdfReady(true);
         if (p.pdfPath) {
-          setPdfInfo({ pdfPath: p.pdfPath, pageCount: p.pageCount ?? 0, fileSize: p.fileSize ?? 0 });
+          setPdfInfo({ pdfPath: p.pdfPath, pageCount: p.pageCount ?? 0, fileSize: p.fileSize ?? 0, variant: p.variant });
         }
         break;
 

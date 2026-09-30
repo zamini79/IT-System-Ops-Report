@@ -17,6 +17,8 @@
  *  내려받을 수 있고, SSE report_done 이 프론트에 알린다.
  */
 
+import fs   from "fs";
+import path from "path";
 import { jobEventBus } from "../crawl/crawl.events";
 import { query }       from "../../config/db";
 import { logger }      from "../../utils/logger";
@@ -48,6 +50,44 @@ const GENERATORS: Record<ReportVariant, (jobId: string) => Promise<ReportOutput>
 };
 
 /**
+ * 보고서 종류별 파일명 (앞에 "YYYY.MM " 이 붙는다).
+ * BIO 는 eDMS·LIMS·ELN 세 보고서가 같은 jobId 를 쓰므로 report_jobs.pdf_path
+ * 하나로는 구분되지 않는다 → 종류를 지정한 다운로드는 이 이름으로 찾는다.
+ */
+const VARIANT_FILE_SUFFIX: Record<ReportVariant, string> = {
+  "dev":      "개발본부 시스템 운영 현황 Report.pdf",
+  "lhouse":   "L HOUSE Veeva System Report.pdf",
+  "bio":      "Bio연구본부 시스템 운영 현황 Report.pdf",
+  "bio-lims": "Bio연구본부 임검분 LIMS 운영 현황 Report.pdf",
+  "bio-eln":  "Bio연구본부 전자연구노트(ELN) 운영 현황 Report.pdf",
+};
+
+export function isReportVariant(v: unknown): v is ReportVariant {
+  return typeof v === "string" && v in GENERATORS;
+}
+
+/** 서버 재시작 전까지: (jobId, variant) → 마지막으로 생성한 PDF */
+const latestPdf = new Map<string, string>();
+
+/**
+ * 해당 종류의 가장 최근 PDF 경로.
+ * 이번 서버 실행에서 만든 것이 있으면 그것, 없으면 출력 폴더에서 같은 종류 중 가장 최근 파일.
+ */
+export function findVariantPdf(jobId: string, variant: ReportVariant): string | null {
+  const hit = latestPdf.get(`${jobId}:${variant}`);
+  if (hit && fs.existsSync(hit)) return hit;
+
+  const outputDir = path.resolve(process.env.OUTPUT_DIR ?? "outputs");
+  if (!fs.existsSync(outputDir)) return null;
+  const suffix = VARIANT_FILE_SUFFIX[variant];
+  const files = fs.readdirSync(outputDir)
+    .filter((f) => /^\d{4}\.\d{2} /.test(f) && f.slice(8) === suffix)
+    .map((f) => path.join(outputDir, f))
+    .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+  return files[0] ?? null;
+}
+
+/**
  * 즉시 반환하고, 생성 완료/실패를 SSE 로 알린다.
  * @throws 알 수 없는 variant 이면 400
  */
@@ -65,6 +105,7 @@ export function startDivisionReport(params: {
   void (async () => {
     try {
       const result = await generate(jobId);
+      latestPdf.set(`${jobId}:${variant}`, result.filePath);
 
       // 기존 /report/:jobId/download 가 report_jobs.pdf_path 를 읽으므로 갱신한다.
       await query(
@@ -80,6 +121,7 @@ export function startDivisionReport(params: {
       jobEventBus.emit(jobId, {
         type:      "report_done",
         jobId,
+        variant,
         pdfPath:   result.filePath,
         pageCount: result.pageCount,
         fileSize:  result.fileSize,

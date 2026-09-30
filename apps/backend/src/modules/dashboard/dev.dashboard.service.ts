@@ -21,15 +21,13 @@ import type {
 import { DASHBOARD_JOB_IDS } from "./dashboard.types";
 
 import { logger } from "../../utils/logger";
-import { dailyFromFile } from "./snapshot.shared";
-import { query }  from "../../config/db";
+import { dailyFromFile, buildTimesheetSection } from "./snapshot.shared";
 import {
   parseGcpMonthGroups,
   parseGcpQualityByType,
   parseGcpCategoryGroups,
   parseGcpStudyByOrg,
   readGcpCategorySheet,
-  readDevMsTimesheetData,
   buildGcpInsightLines,
   buildMedcommsInsightLines,
   buildCtmsInsightLines,
@@ -265,42 +263,9 @@ function buildCtmsData(ws: string): DevDashboardData["ctms"] {
 
 // ── MS Timesheet (공유 업로드) ─────────────────────────────────────────────────
 
-async function buildTimesheetData(): Promise<{
-  data: DevDashboardData["timesheet"];
-  status: { present: boolean; updatedAt: string | null; sizeBytes: number | null };
-}> {
-  try {
-    const rows = await query<{ stored_path: string; created_at: string; file_size: string }>(
-      `SELECT stored_path, created_at, file_size FROM uploaded_files
-       WHERE original_name = $1
-       ORDER BY created_at DESC LIMIT 1`,
-      [TIMESHEET_FILE]
-    );
-    if (!rows.length || !fs.existsSync(rows[0].stored_path)) {
-      return { data: null, status: { present: false, updatedAt: null, sizeBytes: null } };
-    }
-
-    const ts = readDevMsTimesheetData(rows[0].stored_path);
-    const groups = ts.groups.map((g) => ({
-      groupName: g.groupName,
-      chart: {
-        labels: g.chartRows.map((r) => ym2label(r.month)),
-        values: g.chartRows.map((r) => Math.round(r.used)),
-      } as DashboardSeries,
-    })).filter((g) => g.chart.labels.length > 0);
-
-    return {
-      data:   groups.length ? { groups } : null,
-      status: {
-        present:   true,
-        updatedAt: rows[0].created_at,
-        sizeBytes: Number(rows[0].file_size ?? 0),
-      },
-    };
-  } catch (e) {
-    logger.warn(`[DEV Dashboard] Timesheet 파싱 실패: ${(e as Error).message}`);
-    return { data: null, status: { present: false, updatedAt: null, sizeBytes: null } };
-  }
+/** 공유 Timesheet — 세 본부 공통 구현(snapshot.shared) 사용 */
+function buildTimesheetData() {
+  return buildTimesheetSection("DEV");
 }
 
 // ── KPI ───────────────────────────────────────────────────────────────────────

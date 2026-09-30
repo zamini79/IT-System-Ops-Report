@@ -18,10 +18,7 @@ import type {
 } from "./dashboard.types";
 
 import { logger } from "../../utils/logger";
-import { query }  from "../../config/db";
-import { readDevMsTimesheetData }    from "../report/dev.report.service";
-import { readMsTimesheetData as readLhouseTimesheet } from "../report/lhouse.report.service";
-import { readMsTimesheetData as readBioTimesheet }    from "../report/bio.report.service";
+import { findLatestTimesheet, msDashboardGroups, readMsBurnReport } from "../report/ms-burn-report";
 
 // ── 소스 정의 ─────────────────────────────────────────────────────────────────
 
@@ -146,11 +143,21 @@ export interface TimesheetSection {
   status: TimesheetStatus;
 }
 
+/** 본부별로 대시보드에 보여 줄 MS Burn Report 시트와 표시 이름 */
+const TIMESHEET_GROUPS: Record<"DEV" | "LHOUSE" | "BIO", { sheet: string; label: string }[]> = {
+  DEV:    [
+    { sheet: "SKB Clinical", label: "SKB Clinical" },
+    { sheet: "SKB GCP",      label: "SKB GCP" },
+    { sheet: "Medcomms",     label: "Medcomms" },
+  ],
+  LHOUSE: [{ sheet: "SKB GMP", label: "L HOUSE 공장" }],
+  BIO:    [{ sheet: "SKB R&D", label: "Bio연구본부" }],
+};
+
 /**
- * 공유 Timesheet 파일을 읽어 "그룹별 월간 사용 MS" 시리즈로 만든다.
- *
- * 본부별로 리포트 서비스의 파서가 다르다(개발본부는 3개 그룹, L HOUSE·BIO 는 단일 집계).
- * 각 PDF 와 같은 값이 나오도록 본부별 파서를 그대로 사용한다.
+ * 공유 Timesheet(MS Burn Report) 를 읽어 "그룹별 이번 달 사용 시간" 시리즈로 만든다.
+ * 새 양식은 파일 하나가 한 달치라 시리즈는 해당 월 한 점이다.
+ * 보고서와 같은 값이 나오도록 보고서와 같은 파서(ms-burn-report)를 쓴다.
  */
 export async function buildTimesheetSection(
   division: "DEV" | "LHOUSE" | "BIO"
@@ -160,48 +167,11 @@ export async function buildTimesheetSection(
   };
 
   try {
-    const rows = await query<{ stored_path: string; created_at: string; file_size: string }>(
-      `SELECT stored_path, created_at, file_size FROM uploaded_files
-       WHERE original_name = $1
-       ORDER BY created_at DESC LIMIT 1`,
-      [TIMESHEET_FILE]
-    );
-    if (!rows.length || !fs.existsSync(rows[0].stored_path)) return empty;
+    const ts = await findLatestTimesheet();
+    if (!ts) return empty;
+    const status: TimesheetStatus = { present: true, updatedAt: ts.createdAt, sizeBytes: ts.sizeBytes };
 
-    const p = rows[0].stored_path;
-    const status: TimesheetStatus = {
-      present:   true,
-      updatedAt: rows[0].created_at,
-      sizeBytes: Number(rows[0].file_size ?? 0),
-    };
-
-    let groups: { groupName: string; chart: DashboardSeries }[] = [];
-
-    if (division === "DEV") {
-      // 개발본부: SKB Clinical / SKB GCP / Medcomms 3개 그룹
-      const ts = readDevMsTimesheetData(p);
-      groups = ts.groups.map((g) => ({
-        groupName: g.groupName,
-        chart: {
-          labels: g.chartRows.map((r) => ym2label(r.month)),
-          values: g.chartRows.map((r) => Math.round(r.used)),
-        },
-      }));
-    } else {
-      // L HOUSE · BIO: 단일 집계 (본부 이름을 그룹명으로)
-      const read = division === "LHOUSE" ? readLhouseTimesheet : readBioTimesheet;
-      const name = division === "LHOUSE" ? "L HOUSE 공장" : "Bio연구본부";
-      const ts   = read(p);
-      groups = [{
-        groupName: name,
-        chart: {
-          labels: ts.chartRows.map((r) => ym2label(r.month)),
-          values: ts.chartRows.map((r) => Math.round(r.used)),
-        },
-      }];
-    }
-
-    groups = groups.filter((g) => g.chart.labels.length > 0);
+    const groups = msDashboardGroups(readMsBurnReport(ts.path), TIMESHEET_GROUPS[division], ym2label);
     return { data: groups.length ? { groups } : null, status };
 
   } catch (e) {

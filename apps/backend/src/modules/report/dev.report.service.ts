@@ -16,13 +16,15 @@ import path from "path";
 import { execSync } from "child_process";
 
 import * as XLSX    from "xlsx";
-import { chromium } from "playwright";
 // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-explicit-any
 const sharp = require("sharp") as (input: any, options?: any) => any;
 
 import { logger }       from "../../utils/logger";
+import { captureChartPng } from "../../engines/report/chartCapture";
 import { PdfGenerator } from "../../engines/report/PdfGenerator";
-import { query }        from "../../config/db";
+import {
+  MsBurnReport, MS_GROUPS_BY_DIVISION, findLatestTimesheet, msSectionsHtml, readMsBurnReport,
+} from "./ms-burn-report";
 
 // ── 날짜 헬퍼 ─────────────────────────────────────────────────────────────────
 
@@ -60,10 +62,6 @@ const CTMS_CHART_TITLES = [
   "CTMS, eTMF - Study별 사용자 현황",
 ] as const;
 
-// ── MS Timesheet 데이터 구조 ─────────────────────────────────────────────────
-
-const DEV_MS_GROUP_NAMES = ["SKB Clinical", "SKB GCP", "Medcomms"] as const;
-
 interface GcpStats {
   newDocuments: number;  // chart 2 OCR — 신규 문서 수
   deviation:    number;  // chart 3 OCR — Deviation 건수
@@ -83,36 +81,6 @@ interface MedcommsStats {
   timeInReview: number;  // chart 6 OCR — Time in Review (해당 월)
 }
 
-export interface MsChartRow {
-  month:     string;  // e.g. "2026-03"
-  possible:  number;  // B열 = 가능 MS
-  used:      number;  // C열 = 사용 MS
-  remaining: number;  // D열 = 잔여 MS
-}
-
-interface MsTableRow {
-  hours:     string;
-  system:    string;
-  category:  string;
-  subject:   string;
-  detail:    string;
-  startDate: string;
-  endDate:   string;
-  status:    string;
-}
-
-export interface DevMsGroupData {
-  groupName:  string;
-  chartRows:  MsChartRow[];
-  tableRows:  MsTableRow[];
-}
-
-export interface DevMsTimesheetData {
-  groups:      DevMsGroupData[];
-  latestMonth: string;
-  colHeaders:  string[];
-}
-
 // ── 헬퍼 함수 ─────────────────────────────────────────────────────────────────
 
 function escHtml(s: unknown): string {
@@ -120,20 +88,6 @@ function escHtml(s: unknown): string {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
-}
-
-function excelDateToStr(serial: unknown): string {
-  if (typeof serial !== "number" || serial < 1) return String(serial ?? "");
-  const d   = new Date((serial - 25569) * 86400 * 1000);
-  const y   = d.getUTCFullYear();
-  const m   = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const day = String(d.getUTCDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
-}
-
-function formatMonthKorean(yyyymm: string): string {
-  const [y, m] = yyyymm.split("-");
-  return `${y}년 ${m}월`;
 }
 
 // ── Activity.xlsx 도넛 차트 데이터 구조 ──────────────────────────────────────
@@ -392,22 +346,7 @@ ${scriptTag}
 </body>
 </html>`;
 
-  const browser = await chromium.launch({ headless: true });
-  try {
-    const page = await browser.newPage();
-    await page.setViewportSize({ width: 400, height: 400 });
-    await page.setContent(html, { waitUntil: "networkidle", timeout: 30_000 });
-    await page.waitForTimeout(400);
-    const loaded = await page.evaluate(
-      () => typeof (window as unknown as Record<string, unknown>).Chart !== "undefined"
-    );
-    logger.info(`[DEV Report] 도넛 Chart.js 로드: ${loaded ? "성공" : "실패"}`);
-    const container = page.locator("#chart-container");
-    await container.screenshot({ path: outputPng, type: "png" });
-    logger.info(`[DEV Report] 도넛 PNG: ${outputPng} (${fs.statSync(outputPng).size.toLocaleString()} bytes)`);
-  } finally {
-    await browser.close();
-  }
+  await captureChartPng({ html, width: 400, height: 400, selector: "#chart-container", outputPng, label: "GCP 도넛" });
 }
 
 async function generateGcpChartPng(
@@ -997,207 +936,6 @@ async function extractMedcommsReviewStats(imagePath: string): Promise<{ recordCo
   }
 }
 
-// ── MS Timesheet 읽기 (3개 그룹) ─────────────────────────────────────────────
-
-/**
- * SKB_Quallity_MS_Timesheet.xlsx 에서
- * SKB Clinical / SKB GCP / Medcomms 3개 그룹 데이터를 추출합니다.
- */
-export function readDevMsTimesheetData(xlsxPath: string): DevMsTimesheetData {
-  const wb = XLSX.readFile(xlsxPath);
-
-  const monthSheets = wb.SheetNames
-    .filter((n: string) => /^\d{4}-\d{2}$/.test(n))
-    .sort() as string[];
-
-  let latestMonth = "";
-  let colHeaders: string[] = ["시간(h)", "시스템", "카테고리", "주제", "세부내용", "시작일", "종료일", "상태"];
-
-  // 그룹별 데이터 초기화
-  const groupMap = new Map<string, DevMsGroupData>(
-    DEV_MS_GROUP_NAMES.map((name) => [name, { groupName: name, chartRows: [], tableRows: [] }])
-  );
-
-  for (const sheetName of monthSheets) {
-    const ws = wb.Sheets[sheetName];
-    if (!ws) continue;
-
-    const rows = XLSX.utils.sheet_to_json<unknown[]>(ws, { header: 1, defval: "" }) as unknown[][];
-
-    // 최신 시트에서 컬럼명 읽기
-    if (sheetName === monthSheets[monthSheets.length - 1]) {
-      latestMonth = sheetName;
-      if (rows.length > 0) {
-        const hdr = rows[0] as unknown[];
-        const h   = [4, 6, 7, 8, 9, 10, 11, 12].map((i) => String(hdr[i] ?? "").trim());
-        if (h.some((v) => v !== "")) colHeaders = h.map((v, i) => v || colHeaders[i]);
-      }
-    }
-
-    // 각 그룹의 헤더 행 탐색
-    const foundGroupRows = new Map<string, number>(); // groupName → rowIdx
-
-    for (let i = 0; i < rows.length; i++) {
-      const aVal = String((rows[i] as unknown[])[0] ?? "").trim();
-      for (const groupName of DEV_MS_GROUP_NAMES) {
-        if (aVal === groupName && !foundGroupRows.has(groupName)) {
-          foundGroupRows.set(groupName, i);
-        }
-      }
-    }
-
-    for (const [groupName, gmpRowIdx] of foundGroupRows.entries()) {
-      const gmpRow = rows[gmpRowIdx] as unknown[];
-      const group  = groupMap.get(groupName)!;
-
-      group.chartRows.push({
-        month:     sheetName,
-        possible:  Number(gmpRow[1]) || 0,
-        used:      Number(gmpRow[2]) || 0,
-        remaining: Number(gmpRow[3]) || 0,
-      });
-      logger.info(`[DEV Report MS] ${sheetName} ${groupName} — B:${gmpRow[1]}, C:${gmpRow[2]}, D:${gmpRow[3]}`);
-
-      // 최신 월: 세부 행 수집
-      if (sheetName === monthSheets[monthSheets.length - 1]) {
-        // 다음 그룹 시작 위치 파악
-        const nextGroupRow = (() => {
-          let min = rows.length;
-          for (const [otherGroup, otherIdx] of foundGroupRows.entries()) {
-            if (otherGroup !== groupName && otherIdx > gmpRowIdx && otherIdx < min) {
-              min = otherIdx;
-            }
-          }
-          return min;
-        })();
-
-        // 그룹 헤더 행 자체가 첫 번째 작업 행을 겸하는 케이스를 포함하기 위해
-        // gmpRowIdx 부터 시작 (헤더 행도 E열에 시간 값이 있으면 작업 행으로 수집)
-        for (let i = gmpRowIdx; i < nextGroupRow; i++) {
-          const row  = rows[i] as unknown[];
-          const aVal = String(row[0] ?? "").trim();
-          if (aVal !== "" && aVal !== groupName) break;
-          if (String(row[4] ?? "").trim() === "") continue;
-          group.tableRows.push({
-            hours:     String(row[4]  ?? ""),
-            system:    String(row[6]  ?? ""),
-            category:  String(row[7]  ?? ""),
-            subject:   String(row[8]  ?? ""),
-            detail:    String(row[9]  ?? ""),
-            startDate: excelDateToStr(row[10]),
-            endDate:   excelDateToStr(row[11]),
-            status:    String(row[12] ?? ""),
-          });
-        }
-        logger.info(`[DEV Report MS] ${sheetName} ${groupName} 테이블 행: ${group.tableRows.length}개`);
-      }
-    }
-  }
-
-  return {
-    groups:      [...groupMap.values()],
-    latestMonth,
-    colHeaders,
-  };
-}
-
-// ── MS 막대 차트 렌더링 ──────────────────────────────────────────────────────
-
-async function renderMsBarChartToPng(
-  chartRows:  MsChartRow[],
-  groupName:  string,
-  outputPng:  string,
-): Promise<void> {
-  const labels    = chartRows.map((r) => r.month.replace("-", "."));
-  const possible  = chartRows.map((r) => r.possible);
-  const used      = chartRows.map((r) => r.used);
-  const remaining = chartRows.map((r) => r.remaining);
-
-  const chartJs   = loadChartJsScript();
-  const scriptTag = chartJs
-    ? `<script>${chartJs}</script>`
-    : `<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>`;
-
-  const html = `<!DOCTYPE html>
-<html lang="ko">
-<head>
-<meta charset="utf-8">
-<style>
-  * { margin:0; padding:0; box-sizing:border-box; }
-  body { background:#fff; font-family:"Malgun Gothic",Arial,sans-serif; }
-  #wrap { width:520px; height:280px; }
-</style>
-</head>
-<body>
-<div id="wrap">
-  <canvas id="chart" width="520" height="280"></canvas>
-</div>
-${scriptTag}
-<script>
-(function() {
-  var ctx = document.getElementById('chart').getContext('2d');
-  if (!window.Chart) { ctx.fillStyle='#ef4444'; ctx.font='12px Arial'; ctx.fillText('Chart.js 로드 실패',10,20); return; }
-  var barLabelPlugin = {
-    id: 'barLabels',
-    afterDatasetsDraw: function(chart) {
-      var c = chart.ctx;
-      chart.data.datasets.forEach(function(ds, di) {
-        var meta = chart.getDatasetMeta(di);
-        if (meta.hidden) return;
-        meta.data.forEach(function(bar, bi) {
-          var val = ds.data[bi];
-          if (val === null || val === undefined || val === 0) return;
-          c.save(); c.fillStyle='#1f2937'; c.font='bold 9px Arial';
-          c.textAlign='center'; c.textBaseline='bottom';
-          c.fillText(String(val), bar.x, bar.y - 2); c.restore();
-        });
-      });
-    }
-  };
-  Chart.register(barLabelPlugin);
-  new Chart(ctx, {
-    type: 'bar',
-    data: {
-      labels: ${JSON.stringify(labels)},
-      datasets: [
-        { label: '가능 MS', data: ${JSON.stringify(possible)},  backgroundColor: '#4472C4', borderRadius:3, borderSkipped:false },
-        { label: '사용 MS', data: ${JSON.stringify(used)},      backgroundColor: '#A9D18E', borderRadius:3, borderSkipped:false },
-        { label: '잔여 MS', data: ${JSON.stringify(remaining)}, backgroundColor: '#ED7D31', borderRadius:3, borderSkipped:false },
-      ],
-    },
-    options: {
-      responsive:false, animation:false,
-      layout:{ padding:{ top:16 } },
-      plugins:{
-        legend:{ position:'bottom', labels:{ font:{size:9}, padding:10, usePointStyle:true } },
-        tooltip:{ enabled:false },
-      },
-      scales:{
-        x:{ grid:{display:false}, ticks:{font:{size:10}, color:'#374151'} },
-        y:{ beginAtZero:true, grid:{color:'#f0f4f8'},
-            ticks:{font:{size:9}, color:'#6b7280'},
-            title:{display:true, text:'(MD)', font:{size:9}, color:'#9ca3af'} },
-      },
-    },
-  });
-})();
-</script>
-</body>
-</html>`;
-
-  const browser = await chromium.launch({ headless: true });
-  try {
-    const page = await browser.newPage();
-    await page.setViewportSize({ width: 520, height: 280 });
-    await page.setContent(html, { waitUntil: "networkidle", timeout: 30_000 });
-    await page.waitForTimeout(400);
-    await page.locator("#wrap").screenshot({ path: outputPng, type: "png" });
-    logger.info(`[DEV Report MS] ${groupName} bar chart: ${outputPng} (${fs.statSync(outputPng).size.toLocaleString()} B)`);
-  } finally {
-    await browser.close();
-  }
-}
-
 // ── GCP 보고서용 월별 막대 차트 (PerfStats/Quality/Training Formatted export) ────
 // Formatted export 는 "Created Date (Month): YYYY Mon" 그룹 행에 월별 집계를 담는다:
 //   PerfStats : B=Active User 평균, D=Unique Login 평균, E=Doc Count 평균
@@ -1256,16 +994,7 @@ export async function renderGcpBarToPng(
         scales:{y:{beginAtZero:true,grace:'15%',ticks:{font:{size:11}}},x:{ticks:{font:{size:13}}}},
         plugins:{legend:{display:false},tooltip:{enabled:false}}}});
   })();</script></body></html>`;
-  const browser = await chromium.launch({ headless: true });
-  try {
-    const page = await browser.newPage();
-    await page.setViewportSize({ width: 440, height: 300 });
-    await page.setContent(html, { waitUntil: "networkidle", timeout: 30_000 });
-    await page.waitForTimeout(350);
-    await page.locator("#c").screenshot({ path: outputPng, type: "png" });
-  } finally {
-    await browser.close();
-  }
+  await captureChartPng({ html, width: 440, height: 300, selector: "#c", outputPng, label: "막대 차트" });
 }
 
 /** Quality 의 월 그룹 안 "Quality Event Type: <Type> (N)" 소계 → 월×타입 건수 */
@@ -1340,16 +1069,7 @@ export async function renderGcpGroupedBarToPng(
         scales:${scales},
         plugins:{legend:{display:true,position:'top',labels:{font:{size:11},boxWidth:12}},tooltip:{enabled:false}}}});
   })();</script></body></html>`;
-  const browser = await chromium.launch({ headless: true });
-  try {
-    const page = await browser.newPage();
-    await page.setViewportSize({ width, height });
-    await page.setContent(html, { waitUntil: "networkidle", timeout: 30_000 });
-    await page.waitForTimeout(350);
-    await page.locator("#c").screenshot({ path: outputPng, type: "png" });
-  } finally {
-    await browser.close();
-  }
+  await captureChartPng({ html, width, height, selector: "#c", outputPng, label: "그룹 막대 차트" });
 }
 
 export interface GcpBarCharts {
@@ -1723,16 +1443,7 @@ async function renderGcpStackedBarToPng(
         scales:{x:{stacked:true,ticks:{font:{size:10},maxRotation:30,minRotation:0}},y:{stacked:true,beginAtZero:true,grace:'12%',ticks:{font:{size:10},precision:0}}},
         plugins:{legend:{display:true,position:'bottom',labels:{font:{size:10},boxWidth:10,padding:6}},tooltip:{enabled:false}}}});
   })();</script></body></html>`;
-  const browser = await chromium.launch({ headless: true });
-  try {
-    const page = await browser.newPage();
-    await page.setViewportSize({ width, height });
-    await page.setContent(html, { waitUntil: "networkidle", timeout: 30_000 });
-    await page.waitForTimeout(350);
-    await page.locator("#c").screenshot({ path: outputPng, type: "png" });
-  } finally {
-    await browser.close();
-  }
+  await captureChartPng({ html, width, height, selector: "#c", outputPng, label: "누적 막대 차트" });
 }
 
 export interface CtmsBarCharts {
@@ -1863,8 +1574,7 @@ function buildDevReportHtml(
   gcpCharts:      Array<{ base64: string; mime: string } | null>,  // 분할 이미지 [0]=미사용(도넛대체), [1-5] 사용
   medcommsCharts: Array<{ base64: string; mime: string } | null>,
   ctmsCharts:     Array<{ base64: string; mime: string } | null>,
-  msData?:        DevMsTimesheetData | null,
-  msBarCharts?:      Map<string, string | null>,
+  msData?:        MsBurnReport | null,
   gcpStats?:         GcpStats | null,
   medcommsStats?:    MedcommsStats | null,
   gcpBar?:           GcpBarCharts | null,        // GCP 보고서용 월별 막대 차트 5종
@@ -1901,13 +1611,8 @@ function buildDevReportHtml(
 
   // ── 헤드라인 — MS 건/시간 집계 ─────────────────────────────────────────────────
   const msGroupStat = (name: string) => {
-    const g = msData?.groups.find((gr) => gr.groupName === name);
-    if (!g) return { count: 0, hours: 0 };
-    const count = g.tableRows.length;
-    const hours = Math.round(
-      g.tableRows.reduce((s, r) => s + (parseFloat(r.hours) || 0), 0)
-    );
-    return { count, hours };
+    const g = msData?.groups.get(name);
+    return { count: g?.rows.length ?? 0, hours: g?.burned ?? 0 };
   };
   const qualityMs  = msGroupStat("SKB GCP");
   const clinicalMs = msGroupStat("SKB Clinical");
@@ -2059,72 +1764,6 @@ function buildDevReportHtml(
 
   // ── Page 4: MS 진행 현황 ──────────────────────────────────────────────────────
   const msPageHtml = msData ? (() => {
-    const latestLabel = msData.latestMonth ? formatMonthKorean(msData.latestMonth) : titleDate;
-    const [hE, hG, hH, hI, hJ, hK, hL, hM] = msData.colHeaders;
-
-    // 그룹별 막대 차트 섹션 (3열 배치)
-    const chartsRowHtml = `
-    <div class="ms-section">
-      <div class="ms-section-title">1) 시스템 별 MS 현황</div>
-      <div class="ms-three-charts">
-        ${msData.groups.map((g) => {
-          const chartBase64 = msBarCharts?.get(g.groupName) ?? null;
-          const summaryRows = g.chartRows.map((r) => `<tr>
-            <td>${escHtml(formatMonthKorean(r.month))}</td>
-            <td>${r.possible}</td><td>${r.used}</td><td>${r.remaining}</td>
-          </tr>`).join("");
-          return `
-          <div class="ms-chart-group">
-            <div class="ms-chart-subtitle">${escHtml(g.groupName)}</div>
-            <div class="ms-chart-wrap">
-              ${chartBase64
-                ? `<img src="data:image/png;base64,${chartBase64}" alt="${escHtml(g.groupName)} MS 차트" />`
-                : `<div class="ms-no-data">차트 없음</div>`}
-            </div>
-            ${g.chartRows.length > 0 ? `
-            <table class="ms-summary-table" style="font-size:8px;margin-top:4px;">
-              <thead><tr><th>월</th><th>가능</th><th>사용</th><th>잔여</th></tr></thead>
-              <tbody>${summaryRows}</tbody>
-            </table>` : ""}
-          </div>`;
-        }).join("")}
-      </div>
-    </div>`;
-
-    // 그룹별 상세 테이블
-    const tableHeaderRow = `<tr>
-      <th>${escHtml(hG)}</th><th>${escHtml(hH)}</th>
-      <th style="min-width:80px">${escHtml(hI)}</th><th>${escHtml(hJ)}</th>
-      <th style="white-space:nowrap">${escHtml(hK)}</th>
-      <th style="white-space:nowrap">${escHtml(hL)}</th>
-      <th style="white-space:nowrap">${escHtml(hM)}</th>
-      <th style="white-space:nowrap">${escHtml(hE)}</th>
-    </tr>`;
-
-    const tablesHtml = msData.groups.map((g) => {
-      const bodyRows = g.tableRows.map((r) => `<tr>
-        <td class="td-center">${escHtml(r.system)}</td>
-        <td class="td-center">${escHtml(r.category)}</td>
-        <td>${escHtml(r.subject)}</td>
-        <td class="td-detail">${escHtml(r.detail)}</td>
-        <td class="td-nowrap">${escHtml(r.startDate)}</td>
-        <td class="td-nowrap">${escHtml(r.endDate)}</td>
-        <td class="td-nowrap">${escHtml(r.status)}</td>
-        <td class="td-nowrap td-num">${escHtml(r.hours)}</td>
-      </tr>`).join("");
-
-      return `
-    <div class="ms-section">
-      <div class="ms-table-title">${escHtml(latestLabel)} ${escHtml(g.groupName)} Managed Service 주요 현황</div>
-      ${g.tableRows.length > 0
-        ? `<table class="ms-table">
-             <thead>${tableHeaderRow}</thead>
-             <tbody>${bodyRows}</tbody>
-           </table>`
-        : `<div class="ms-no-data">해당 월 ${escHtml(g.groupName)} 세부 데이터가 없습니다.</div>`}
-    </div>`;
-    }).join("");
-
     return `
   <!-- ── MS 진행 현황 페이지 ── -->
   <div class="page ms-page">
@@ -2139,8 +1778,7 @@ function buildDevReportHtml(
       </thead>
       <tbody>
         <tr><td>
-          ${chartsRowHtml}
-          ${tablesHtml}
+          ${msSectionsHtml(msData, MS_GROUPS_BY_DIVISION.DEV)}
         </td></tr>
       </tbody>
       <tfoot>
@@ -2526,41 +2164,14 @@ export async function generateDevReport(jobId: string): Promise<DevReportResult>
     }
   }
 
-  // 3) MS Timesheet — DB 에서 최신 파일 조회
-  let msData:       DevMsTimesheetData | null = null;
-  let msBarCharts:  Map<string, string | null> = new Map();
-
-  try {
-    const tsRows = await query<{ stored_path: string }>(
-      `SELECT stored_path FROM uploaded_files
-       WHERE original_name = 'SKB_Quallity_MS_Timesheet.xlsx'
-       ORDER BY created_at DESC LIMIT 1`,
-      []
-    );
-
-    if (tsRows.length && fs.existsSync(tsRows[0].stored_path)) {
-      const tsPath = tsRows[0].stored_path;
-      logger.info(`[DEV Report] Timesheet 파일: ${tsPath}`);
-
-      msData = readDevMsTimesheetData(tsPath);
-
-      // 3개 그룹 각각 막대 차트 렌더링
-      for (const group of msData.groups) {
-        if (group.chartRows.length === 0) {
-          logger.warn(`[DEV Report] ${group.groupName}: 차트 데이터 없음 — 스킵`);
-          msBarCharts.set(group.groupName, null);
-          continue;
-        }
-        const pngPath = path.join(uploadPath, `ms_barchart_${group.groupName.replace(/\s+/g, "_")}_${Date.now()}.png`);
-        await renderMsBarChartToPng(group.chartRows, group.groupName, pngPath);
-        msBarCharts.set(group.groupName, fs.existsSync(pngPath) ? fs.readFileSync(pngPath).toString("base64") : null);
-      }
-    } else {
-      logger.info("[DEV Report] Timesheet 파일 없음 — MS 페이지 생략");
-    }
-  } catch (e) {
-    logger.error(`[DEV Report] Timesheet 처리 실패 (무시): ${(e as Error).message}`);
-    msData = null;
+  // 3) MS Timesheet — 최신 업로드 파일 (없으면 MS 페이지 생략, 이전 양식이면 오류)
+  let msData: MsBurnReport | null = null;
+  const ts = await findLatestTimesheet();
+  if (ts) {
+    logger.info(`[DEV Report] Timesheet 파일: ${ts.path}`);
+    msData = readMsBurnReport(ts.path);
+  } else {
+    logger.info("[DEV Report] Timesheet 파일 없음 — MS 페이지 생략");
   }
 
   // 2.5) GCP 보고서용 월별 막대 차트 5종 (PerfStats/Quality/Training Formatted export)
@@ -2594,7 +2205,7 @@ export async function generateDevReport(jobId: string): Promise<DevReportResult>
   logger.info(`[DEV Report] ── buildDevReportHtml 호출 직전 ── medcommsStats=${JSON.stringify(medcommsStats)}`);
   const { year, month } = getLastMonth();
   const titleDate  = `${year}년 ${String(month).padStart(2, "0")}월`;
-  const html       = buildDevReportHtml(titleDate, gcpDonutBase64, gcpCounts, gcpCharts, medcommsCharts, ctmsCharts, msData, msBarCharts, gcpStats, medcommsStats, gcpBar, medcommsBar, ctmsBar);
+  const html       = buildDevReportHtml(titleDate, gcpDonutBase64, gcpCounts, gcpCharts, medcommsCharts, ctmsCharts, msData, gcpStats, medcommsStats, gcpBar, medcommsBar, ctmsBar);
   const outputDir  = path.resolve(process.env.OUTPUT_DIR ?? "outputs");
   fs.mkdirSync(outputDir, { recursive: true });
 

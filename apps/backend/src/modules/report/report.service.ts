@@ -173,14 +173,13 @@ export async function getPdfPath(jobId: string): Promise<string> {
 
   const { pdf_path, status } = rows[0];
 
-  if (status !== "COMPLETED" || !pdf_path) {
+  // jobId 가 본부별로 고정이라 수집을 시작하면 status 가 RUNNING 으로 바뀐다.
+  // 그래도 이전에 만든 PDF 는 그대로 있으므로, 파일이 있으면 상태와 무관하게 내려준다.
+  if (pdf_path && fs.existsSync(pdf_path)) return pdf_path;
+  if (!pdf_path) {
     throw new AppError(409, `PDF 가 아직 준비되지 않았습니다. 현재 상태: ${status}`);
   }
-  if (!fs.existsSync(pdf_path)) {
-    throw new AppError(404, "PDF 파일이 서버에 존재하지 않습니다.");
-  }
-
-  return pdf_path;
+  throw new AppError(404, "PDF 파일이 서버에 존재하지 않습니다.");
 }
 
 // ── 백그라운드 생성 ────────────────────────────────────────────────────────────
