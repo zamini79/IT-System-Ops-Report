@@ -16,6 +16,7 @@
  */
 
 import fs from "fs";
+import path from "path";
 import * as XLSX from "xlsx";
 import { AppError } from "../../utils/errors";
 import { logger }   from "../../utils/logger";
@@ -144,7 +145,7 @@ function readSheet(ws: XLSX.WorkSheet, groupName: string): { group: MsGroup; tit
  * MS Burn Report 엑셀을 읽는다.
  * 예전 양식(YYYY-MM 월별 시트)이면 새 양식으로 다시 올리라는 오류를 던진다.
  */
-export function readMsBurnReport(xlsxPath: string): MsBurnReport {
+export function readMsBurnReport(xlsxPath: string, opts: { quiet?: boolean } = {}): MsBurnReport {
   let wb: XLSX.WorkBook;
   try {
     wb = XLSX.readFile(xlsxPath);
@@ -174,7 +175,7 @@ export function readMsBurnReport(xlsxPath: string): MsBurnReport {
     if (!month) {
       month = title.match(/(\d{4})-(\d{2})/)?.[0] ?? firstDate.slice(0, 7);
     }
-    logger.info(`[MS Burn] ${groupName}: ${group.rows.length}행, ${group.burned}h` +
+    if (!opts.quiet) logger.info(`[MS Burn] ${groupName}: ${group.rows.length}행, ${group.burned}h` +
       (group.summary.length ? ` (요약 ${group.summary.map((s) => `${s.label}=${s.value}`).join(", ")})` : ""));
   }
 
@@ -278,17 +279,100 @@ export function msSectionsHtml(report: MsBurnReport, groupNames: readonly string
     ${tablesHtml}`;
 }
 
-/** 대시보드용: 그룹별 이번 달 사용 시간 (단일 월 시리즈) */
+// ── 월별 이력 ─────────────────────────────────────────────────────────────────
+//
+// 새 양식은 파일 하나가 한 달치이고 업로드하면 같은 이름으로 덮어써진다.
+// 그래서 읽을 때마다 현재 파일을 ms_history/YYYY-MM.xlsx 로 보관해 두고,
+// 대시보드는 보관된 달들을 모아 추이를 그린다. 같은 달을 다시 올리면 그 달만 교체된다.
+//
+// 이전 양식(월별 시트, 1~7월) 파일도 ms_history/legacy-YYYY-MM.xlsx 로 두면
+// 각 월 시트의 그룹 행 C열(Burned MS)을 이력으로 읽는다. C열은 그 그룹의 작업 시간
+// 합계와 같은 값이라 새 양식의 Hours 합계와 단위가 같다. 같은 달은 새 양식이 우선한다.
+//
+// 폴더는 공유 Timesheet 옆(uploads/<공유 jobId>/uploads/ms_history)이라
+// 폐쇄망 이관 꾸러미(files/)에도 그대로 포함된다.
+
+/** 월 → (그룹 → 사용 시간) */
+export type MsHistory = Map<string, Map<string, number>>;
+
+function historyDir(timesheetPath: string): string {
+  return path.join(path.dirname(timesheetPath), "ms_history");
+}
+
+/** 현재 Timesheet 를 월별 보관 폴더에 복사한다 (바뀐 경우에만). 새 양식만 보관한다. */
+export function archiveTimesheet(timesheetPath: string, month: string): void {
+  try {
+    const dir  = historyDir(timesheetPath);
+    const dest = path.join(dir, `${month}.xlsx`);
+    const src  = fs.statSync(timesheetPath);
+    if (fs.existsSync(dest)) {
+      const d = fs.statSync(dest);
+      if (d.size === src.size && d.mtimeMs >= src.mtimeMs) return;   // 이미 보관됨
+    }
+    fs.mkdirSync(dir, { recursive: true });
+    fs.copyFileSync(timesheetPath, dest);
+    logger.info(`[MS Burn] ${month} 월별 보관: ${dest}`);
+  } catch (e) {
+    logger.warn(`[MS Burn] 월별 보관 실패 (무시): ${(e as Error).message}`);
+  }
+}
+
+/** 이전 양식 파일에서 월별·그룹별 Burned MS (C열) */
+function readLegacyHistory(xlsxPath: string, into: MsHistory): void {
+  const wb = XLSX.readFile(xlsxPath);
+  for (const name of wb.SheetNames.filter((n) => /^\d{4}-\d{2}$/.test(n))) {
+    const rows = XLSX.utils.sheet_to_json<unknown[]>(wb.Sheets[name], { header: 1, defval: "" }) as unknown[][];
+    const month = into.get(name) ?? new Map<string, number>();
+    for (const r of rows) {
+      const group = cellStr(r[0]);
+      if (!group || /^(name|total)$/i.test(group) || /work report/i.test(group)) continue;
+      const burned = Number(r[2]);
+      if (Number.isFinite(burned) && r[2] !== "") month.set(group, round1(burned));
+    }
+    if (month.size) into.set(name, month);
+  }
+}
+
+/** 보관된 모든 달의 그룹별 사용 시간 */
+export function readMsHistory(timesheetPath: string): MsHistory {
+  const history: MsHistory = new Map();
+  const dir = historyDir(timesheetPath);
+  if (!fs.existsSync(dir)) return history;
+  const files = fs.readdirSync(dir).filter((f) => /\.xlsx$/i.test(f)).sort();
+
+  // 이전 양식을 먼저 읽고, 같은 달은 새 양식으로 덮는다
+  for (const f of files.filter((f) => f.startsWith("legacy-"))) {
+    try { readLegacyHistory(path.join(dir, f), history); }
+    catch (e) { logger.warn(`[MS Burn] 이력 파일 읽기 실패 ${f}: ${(e as Error).message}`); }
+  }
+  for (const f of files.filter((f) => /^\d{4}-\d{2}\.xlsx$/.test(f))) {
+    try {
+      const r = readMsBurnReport(path.join(dir, f), { quiet: true });
+      history.set(r.month, new Map([...r.groups].map(([n, g]) => [n, g.burned])));
+    } catch (e) { logger.warn(`[MS Burn] 이력 파일 읽기 실패 ${f}: ${(e as Error).message}`); }
+  }
+  return history;
+}
+
+/**
+ * 대시보드용: 그룹별 월간 사용 시간 추이 (기준 월까지 최근 maxMonths 개월).
+ * 보관된 달 중 한 번도 값이 없는 그룹은 뺀다.
+ */
 export function msDashboardGroups(
-  report: MsBurnReport,
-  groups: { sheet: string; label: string }[],
+  history:  MsHistory,
+  upTo:     string,
+  groups:   { sheet: string; label: string }[],
   ym2label: (ym: string) => string,
+  maxMonths = 6,
 ): { groupName: string; chart: { labels: string[]; values: number[] } }[] {
+  const months = [...history.keys()].filter((m) => m <= upTo).sort().slice(-maxMonths);
   return groups
-    .map(({ sheet, label }) => ({ label, g: report.groups.get(sheet) }))
-    .filter((x): x is { label: string; g: MsGroup } => !!x.g)
-    .map(({ label, g }) => ({
+    .filter(({ sheet }) => months.some((m) => history.get(m)?.has(sheet)))
+    .map(({ sheet, label }) => ({
       groupName: label,
-      chart: { labels: [ym2label(report.month)], values: [g.burned] },
+      chart: {
+        labels: months.map(ym2label),
+        values: months.map((m) => history.get(m)?.get(sheet) ?? 0),
+      },
     }));
 }

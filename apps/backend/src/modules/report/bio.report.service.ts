@@ -25,7 +25,9 @@ import { renderGcpBarToPng, renderGcpGroupedBarToPng, parseGcpMonthGroups } from
 
 // ── 날짜 헬퍼 ─────────────────────────────────────────────────────────────────
 
-function getLastMonth(): { year: number; month: number } {
+export interface YearMonth { year: number; month: number }
+
+function getLastMonth(): YearMonth {
   const now = new Date();
   const m   = now.getMonth();
   return m === 0
@@ -708,8 +710,8 @@ function readLimsServiceData(xlsxPath: string): { rows: LimsServiceRow[]; descri
 //   E(4)=Lifecyclestate, G(6)=Samplecount, I(8)=taskID, M(12)=Task Plan, O(14)=week
 
 /** 보고서 기준 최근 3개월 [M-3, M-2, M-1] ("YYYY-MM") */
-function recentThreeMonths(): string[] {
-  const { year, month } = getLastMonth();   // M-1
+function recentThreeMonths(target?: YearMonth): string[] {
+  const { year, month } = target ?? getLastMonth();   // 기준 월 (기본: M-1)
   const out: string[] = [];
   for (let k = 2; k >= 0; k--) {
     let y = year, m = month - k;
@@ -740,7 +742,7 @@ interface LimsElnData {
   totals:      { taskPlan: number; taskCount: number; sample: number };
 }
 
-function readLimsElnData(xlsxPath: string): LimsElnData | null {
+function readLimsElnData(xlsxPath: string, target?: YearMonth): LimsElnData | null {
   const wb = XLSX.readFile(xlsxPath);
   // "PreprocessdData" 시트 사용 (오탈자 대비 preprocess 부분일치)
   const sheetName = wb.SheetNames.find((n: string) => /preprocess/i.test(n));
@@ -765,7 +767,7 @@ function readLimsElnData(xlsxPath: string): LimsElnData | null {
     return m ? `${m[1]}-${m[2].padStart(2, "0")}` : "";
   };
 
-  const months      = recentThreeMonths();
+  const months      = recentThreeMonths(target);
   const latestMonth = months[months.length - 1];
   const mlabel      = (ym: string) => `${parseInt(ym.slice(5, 7), 10)}월`;
 
@@ -894,6 +896,7 @@ function buildBioLimsReportHtml(
   today:           string,
   charts:          { taskPlan: string | null; taskCount: string | null; sample: string | null; status: string | null; weekly: string | null },
   data:            LimsElnData | null,
+  service:         { rows: LimsServiceRow[]; description: string } | null,
 ): string {
   const monthRange = data && data.monthLabels.length
     ? `${data.monthLabels[0]}~${data.monthLabels[data.monthLabels.length - 1]}`
@@ -1002,6 +1005,20 @@ function buildBioLimsReportHtml(
     .gcp-insight .gcp-insight-label { font-weight:700; color:#15803d; font-size:11px; margin-bottom:4px; }
     .gcp-insight p { margin:0 0 3px; }
     .gcp-insight p:last-child { margin-bottom:0; }
+    /* IT서비스 진행 현황 (유지보수리스트) */
+    .svc-table { width:100%; border-collapse:collapse; font-size:9px; margin-top:4px; }
+    .svc-table th {
+      background:#0f2d55; color:#fff; padding:5px 4px; text-align:center;
+      font-size:9px; font-weight:600; border:1px solid #0f2d55;
+    }
+    .svc-table td { padding:4px 5px; border:1px solid #d1d5db; vertical-align:top; text-align:center; }
+    .svc-table .td-left { text-align:left; }
+    .svc-table tr.alt td { background:#f9fafb; }
+    .desc-box {
+      margin-top:16px; padding:10px 14px; background:#f8fafc;
+      border:1px solid #e5e7eb; border-radius:4px;
+      font-size:9.5px; color:#374151; line-height:1.6;
+    }
     .footer {
       margin-top:14px; padding-top:10px; border-top:1px solid #e5e7eb;
       font-size:10px; color:#d1d5db; display:flex; justify-content:space-between;
@@ -1037,14 +1054,67 @@ function buildBioLimsReportHtml(
       <span>${titleDate}</span>
     </div>
   </div>
+${service ? limsServicePageHtml(titleDate, service) : ""}
 </body>
 </html>`;
 }
 
-export async function generateBioLimsReport(jobId: string): Promise<BioReportResult> {
-  logger.info(`[BIO LIMS Report] 보고서 생성 요청 — jobId: ${jobId}`);
+/** 줄바꿈을 살린 HTML 이스케이프 (엑셀 셀 안의 Alt+Enter 줄바꿈) */
+const escMultiline = (s: string) => escHtml(s.trim()).replace(/\r?\n/g, "<br>");
 
-  const { year, month } = getLastMonth();
+/** IT서비스 진행 현황 — 유지보수리스트(LIMS.xlsx) 표 페이지 */
+function limsServicePageHtml(
+  titleDate: string,
+  service:   { rows: LimsServiceRow[]; description: string },
+): string {
+  const body = service.rows.length
+    ? service.rows.map((r, i) => `
+      <tr class="${i % 2 === 0 ? "" : "alt"}">
+        <td>${escHtml(r.initiatedAt)}</td>
+        <td>${escHtml(r.area)}</td>
+        <td class="td-left">${escMultiline(r.contentSummary)}</td>
+        <td class="td-left">${escMultiline(r.detail)}</td>
+        <td>${escHtml(r.issueType)}</td>
+        <td>${escHtml(r.status)}</td>
+        <td>${escHtml(r.hours)}</td>
+      </tr>`).join("")
+    : `<tr><td colspan="7" style="text-align:center;color:#9ca3af;padding:20px;">데이터 없음</td></tr>`;
+
+  return `
+  <div class="page">
+    <div class="page-header">
+      <h2>IT서비스 진행 현황</h2>
+      <span class="pg">${titleDate}</span>
+    </div>
+    <table class="svc-table">
+      <thead>
+        <tr>
+          <th style="width:10%">발의일자</th>
+          <th style="width:9%">영역구분</th>
+          <th style="width:18%">내용요약</th>
+          <th style="width:28%">상세내용</th>
+          <th style="width:9%">이슈구분</th>
+          <th style="width:9%">진행상태</th>
+          <th style="width:7%">지원시간</th>
+        </tr>
+      </thead>
+      <tbody>${body}</tbody>
+    </table>
+    ${service.description ? `<div class="desc-box">${escMultiline(service.description)}</div>` : ""}
+    <div class="footer">
+      <span>SK Bioscience Bio연구본부 — 임검분 LIMS 운영 현황</span>
+      <span>${titleDate}</span>
+    </div>
+  </div>`;
+}
+
+/**
+ * @param target 기준 월 — 생략하면 지난달. 지난 달 보고서를 다시 만들 때 지정한다.
+ */
+export async function generateBioLimsReport(jobId: string, target?: YearMonth): Promise<BioReportResult> {
+  logger.info(`[BIO LIMS Report] 보고서 생성 요청 — jobId: ${jobId}` + (target ? ` (기준 월 ${target.year}-${target.month})` : ""));
+
+  const { year, month } = target ?? getLastMonth();
   const titleDate = `${year}년 ${String(month).padStart(2, "0")}월`;
   const today     = new Date().toISOString().slice(0, 10);
 
@@ -1064,7 +1134,7 @@ export async function generateBioLimsReport(jobId: string): Promise<BioReportRes
     );
     if (srcRows.length && fs.existsSync(srcRows[0].stored_path)) {
       logger.info(`[BIO LIMS Report] LIMS_Dashboard.xlsx: ${srcRows[0].stored_path}`);
-      data = readLimsElnData(srcRows[0].stored_path);
+      data = readLimsElnData(srcRows[0].stored_path, target);
     } else {
       logger.info("[BIO LIMS Report] LIMS_Dashboard.xlsx 없음 — 차트 생략");
     }
@@ -1111,7 +1181,27 @@ export async function generateBioLimsReport(jobId: string): Promise<BioReportRes
     }
   }
 
-  const html = buildBioLimsReportHtml(titleDate, today, charts, data);
+  // IT서비스 진행 현황 — 유지보수리스트(LIMS.xlsx). 2026-07 차트 개편 때 빠졌던 표를 다시 싣는다.
+  let service: { rows: LimsServiceRow[]; description: string } | null = null;
+  try {
+    const svcRows = await query<{ stored_path: string }>(
+      `SELECT stored_path FROM uploaded_files
+       WHERE report_job_id = $1 AND original_name = 'LIMS.xlsx'
+       ORDER BY created_at DESC LIMIT 1`,
+      [jobId]
+    );
+    if (svcRows.length && fs.existsSync(svcRows[0].stored_path)) {
+      logger.info(`[BIO LIMS Report] LIMS.xlsx(유지보수리스트): ${svcRows[0].stored_path}`);
+      service = readLimsServiceData(svcRows[0].stored_path);
+      logger.info(`[BIO LIMS Report] 유지보수 ${service.rows.length}건`);
+    } else {
+      logger.info("[BIO LIMS Report] LIMS.xlsx(유지보수리스트) 없음 — IT서비스 페이지 생략");
+    }
+  } catch (e) {
+    logger.error(`[BIO LIMS Report] LIMS.xlsx 처리 실패 (무시): ${(e as Error).message}`);
+  }
+
+  const html = buildBioLimsReportHtml(titleDate, today, charts, data, service);
 
   const outputDir  = path.resolve(process.env.OUTPUT_DIR ?? "outputs");
   fs.mkdirSync(outputDir, { recursive: true });

@@ -23,7 +23,23 @@ export interface ChartCaptureOptions {
   label:     string;
 }
 
-const MAX_ATTEMPTS = 3;
+const MAX_ATTEMPTS = 4;
+
+/** 브라우저 안에서 실행: 흰색·투명이 아닌 픽셀이 충분하면 그려진 것으로 본다 (16픽셀마다 표본) */
+function isPainted(): boolean {
+  const canvases = Array.from(document.querySelectorAll("canvas"));
+  if (!canvases.length) return false;
+  let painted = 0;
+  for (const cv of canvases) {
+    const ctx = cv.getContext("2d");
+    if (!ctx || !cv.width || !cv.height) continue;
+    const d = ctx.getImageData(0, 0, cv.width, cv.height).data;
+    for (let i = 0; i < d.length; i += 64) {
+      if (d[i + 3] > 0 && (d[i] < 235 || d[i + 1] < 235 || d[i + 2] < 235)) painted++;
+    }
+  }
+  return painted > 50;
+}
 
 export async function captureChartPng(o: ChartCaptureOptions): Promise<void> {
   const browser = await chromium.launch({ headless: true });
@@ -34,23 +50,18 @@ export async function captureChartPng(o: ChartCaptureOptions): Promise<void> {
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       await page.setContent(o.html, { waitUntil: "load", timeout: 30_000 });
-      const drawn = await page
-        .waitForFunction(() => {
-          const canvases = Array.from(document.querySelectorAll("canvas"));
-          if (!canvases.length) return false;
-          // 흰색·투명이 아닌 픽셀이 충분히 있으면 그려진 것으로 본다 (16픽셀마다 표본)
-          let painted = 0;
-          for (const cv of canvases) {
-            const ctx = cv.getContext("2d");
-            if (!ctx || !cv.width || !cv.height) continue;
-            const d = ctx.getImageData(0, 0, cv.width, cv.height).data;
-            for (let i = 0; i < d.length; i += 64) {
-              if (d[i + 3] > 0 && (d[i] < 235 || d[i + 1] < 235 || d[i + 2] < 235)) painted++;
-            }
-          }
-          return painted > 50;
-        }, null, { timeout: 10_000, polling: 100 })
-        .then(() => true, () => false);
+
+      // 헤드리스 페이지는 화면에 그릴 일이 없으면 프레임을 만들지 않아,
+      // Chart.js 의 그리기(requestAnimationFrame)가 실행되지 않은 채 멈춰 있을 수 있다.
+      // 그래서 기다리는 동안 버리는 스크린샷으로 프레임을 강제로 돌린다.
+      let drawn = false;
+      for (let tick = 0; tick < 25 && !drawn; tick++) {   // 약 2.5초 — 안 그려지면 다시 불러오는 편이 빠르다
+        drawn = await page.evaluate(isPainted);
+        if (!drawn) {
+          await page.screenshot({ type: "png" });
+          await page.waitForTimeout(100);
+        }
+      }
 
       if (drawn) {
         await page.locator(o.selector).screenshot({ path: o.outputPng, type: "png" });

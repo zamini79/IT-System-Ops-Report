@@ -28,7 +28,8 @@ import { generateDevReport }       from "./dev.report.service";
 import { generateLhouseReport }    from "./lhouse.report.service";
 import { generateBioReport,
          generateBioLimsReport,
-         generateBioElnReport }    from "./bio.report.service";
+         generateBioElnReport,
+         type YearMonth }          from "./bio.report.service";
 
 /** 동기 엔드포인트와 1:1 대응하는 변형 */
 export type ReportVariant =
@@ -41,7 +42,8 @@ interface ReportOutput {
   pageCount: number;
 }
 
-const GENERATORS: Record<ReportVariant, (jobId: string) => Promise<ReportOutput>> = {
+/** 기준 월을 지정할 수 있는 보고서 (생략하면 지난달) */
+const GENERATORS: Record<ReportVariant, (jobId: string, target?: YearMonth) => Promise<ReportOutput>> = {
   "dev":      generateDevReport,
   "lhouse":   generateLhouseReport,
   "bio":      generateBioReport,
@@ -94,8 +96,10 @@ export function findVariantPdf(jobId: string, variant: ReportVariant): string | 
 export function startDivisionReport(params: {
   jobId:   string;
   variant: ReportVariant;
+  /** 기준 월 — 현재는 bio-lims 만 반영 (다른 보고서는 항상 지난달) */
+  target?: YearMonth;
 }): void {
-  const { jobId, variant } = params;
+  const { jobId, variant, target } = params;
   const generate = GENERATORS[variant];
   if (!generate) throw new AppError(400, `알 수 없는 보고서 종류: ${variant}`);
 
@@ -104,7 +108,7 @@ export function startDivisionReport(params: {
 
   void (async () => {
     try {
-      const result = await generate(jobId);
+      const result = await generate(jobId, target);
       latestPdf.set(`${jobId}:${variant}`, result.filePath);
 
       // 기존 /report/:jobId/download 가 report_jobs.pdf_path 를 읽으므로 갱신한다.

@@ -136,12 +136,21 @@ reportRouter.post(
   "/generate-async",
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const { jobId, variant } = req.body as { jobId?: string; variant?: string };
+      const { jobId, variant, month } = req.body as { jobId?: string; variant?: string; month?: string };
       if (!jobId)   throw new AppError(400, "jobId 는 필수입니다.");
       if (!UUID_RE.test(jobId)) throw new AppError(400, "jobId 는 UUID 형식이어야 합니다.");
       if (!variant) throw new AppError(400, "variant 는 필수입니다.");
 
-      startDivisionReport({ jobId, variant: variant as ReportVariant });
+      // month: "YYYY-MM" — 지정하면 그 달 기준으로 만든다 (현재 bio-lims 만 지원)
+      let target: { year: number; month: number } | undefined;
+      if (month !== undefined) {
+        const m = /^(\d{4})-(\d{2})$/.exec(month);
+        if (!m || +m[2] < 1 || +m[2] > 12) throw new AppError(400, "month 는 YYYY-MM 형식이어야 합니다.");
+        if (variant !== "bio-lims") throw new AppError(400, "기준 월 지정은 현재 LIMS 보고서만 지원합니다.");
+        target = { year: +m[1], month: +m[2] };
+      }
+
+      startDivisionReport({ jobId, variant: variant as ReportVariant, target });
 
       res.status(202).json({
         success: true,

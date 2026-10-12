@@ -18,7 +18,9 @@ import type {
 } from "./dashboard.types";
 
 import { logger } from "../../utils/logger";
-import { findLatestTimesheet, msDashboardGroups, readMsBurnReport } from "../report/ms-burn-report";
+import {
+  archiveTimesheet, findLatestTimesheet, msDashboardGroups, readMsBurnReport, readMsHistory,
+} from "../report/ms-burn-report";
 
 // ── 소스 정의 ─────────────────────────────────────────────────────────────────
 
@@ -155,8 +157,8 @@ const TIMESHEET_GROUPS: Record<"DEV" | "LHOUSE" | "BIO", { sheet: string; label:
 };
 
 /**
- * 공유 Timesheet(MS Burn Report) 를 읽어 "그룹별 이번 달 사용 시간" 시리즈로 만든다.
- * 새 양식은 파일 하나가 한 달치라 시리즈는 해당 월 한 점이다.
+ * 공유 Timesheet(MS Burn Report) 를 읽어 "그룹별 월간 사용 시간" 추이로 만든다.
+ * 새 양식은 파일 하나가 한 달치라, 월별로 보관해 둔 파일(ms_history)을 모아 그린다.
  * 보고서와 같은 값이 나오도록 보고서와 같은 파서(ms-burn-report)를 쓴다.
  */
 export async function buildTimesheetSection(
@@ -171,7 +173,10 @@ export async function buildTimesheetSection(
     if (!ts) return empty;
     const status: TimesheetStatus = { present: true, updatedAt: ts.createdAt, sizeBytes: ts.sizeBytes };
 
-    const groups = msDashboardGroups(readMsBurnReport(ts.path), TIMESHEET_GROUPS[division], ym2label);
+    // 현재 파일을 월별로 보관한 뒤, 보관된 달들로 추이를 만든다
+    const report = readMsBurnReport(ts.path, { quiet: true });
+    archiveTimesheet(ts.path, report.month);
+    const groups = msDashboardGroups(readMsHistory(ts.path), report.month, TIMESHEET_GROUPS[division], ym2label);
     return { data: groups.length ? { groups } : null, status };
 
   } catch (e) {
